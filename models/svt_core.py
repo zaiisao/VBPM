@@ -8,12 +8,12 @@ Prior (transition_model_pseudocode.pdf):
 - All prior params computed in parallel from h_prior
 - Means are fixed (bar pointer dynamics), uncertainties are learned
 
-Posterior (posterior_model_final.pdf):
-- Encoder-Decoder Transformer: encoder on x_{1:T}, decoder on b_{1:T}
-- Cross-attention: Q=b (beat targets), K=V=x (audio features)
+Posterior:
+- Transformer Encoder on [h_{1:T}, b_{1:T}] concatenated
+- Audio features provide position-varying content, beats mark locations
 - FFN heads with Softplus for kappa/sigma, pi*tanh for phase mu
 - All posterior params computed in parallel (no z_{t-1} dependency)
-- Does NOT condition on z_{t-1} — purely from (x, b)
+- Does NOT condition on z_{t-1} — purely from (h, b)
 
 Training (Algorithm 1):
 - Prior means depend on z_{t-1} (sequential), but prior uncertainties
@@ -78,6 +78,7 @@ class SVTModel(nn.Module):
         num_meter_classes: int = 8,
         meter_delta: float = 0.001,
         h_prior_bottleneck: int = 0,
+        input_dim: int = 2,
         **kwargs,  # absorb extra args like z_context for backward compat
     ) -> None:
         super().__init__()
@@ -86,7 +87,6 @@ class SVTModel(nn.Module):
         self.num_meter_classes = num_meter_classes
         self.meter_delta = meter_delta
         K = num_meter_classes
-        input_dim = 2  # beat activation + downbeat activation
 
         # ================================================================
         # PRIOR: Encoder Transformer on x_{1:T} → h_prior_{1:T}
@@ -122,27 +122,15 @@ class SVTModel(nn.Module):
         self.prior_tempo_mu_init = nn.Parameter(torch.tensor(-1.9))
 
         # ================================================================
-        # POSTERIOR: Encoder-Decoder Transformer
-        # (posterior_model_final.pdf)
-        # Encoder: x_{1:T} → h_x (K, V for cross-attention)
-        # Decoder: b_{1:T} → h_post (Q drives cross-attention into h_x)
+        # POSTERIOR: Transformer Encoder on [h_{1:T}, d_beat, d_downbeat]
+        # q_φ(m_{1:T}, φ_{1:T}, φ̇_{1:T} | h_{1:T}, d_beat, d_downbeat)
+        # Input: audio features h_{1:T} concatenated with
+        #        beat-distance (1-dim) and downbeat-distance (1-dim)
         # ================================================================
-        # Posterior encoder (processes audio features x_{1:T})
-        self.post_enc_proj = nn.Linear(input_dim, hidden_dim)
-        self.post_enc_pos = PositionalEncoding(d_model=hidden_dim)
+        self.post_proj = nn.Linear(input_dim + 2, hidden_dim)  # [h_t, d_beat, d_db] → D
+        self.post_pos_enc = PositionalEncoding(d_model=hidden_dim)
         self.post_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
-                d_model=hidden_dim, nhead=nhead, batch_first=True,
-            ),
-            num_layers=num_layers,
-        )
-
-        # Posterior decoder (processes beat targets b_{1:T}, cross-attends to x)
-        # b_{1:T} is 1-dim (binary beat indicator per frame)
-        self.post_dec_proj = nn.Linear(1, hidden_dim)
-        self.post_dec_pos = PositionalEncoding(d_model=hidden_dim)
-        self.post_decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
                 d_model=hidden_dim, nhead=nhead, batch_first=True,
             ),
             num_layers=num_layers,
@@ -186,11 +174,11 @@ class SVTModel(nn.Module):
         else:
             h_dim_for_decoder = hidden_dim
 
-        decoder_input_dim = 2 + K + h_dim_for_decoder
+        decoder_input_dim = 3 + K + h_dim_for_decoder  # [cos(φ), sin(φ), log_tempo, meter, h_prior]
         self.emission_decoder = nn.Sequential(
             nn.Linear(decoder_input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 2),  # channel 0: beat, channel 1: downbeat
         )
 
     # ------------------------------------------------------------------
@@ -224,13 +212,13 @@ class SVTModel(nn.Module):
             self.prior_meter_ffn(h_prior).view(B, T, K, K)
         )
 
-        # Phase: kappa in [10, 300] — concentrated but not frozen
-        phase_kappa = 10.0 + 290.0 * torch.sigmoid(
+        # Phase: kappa in [100, 300] — prior should be confident about
+        # its phase prediction (phi_prev + tempo is a good estimate)
+        phase_kappa = 100.0 + 200.0 * torch.sigmoid(
             self.prior_phase_ffn(h_prior).squeeze(-1)
         )
 
-        # Tempo: sigma in [0.001, 0.05] — tight random walk (learned Gaussian variance limit)
-        # All prior models limit tempo change rate. sigma=0.05 allows ~5% change/frame max.
+        # Tempo: sigma in [0.001, 0.05]
         tempo_sigma = 0.001 + 0.049 * torch.sigmoid(
             self.prior_tempo_ffn(h_prior).squeeze(-1)
         )
@@ -324,40 +312,34 @@ class SVTModel(nn.Module):
     def encode_posterior(
         self,
         activations: Tensor,
-        beat_targets: Tensor,
+        beat_distance: Tensor,
+        downbeat_distance: Tensor,
     ) -> dict[str, Tensor]:
-        """Compute all posterior params in parallel via encoder-decoder.
-
-        Per posterior_model_final.pdf.
+        """Compute all posterior params in parallel via Transformer Encoder.
 
         Args:
-            activations: [B, T, 2] acoustic activations (x_{1:T}).
-            beat_targets: [B, T] binary beat indicators (b_{1:T}).
+            activations: [B, T, D_feat] acoustic features (h_{1:T}).
+            beat_distance: [B, T] fraction since last beat (0→1).
+            downbeat_distance: [B, T] fraction since last downbeat (0→1).
 
         Returns:
-            Dict with posterior params for all T timesteps:
-                - meter_logits: [B, T, K]
-                - phase_mu: [B, T]
-                - phase_kappa: [B, T]  (not log_kappa — direct Softplus output)
-                - tempo_mu: [B, T]
-                - tempo_sigma: [B, T]  (not log_sigma — direct Softplus output)
+            Dict with posterior params for all T timesteps.
         """
-        # Encoder: x_{1:T} → h_x
-        x_emb = self.post_enc_proj(activations)
-        x_emb = self.post_enc_pos(x_emb)
-        h_x = self.post_encoder(x_emb)  # [B, T, D]
-
-        # Decoder: b_{1:T} drives Q, h_x provides K,V
-        b_emb = self.post_dec_proj(beat_targets.unsqueeze(-1))  # [B, T, 1] → [B, T, D]
-        b_emb = self.post_dec_pos(b_emb)
-        h_post = self.post_decoder(b_emb, h_x)  # [B, T, D]
+        # Concatenate: [B, T, D_feat+2]
+        x = torch.cat([
+            activations,
+            beat_distance.unsqueeze(-1),
+            downbeat_distance.unsqueeze(-1),
+        ], dim=-1)
+        x = self.post_proj(x)           # [B, T, D]
+        x = self.post_pos_enc(x)
+        h_post = self.post_encoder(x)   # [B, T, D]
 
         # FFN heads (position-wise, shared weights)
-        K = self.num_meter_classes
         return {
             "meter_logits": self.post_meter_ffn(h_post),                              # [B, T, K]
             "phase_mu": math.pi * torch.tanh(self.post_phase_mu_ffn(h_post).squeeze(-1)),  # [B, T]
-            "phase_kappa": 0.1 + 299.9 * torch.sigmoid(                                 # [B, T] in [0.1, 300]
+            "phase_kappa": 200.0 + 300.0 * torch.sigmoid(                                # [B, T] in [200, 500]
                 self.post_phase_kappa_ffn(h_post).squeeze(-1)),
             "tempo_mu": -2.1 + 0.9 * torch.tanh(                                      # [B, T] in [-3.0, -1.2]
                 self.post_tempo_mu_ffn(h_post).squeeze(-1)),                           # ~40-250 BPM at 86fps (madmom range)
@@ -417,12 +399,13 @@ class SVTModel(nn.Module):
         if self.h_prior_bottleneck_dim > 0:
             h = self.h_prior_bottleneck_proj(h)
         decoder_input = torch.cat([
-            samples["phase"].unsqueeze(-1),       # [B, 1]
-            samples["log_tempo"].unsqueeze(-1),    # [B, 1]
-            samples["meter_soft"],                 # [B, K]
-            h,                                     # [B, D'] or [B, D]
+            torch.cos(samples["phase"]).unsqueeze(-1),  # [B, 1]
+            torch.sin(samples["phase"]).unsqueeze(-1),  # [B, 1]
+            samples["log_tempo"].unsqueeze(-1),          # [B, 1]
+            samples["meter_soft"],                       # [B, K]
+            h,                                           # [B, D'] or [B, D]
         ], dim=-1)
-        return self.emission_decoder(decoder_input)  # [B, 1]
+        return self.emission_decoder(decoder_input)  # [B, 2]
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -463,22 +446,17 @@ class SVTModel(nn.Module):
         phase_kappa = prior_params["phase_kappa"]  # [B, T]
 
         # Tempo prior: mu = log(phidot_{t-1}) = log_tempo_prev
-        tempo_mu = log_tempo_prev.clone()                                     # [B, T]
-        tempo_mu[:, 0] = self.prior_tempo_mu_init                             # learnable init
+        # Use cat to avoid in-place op (preserves gradient to prior_tempo_mu_init)
+        tempo_mu_init = self.prior_tempo_mu_init.expand(B).unsqueeze(1)       # [B, 1]
+        tempo_mu = torch.cat([tempo_mu_init, log_tempo_prev[:, 1:]], dim=1)   # [B, T]
 
         # Tempo sigma: beat-gated (tempo can change at beats, locked between beats)
         # Uses GT beat_targets during training to gate tempo changes.
         # At inference (beat_targets=None), falls back to learned sigma everywhere.
         _TEMPO_BETWEEN_SIGMA = 0.03  # moderate lock between beats
-        if beat_targets is not None and beat_targets.shape[1] == T:
-            is_beat = beat_targets > 0.5  # [B, T] bool
-            tempo_sigma = torch.where(
-                is_beat,
-                prior_params["tempo_sigma"],                                        # learned at beats
-                torch.full_like(prior_params["tempo_sigma"], _TEMPO_BETWEEN_SIGMA),  # locked between beats
-            )
-        else:
-            tempo_sigma = prior_params["tempo_sigma"]  # no gating at inference
+        # No beat-gating: GT z_prev already anchors the prior to correct tempo.
+        # The learned sigma controls how tightly the posterior must match.
+        tempo_sigma = prior_params["tempo_sigma"]
 
         # Meter boundary detection (phase-based for now)
         boundary = (phase_prev + tempo_prev) >= TWO_PI  # [B, T]
@@ -517,27 +495,61 @@ class SVTModel(nn.Module):
             "tempo_sigma": tempo_sigma,          # [B, T]
         }
 
+    @staticmethod
+    def _beat_targets_to_distance(beat_targets: Tensor) -> Tensor:
+        """Convert binary beat labels to continuous beat-distance in [0, 1).
+
+        For each frame, computes the fraction of time elapsed since the
+        last beat. At a beat frame d=0, then ramps linearly to ~1 just
+        before the next beat. This gives the posterior a smooth
+        interpolation signal instead of sparse binary input.
+
+        Args:
+            beat_targets: [B, T] binary beat indicators.
+        Returns:
+            beat_distance: [B, T] in [0, 1).
+        """
+        B, T = beat_targets.shape
+        device = beat_targets.device
+
+        # Find beat positions per batch element
+        distance = torch.zeros_like(beat_targets)
+        for b in range(B):
+            beats = torch.where(beat_targets[b] > 0.5)[0]
+            if len(beats) == 0:
+                # No beats: linear ramp over full sequence
+                distance[b] = torch.linspace(0, 1, T, device=device)
+                continue
+            # Between consecutive beats: linear ramp 0→1
+            prev = 0
+            for i, beat_pos in enumerate(beats):
+                beat_pos = beat_pos.item()
+                span = beat_pos - prev
+                if span > 0:
+                    distance[b, prev:beat_pos] = torch.linspace(0, 1 - 1/max(span, 1), span, device=device)
+                prev = beat_pos
+            # After last beat
+            remaining = T - prev
+            if remaining > 0:
+                distance[b, prev:] = torch.linspace(0, 1 - 1/max(remaining, 1), remaining, device=device)
+        return distance
+
     def forward(
         self,
         activations: Tensor,
         z_prev_init: dict[str, Tensor],
         temperature: float = 1.0,
         beat_targets: Tensor | None = None,
+        downbeat_targets: Tensor | None = None,
     ) -> dict[str, Tensor | dict[str, Tensor]]:
         """Fully parallel forward pass.
 
-        Since the posterior q_phi(z_{1:T} | b_{1:T}, x_{1:T}) does NOT
-        depend on z_{t-1}, all posterior params and samples can be computed
-        in a single parallel pass. Prior means are computed by shifting
-        the samples (z_prev[t] = sample[t-1]). This is mathematically
-        equivalent to Algorithm 1's sequential loop but runs in O(1)
-        sequential steps instead of O(T).
-
         Args:
-            activations: [B, T, 2] acoustic activations.
+            activations: [B, T, D_feat] acoustic features.
             z_prev_init: Dict with initial z_prev (t=0 seed).
             temperature: Gumbel-Softmax temperature.
             beat_targets: [B, T] binary beat indicators.
+            downbeat_targets: [B, T] binary downbeat indicators.
 
         Returns:
             Dict with beat_logits, posterior, prior, samples.
@@ -547,12 +559,18 @@ class SVTModel(nn.Module):
 
         if beat_targets is None:
             beat_targets = torch.zeros(B, T, device=device)
+        if downbeat_targets is None:
+            downbeat_targets = torch.zeros(B, T, device=device)
+
+        # Convert binary labels to continuous distances for posterior
+        beat_distance = self._beat_targets_to_distance(beat_targets)
+        downbeat_distance = self._beat_targets_to_distance(downbeat_targets)
 
         # Step 1: Prior encoder — pre-compute h_prior and uncertainties (parallel)
         h_prior, prior_params = self.encode_prior(activations)
 
-        # Step 2: Posterior encoder-decoder — pre-compute all params (parallel)
-        posterior = self.encode_posterior(activations, beat_targets)
+        # Step 2: Posterior encoder — pre-compute all params (parallel)
+        posterior = self.encode_posterior(activations, beat_distance, downbeat_distance)
 
         # Step 3: Sample ALL timesteps from posterior at once (parallel)
         meter_soft = gumbel_softmax_sample(posterior["meter_logits"], temperature=temperature, hard=False)
@@ -578,12 +596,13 @@ class SVTModel(nn.Module):
         if self.h_prior_bottleneck_dim > 0:
             h = self.h_prior_bottleneck_proj(h)
         decoder_input = torch.cat([
-            phase.unsqueeze(-1),       # [B, T, 1]
-            log_tempo.unsqueeze(-1),   # [B, T, 1]
-            meter_soft,                # [B, T, K]
-            h,                         # [B, T, D]
+            torch.cos(phase).unsqueeze(-1),  # [B, T, 1]
+            torch.sin(phase).unsqueeze(-1),  # [B, T, 1]
+            log_tempo.unsqueeze(-1),         # [B, T, 1]
+            meter_soft,                      # [B, T, K]
+            h,                               # [B, T, D]
         ], dim=-1)
-        beat_logits = self.emission_decoder(decoder_input)  # [B, T, 1]
+        beat_logits = self.emission_decoder(decoder_input)  # [B, T, 2] (beat, downbeat)
 
         # Reformat posterior for KL compatibility
         posterior_for_loss = {
