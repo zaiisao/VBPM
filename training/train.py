@@ -100,6 +100,7 @@ def _save_beat_viz(
     fps: float = 86.1328125,
     gt_phase: np.ndarray | None = None,
     gt_z_prev: dict[str, Tensor] | None = None,
+    downbeat_targets: Tensor | None = None,
 ) -> str | None:
     """Save detailed diagnostic visualization for the first sample."""
     try:
@@ -111,8 +112,11 @@ def _save_beat_viz(
         return None
 
     TWO_PI = 2 * np.pi
-    logits = out["beat_logits"][0, :, 0].detach().cpu().numpy()
+    beat_logits_all = out["beat_logits"][0].detach().cpu().numpy()  # [T, 2]
+    logits = beat_logits_all[:, 0]
     probs = 1.0 / (1.0 + np.exp(-logits))
+    db_logits = beat_logits_all[:, 1] if beat_logits_all.shape[1] > 1 else None
+    db_probs = 1.0 / (1.0 + np.exp(-db_logits)) if db_logits is not None else None
     gt = beat_targets[0].detach().cpu().numpy()
     phase = out["samples"]["phase"][0].detach().cpu().numpy()
     log_tempo = out["samples"]["log_tempo"][0].detach().cpu().numpy()
@@ -150,9 +154,9 @@ def _save_beat_viz(
         out["prior"]["tempo_mu"][0], out["prior"]["tempo_sigma"][0],
     ).detach().cpu().numpy()
 
-    fig, axes = plt.subplots(6, 1, figsize=(22, 20), sharex=True)
+    fig, axes = plt.subplots(7, 1, figsize=(22, 24), sharex=True)
 
-    # 1. Beat probability + GT beats/downbeats
+    # 0. Beat probability + GT beats/downbeats
     axes[0].plot(probs, "b-", lw=0.8, label="P(beat)")
     axes[0].axhline(0.5, color="gray", ls="--", alpha=0.3)
     for bf in beat_frames:
@@ -162,49 +166,62 @@ def _save_beat_viz(
     axes[0].set_title(f"Epoch {epoch}: Beat P (blue) | GT beats (green) | GT downbeats (red)")
     axes[0].legend()
 
-    # 2. Phase: model vs GT sawtooth
-    axes[1].plot(phase_wrapped, "purple", lw=0.5, alpha=0.7, label="model phase")
-    if gt_phase_rad is not None:
-        axes[1].plot(gt_phase_rad, "green", lw=0.5, alpha=0.5, label="GT phase (sawtooth)")
-    axes[1].axhline(0, color="k", ls=":", alpha=0.2)
-    axes[1].axhline(TWO_PI, color="k", ls=":", alpha=0.2)
-    axes[1].set_ylabel("Phase mod 2π")
-    axes[1].set_title("Phase: model (purple) vs GT sawtooth (green)")
+    # 1. Downbeat probability + GT downbeats
+    if db_probs is not None:
+        axes[1].plot(db_probs, "b-", lw=0.8, label="P(downbeat)")
+        axes[1].axhline(0.5, color="gray", ls="--", alpha=0.3)
+    if downbeat_targets is not None:
+        db_gt = downbeat_targets[0].detach().cpu().numpy()[:T]
+        db_gt_frames = np.where(db_gt > 0.5)[0]
+        for df in db_gt_frames:
+            axes[1].axvline(df, color="r", alpha=0.5, lw=1.5)
+    axes[1].set_ylim(-0.05, 1.05)
+    axes[1].set_title("Downbeat P (blue) | GT downbeats (red)")
     axes[1].legend()
 
-    # 3. Prior vs Posterior phase mu
-    axes[2].plot(post_phase_mu, "blue", lw=0.5, alpha=0.7, label="posterior μ_φ")
-    axes[2].plot(prior_phase_mu, "red", lw=0.5, alpha=0.7, label="prior μ_φ (from GT z_prev)")
+    # 2. Phase: model vs GT sawtooth
+    axes[2].plot(phase_wrapped, "purple", lw=0.5, alpha=0.7, label="model phase")
     if gt_phase_rad is not None:
-        axes[2].plot(gt_phase_rad, "green", lw=0.3, alpha=0.3, label="GT phase")
-    axes[2].set_ylabel("μ_φ mod 2π")
-    axes[2].set_title("Prior mean (red, from GT) vs Posterior mean (blue) — should overlap")
+        axes[2].plot(gt_phase_rad, "green", lw=0.5, alpha=0.5, label="GT phase (sawtooth)")
+    axes[2].axhline(0, color="k", ls=":", alpha=0.2)
+    axes[2].axhline(TWO_PI, color="k", ls=":", alpha=0.2)
+    axes[2].set_ylabel("Phase mod 2π")
+    axes[2].set_title("Phase: model (purple) vs GT sawtooth (green)")
     axes[2].legend()
 
-    # 4. Tempo BPM: model vs GT
-    axes[3].plot(bpm, "orange", lw=0.5, alpha=0.7, label="model BPM")
-    if gt_bpm is not None:
-        axes[3].plot(gt_bpm, "green", lw=0.5, alpha=0.5, label="GT BPM")
-    axes[3].set_ylabel("BPM")
-    axes[3].set_title(f"Tempo: model mean={bpm.mean():.0f} BPM" + (f", GT mean={gt_bpm.mean():.0f}" if gt_bpm is not None else ""))
+    # 3. Prior vs Posterior phase mu
+    axes[3].plot(post_phase_mu, "blue", lw=0.5, alpha=0.7, label="posterior μ_φ")
+    axes[3].plot(prior_phase_mu, "red", lw=0.5, alpha=0.7, label="prior μ_φ (from GT z_prev)")
+    if gt_phase_rad is not None:
+        axes[3].plot(gt_phase_rad, "green", lw=0.3, alpha=0.3, label="GT phase")
+    axes[3].set_ylabel("μ_φ mod 2π")
+    axes[3].set_title("Prior mean (red, from GT) vs Posterior mean (blue) — should overlap")
     axes[3].legend()
 
-    # 5. Per-frame KL
-    axes[4].plot(kl_phase_t, "purple", lw=0.5, label=f"KL phase (mean={kl_phase_t.mean():.2f})")
-    axes[4].plot(kl_tempo_t, "orange", lw=0.5, label=f"KL tempo (mean={kl_tempo_t.mean():.2f})")
-    axes[4].set_ylabel("KL (nats)")
-    axes[4].set_title("Per-frame KL — high means posterior disagrees with GT-anchored prior")
+    # 4. Tempo BPM: model vs GT
+    axes[4].plot(bpm, "orange", lw=0.5, alpha=0.7, label="model BPM")
+    if gt_bpm is not None:
+        axes[4].plot(gt_bpm, "green", lw=0.5, alpha=0.5, label="GT BPM")
+    axes[4].set_ylabel("BPM")
+    axes[4].set_title(f"Tempo: model mean={bpm.mean():.0f} BPM" + (f", GT mean={gt_bpm.mean():.0f}" if gt_bpm is not None else ""))
     axes[4].legend()
 
+    # 5. Per-frame KL
+    axes[5].plot(kl_phase_t, "purple", lw=0.5, label=f"KL phase (mean={kl_phase_t.mean():.2f})")
+    axes[5].plot(kl_tempo_t, "orange", lw=0.5, label=f"KL tempo (mean={kl_tempo_t.mean():.2f})")
+    axes[5].set_ylabel("KL (nats)")
+    axes[5].set_title("Per-frame KL — high means posterior disagrees with GT-anchored prior")
+    axes[5].legend()
+
     # 6. Prior uncertainty
-    ax6b = axes[5].twinx()
-    axes[5].plot(prior_kappa, "darkblue", lw=0.8, label=f"κ (mean={prior_kappa.mean():.0f})")
+    ax6b = axes[6].twinx()
+    axes[6].plot(prior_kappa, "darkblue", lw=0.8, label=f"κ (mean={prior_kappa.mean():.0f})")
     ax6b.plot(prior_sigma, "darkred", lw=0.8, label=f"σ (mean={prior_sigma.mean():.4f})")
-    axes[5].set_ylabel("κ_φ", color="darkblue")
+    axes[6].set_ylabel("κ_φ", color="darkblue")
     ax6b.set_ylabel("σ_tempo", color="darkred")
-    axes[5].set_title("Prior uncertainty: κ should be HIGH (concentrated), σ should be LOW (stable tempo)")
-    axes[5].legend(loc="upper left"); ax6b.legend(loc="upper right")
-    axes[5].set_xlabel("Frame")
+    axes[6].set_title("Prior uncertainty: κ should be HIGH (concentrated), σ should be LOW (stable tempo)")
+    axes[6].legend(loc="upper left"); ax6b.legend(loc="upper right")
+    axes[6].set_xlabel("Frame")
 
     plt.tight_layout()
     os.makedirs(log_dir, exist_ok=True)
@@ -397,6 +414,8 @@ def train_epoch_end_to_end(
     num_epochs: int = 1,
     log_interval: int = 1,
     is_main: bool = True,
+    smooth_sigma: float = 3.0,
+    smooth_sigma_db: float = 5.0,
 ) -> tuple[float, float, float, dict[str, float]]:
     """Run one end-to-end training epoch.
 
@@ -429,6 +448,11 @@ def train_epoch_end_to_end(
         T_act = activations.shape[1]
         beat_targets_cropped = _center_crop_seq_dim(beat_targets.unsqueeze(-1), T_act).squeeze(-1)
 
+        # Downbeat targets from extractor_target channel 1
+        downbeat_targets_cropped = _center_crop_seq_dim(
+            extractor_target[:, 1:2, :].transpose(1, 2), T_act
+        ).squeeze(-1)
+
         # Full GT z_prev trajectory (prior anchored to GT dynamics)
         z_prev_gt = {
             "phase": _center_crop_seq_dim(batch["phase_prev"].to(device), T_act),
@@ -438,7 +462,8 @@ def train_epoch_end_to_end(
 
         # Parallel forward: prior uses GT z_prev, posterior sampled independently
         out = svt_model(activations, z_prev_gt, temperature=temperature,
-                        beat_targets=beat_targets_cropped)
+                        beat_targets=beat_targets_cropped,
+                        downbeat_targets=downbeat_targets_cropped)
         svt_total, components = compute_elbo_loss(
             beat_logits=out["beat_logits"],
             beat_targets=beat_targets_cropped,
@@ -450,6 +475,9 @@ def train_epoch_end_to_end(
             free_bits_meter=free_bits_meter,
             free_bits_phase=free_bits_phase,
             free_bits_tempo=free_bits_tempo,
+            downbeat_targets=downbeat_targets_cropped,
+            smooth_sigma=smooth_sigma,
+            smooth_sigma_db=smooth_sigma_db,
         )
 
         total_loss = extractor_loss_weight * extractor_loss + svt_loss_weight * svt_total
@@ -565,6 +593,8 @@ def val_epoch_end_to_end(
     extractor_loss_weight: float = 1.0,
     svt_loss_weight: float = 1.0,
     fps: float = 86.1328125,
+    smooth_sigma: float = 3.0,
+    smooth_sigma_db: float = 5.0,
 ) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
     """Run one validation epoch (no gradient updates).
 
@@ -599,11 +629,17 @@ def val_epoch_end_to_end(
         log_tempo_prev_aligned = _center_crop_seq_dim(batch["log_tempo_prev"].to(device), T_ext)
         meter_prev_aligned = _center_crop_seq_dim(batch["meter_onehot_prev"].to(device), T_ext)
 
+        # Downbeat targets from extractor_target channel 1
+        downbeat_targets_aligned = _center_crop_seq_dim(
+            extractor_target[:, 1:2, :].transpose(1, 2), T_ext
+        ).squeeze(-1)
+
         # Cap sequence length for sequential Algorithm 1
         _MAX_VAL_FRAMES = 512
         T_act = min(T_ext, _MAX_VAL_FRAMES)
         activations = activations[:, :T_act, :]
         beat_targets_cropped = beat_targets_aligned[:, :T_act]
+        downbeat_targets_cropped = downbeat_targets_aligned[:, :T_act]
 
         # Full GT z_prev for val
         z_prev_gt = {
@@ -612,7 +648,8 @@ def val_epoch_end_to_end(
             "meter_onehot": meter_prev_aligned[:, :T_act, :],
         }
         out = svt_model(activations, z_prev_gt, temperature=temperature,
-                        beat_targets=beat_targets_cropped)
+                        beat_targets=beat_targets_cropped,
+                        downbeat_targets=downbeat_targets_cropped)
         svt_total, components = compute_elbo_loss(
             beat_logits=out["beat_logits"],
             beat_targets=beat_targets_cropped,
@@ -624,6 +661,9 @@ def val_epoch_end_to_end(
             free_bits_meter=free_bits_meter,
             free_bits_phase=free_bits_phase,
             free_bits_tempo=free_bits_tempo,
+            downbeat_targets=downbeat_targets_cropped,
+            smooth_sigma=smooth_sigma,
+            smooth_sigma_db=smooth_sigma_db,
         )
 
         total_loss = extractor_loss_weight * extractor_loss + svt_loss_weight * svt_total
@@ -636,7 +676,7 @@ def val_epoch_end_to_end(
         num_batches += 1
 
         # --- mir_eval beat/downbeat metrics per sample in batch ---
-        beat_probs = torch.sigmoid(out["beat_logits"].squeeze(-1)).cpu().numpy()  # [B, T]
+        beat_probs = torch.sigmoid(out["beat_logits"][:, :, 0]).cpu().numpy()  # [B, T]
         bt_ref_np = beat_targets_cropped.cpu().numpy()  # [B, T]
         phase_np = out["samples"]["phase"].cpu().numpy()  # [B, T]
         B = beat_probs.shape[0]
@@ -729,6 +769,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Per-latent free_bits override for phase KL. Default: use --free_bits.")
     parser.add_argument("--free_bits_tempo", type=float, default=None,
                         help="Per-latent free_bits override for tempo KL. Default: use --free_bits.")
+    parser.add_argument("--smooth_sigma", type=float, default=3.0,
+                        help="Gaussian kernel sigma for beat target smoothing (frames). Default: 3.0.")
+    parser.add_argument("--smooth_sigma_db", type=float, default=5.0,
+                        help="Gaussian kernel sigma for downbeat target smoothing (frames). Default: 5.0.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping. Default: 1.0.")
     parser.add_argument("--z_context", type=int, default=1,
@@ -934,6 +978,8 @@ def main() -> None:
             num_epochs=args.num_epochs,
             log_interval=args.log_interval,
             is_main=is_main,
+            smooth_sigma=args.smooth_sigma,
+            smooth_sigma_db=args.smooth_sigma_db,
         )
 
         if is_main:
@@ -985,6 +1031,8 @@ def main() -> None:
                 extractor_loss_weight=args.extractor_loss_weight,
                 svt_loss_weight=args.svt_loss_weight,
                 fps=val_fps,
+                smooth_sigma=args.smooth_sigma,
+            smooth_sigma_db=args.smooth_sigma_db,
             )
             v_comp_str = " | ".join(f"{k}={v:.6f}" for k, v in v_comps.items())
             print(
@@ -1014,7 +1062,11 @@ def main() -> None:
                         "log_tempo": _center_crop_seq_dim(viz_batch["log_tempo_prev"].to(device), viz_T),
                         "meter_onehot": _center_crop_seq_dim(viz_batch["meter_onehot_prev"].to(device), viz_T),
                     }
-                    viz_out = svt_model(viz_act, viz_z_gt, temperature=temp, beat_targets=viz_bt)
+                    viz_db = _center_crop_seq_dim(
+                        viz_ext_target[:, 1:2, :].transpose(1, 2), viz_T
+                    ).squeeze(-1)
+                    viz_out = svt_model(viz_act, viz_z_gt, temperature=temp,
+                                        beat_targets=viz_bt, downbeat_targets=viz_db)
                     # Get GT downbeats from extractor_target channel 1
                     viz_gt_db = None
                     if "extractor_target" in viz_batch:
@@ -1025,7 +1077,8 @@ def main() -> None:
                             )[0, :, 0].cpu().numpy()
                 viz_dir = os.path.join(ckpt_dir, "viz")
                 viz_path = _save_beat_viz(viz_out, viz_bt, epoch, viz_dir, fps=val_fps,
-                                          gt_phase=viz_gt_db, gt_z_prev=viz_z_gt)
+                                          gt_phase=viz_gt_db, gt_z_prev=viz_z_gt,
+                                          downbeat_targets=viz_db)
                 if viz_path:
                     print(f"  [Viz] saved {viz_path}")
                     if use_wandb:
