@@ -56,6 +56,56 @@ def pad_collate(batch: list[dict]) -> dict:
     return result
 
 
+def _meter_from_beat_downbeat(
+    beats: np.ndarray,
+    downbeats: np.ndarray,
+    num_meter_classes: int = _DEFAULT_NUM_METER_CLASSES,
+) -> np.ndarray:
+    """Derive per-frame meter class by counting beats between downbeats.
+
+    Meter class = (number of beats per bar) - 1, clamped to [0, K-1].
+    E.g., 3/4 → class 2, 4/4 → class 3, 6/8 → class 5.
+
+    Args:
+        beats: [T] binary beat indicators.
+        downbeats: [T] binary downbeat indicators.
+        num_meter_classes: K.
+
+    Returns:
+        meter_class: [T] int array with meter class per frame.
+    """
+    T = len(beats)
+    meter_class = np.full(T, 3, dtype=np.int64)  # default 4/4 = class 3
+
+    beat_pos = np.where(beats > 0.5)[0]
+    db_pos = np.where(downbeats > 0.5)[0]
+
+    if len(db_pos) < 2 or len(beat_pos) < 2:
+        return meter_class
+
+    # For each pair of consecutive downbeats, count beats in between
+    for i in range(len(db_pos) - 1):
+        bar_start = db_pos[i]
+        bar_end = db_pos[i + 1]
+        beats_in_bar = int(np.sum((beat_pos >= bar_start) & (beat_pos < bar_end)))
+        if beats_in_bar < 1:
+            beats_in_bar = 4  # fallback
+        cls = min(beats_in_bar - 1, num_meter_classes - 1)
+        meter_class[bar_start:bar_end] = cls
+
+    # Extend last bar to end of sequence
+    if len(db_pos) >= 2:
+        last_bar_start = db_pos[-1]
+        prev_bar_start = db_pos[-2]
+        beats_in_last = int(np.sum((beat_pos >= prev_bar_start) & (beat_pos < last_bar_start)))
+        if beats_in_last < 1:
+            beats_in_last = 4
+        cls = min(beats_in_last - 1, num_meter_classes - 1)
+        meter_class[last_bar_start:] = cls
+
+    return meter_class
+
+
 def _phase_npy_to_structured(
     phase_np: np.ndarray,
     num_meter_classes: int = _DEFAULT_NUM_METER_CLASSES,
@@ -312,7 +362,10 @@ class AudioPhaseBridgeDataset(Dataset):
 
         if full_target_len > target_len:
             # Resample phase to full-song length at target fps
-            full_phase = self._fit_phase_length_np(phase_np, full_target_len)
+            full_phase = self._fit_phase_length_np(
+                phase_np, full_target_len,
+                phase_fps=phase_fps, target_fps=target_fps,
+            )
 
             # Find crop offset by matching beat positions
             crop_offset = self._find_phase_crop_offset(full_phase, beat_target, target_len)
@@ -321,16 +374,55 @@ class AudioPhaseBridgeDataset(Dataset):
         if phase_np.shape[0] != target_len:
             # Fallback: resample directly
             phase_np = self._fit_phase_length_np(
-                np.load(phase_path).astype(np.float32), target_len
+                np.load(phase_path).astype(np.float32), target_len,
+                phase_fps=phase_fps, target_fps=target_fps,
             )
 
         structured = _phase_npy_to_structured(phase_np, self.num_meter_classes)
-        prev = _build_prev_shifted(structured)
 
-        # Use WaveBeat's beat targets (channel 0) which are correctly time-aligned
-        # with the audio crop, rather than the phase-file-derived targets which are
-        # misaligned when WaveBeat uses a random crop position.
+        # Derive meter from beat/downbeat annotations instead of hardcoding 4/4.
+        # extractor_target: [2, T_ext] — channel 0 = beats, channel 1 = downbeats
+        if extractor_target.shape[0] >= 2:
+            beat_np = extractor_target[0].numpy()
+            db_np = extractor_target[1].numpy()
+            meter_derived = _meter_from_beat_downbeat(
+                beat_np, db_np, self.num_meter_classes
+            )
+            meter_idx = torch.as_tensor(meter_derived, dtype=torch.long)
+            structured["meter_index"] = meter_idx
+            structured["meter_onehot"] = F.one_hot(
+                meter_idx, self.num_meter_classes
+            ).float()
+
+        # Re-derive beat_phase from WaveBeat beat positions to eliminate
+        # the resampling offset. The sawtooth ramps 0→2π between consecutive
+        # beats, guaranteeing exact alignment with beat_targets.
         wavebeat_beat_targets = extractor_target[0].float()  # [T_ext] binary, aligned
+        beat_pos = torch.where(wavebeat_beat_targets > 0.5)[0].tolist()
+        if len(beat_pos) >= 2:
+            T_phase = structured["phase"].shape[0]
+            realigned_phase = torch.zeros(T_phase, 1)
+            # Before first beat
+            if beat_pos[0] > 0:
+                realigned_phase[:beat_pos[0], 0] = torch.linspace(
+                    0, TWO_PI * (1 - 1 / max(beat_pos[0], 1)), beat_pos[0]
+                )
+            # Between consecutive beats
+            for i in range(len(beat_pos) - 1):
+                s, e = beat_pos[i], beat_pos[i + 1]
+                if s < T_phase and e <= T_phase:
+                    span = e - s
+                    realigned_phase[s:e, 0] = torch.linspace(0, TWO_PI * (1 - 1 / span), span)
+            # After last beat
+            last = beat_pos[-1]
+            if last < T_phase:
+                remaining = T_phase - last
+                realigned_phase[last:, 0] = torch.linspace(
+                    0, TWO_PI * (1 - 1 / max(remaining, 1)), remaining
+                )
+            structured["phase"] = realigned_phase
+
+        prev = _build_prev_shifted(structured)
 
         return {
             "audio": audio,
@@ -415,36 +507,61 @@ class AudioPhaseBridgeDataset(Dataset):
         return int(np.argmax(scores))
 
     @staticmethod
-    def _fit_phase_length_np(phase_np: np.ndarray, target_len: int) -> np.ndarray:
+    @staticmethod
+    def _fit_phase_length_np(phase_np: np.ndarray, target_len: int,
+                             phase_fps: float = 100.0,
+                             target_fps: float | None = None) -> np.ndarray:
         """Temporally resample a phase array to ``target_len`` frames.
 
-        Uses linear interpolation for continuous columns (tempo, beat_phase,
-        bar_phase) and nearest-neighbor for the discrete meter_class column.
-        The tempo column is rescaled to account for the change in frames-per-second
-        so that beats-per-second stays constant.
+        Maps each target frame to its exact time in seconds, then
+        interpolates.  Circular columns (beat_phase, bar_phase in [0,1))
+        are unwrapped before linear interpolation and re-wrapped after,
+        so that the wrap point is placed at the correct sub-frame time
+        with no systematic offset.
         """
         current_len = phase_np.shape[0]
         if current_len == target_len:
             return phase_np
 
+        if target_fps is None:
+            target_fps = phase_fps * target_len / current_len
+
+        fps_ratio = phase_fps / target_fps
+
+        # Continuous source positions for each target frame
+        x_tgt = np.arange(target_len, dtype=np.float64) * fps_ratio
+        x_tgt_clipped = np.clip(x_tgt, 0.0, current_len - 1.0)
         x_src = np.arange(current_len, dtype=np.float64)
-        x_tgt = np.linspace(0.0, float(current_len - 1), target_len)
 
         n_cols = phase_np.shape[1]
         result = np.empty((target_len, n_cols), dtype=np.float32)
 
-        # Columns 0-2 (tempo, beat_phase, bar_phase): linear interpolation
-        for c in range(min(n_cols, 3)):
-            result[:, c] = np.interp(x_tgt, x_src, phase_np[:, c].astype(np.float64))
+        # Column 0 (tempo): linear interpolation + fps rescaling
+        result[:, 0] = np.interp(x_tgt_clipped, x_src, phase_np[:, 0].astype(np.float64))
+        result[:, 0] *= fps_ratio  # beats/src_frame → beats/tgt_frame
 
-        # Tempo column (0) is in beats/frame at source fps; rescale for target fps.
-        # beats/second = tempo_src * fps_src  →  tempo_tgt = tempo_src * (fps_src / fps_tgt)
-        # fps_src / fps_tgt ≈ current_len / target_len for the same audio duration.
-        result[:, 0] *= float(current_len) / float(target_len)
+        # Columns 1-2 (beat_phase, bar_phase): unwrap → linear interp → re-wrap
+        # Circular values in [0, 1) have discontinuous wraps (0.99 → 0.01).
+        # Unwrapping converts to a monotonically increasing signal, enabling
+        # correct linear interpolation across wrap boundaries.
+        for c in range(1, min(n_cols, 3)):
+            src = phase_np[:, c].astype(np.float64)
+            # Unwrap: accumulate forward differences, treating jumps < -0.5 as wraps
+            unwrapped = np.empty_like(src)
+            unwrapped[0] = src[0]
+            for i in range(1, len(src)):
+                diff = src[i] - src[i - 1]
+                if diff < -0.5:
+                    diff += 1.0  # wrap: 0.99 → 0.01 becomes +0.02
+                unwrapped[i] = unwrapped[i - 1] + diff
+            # Linear interpolation on the unwrapped signal
+            interp = np.interp(x_tgt_clipped, x_src, unwrapped)
+            # Re-wrap to [0, 1)
+            result[:, c] = (interp % 1.0).astype(np.float32)
 
         if n_cols >= 4:
             # Column 3 (meter_class) is discrete: nearest-neighbor
-            idx = np.clip(np.round(x_tgt).astype(np.int64), 0, current_len - 1)
+            idx = np.clip(np.floor(x_tgt).astype(np.int64), 0, current_len - 1)
             result[:, 3] = phase_np[idx, 3].astype(np.float32)
 
         return result
