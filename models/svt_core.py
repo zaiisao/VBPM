@@ -343,7 +343,7 @@ class SVTModel(nn.Module):
                 self.post_phase_kappa_ffn(h_post).squeeze(-1)),
             "tempo_mu": -2.1 + 0.9 * torch.tanh(                                      # [B, T] in [-3.0, -1.2]
                 self.post_tempo_mu_ffn(h_post).squeeze(-1)),                           # ~40-250 BPM at 86fps (madmom range)
-            "tempo_sigma": 0.01 + 1.99 * torch.sigmoid(                               # [B, T] in [0.01, 2.0]
+            "tempo_sigma": 0.01 + 0.09 * torch.sigmoid(                               # [B, T] in [0.01, 0.1]
                 self.post_tempo_sigma_ffn(h_post).squeeze(-1)),
         }
 
