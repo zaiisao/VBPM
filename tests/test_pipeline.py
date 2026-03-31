@@ -265,7 +265,7 @@ class TestGumbelSoftmaxSample:
 
 class TestComputeElboLoss:
     def _call(self, **kwargs):
-        beat_logits = torch.randn(B, T, 1)
+        beat_logits = torch.randn(B, T, 2)
         beat_targets = torch.randint(0, 2, (B, T)).float()
         posterior, prior = _make_posterior_prior()
         return compute_elbo_loss(
@@ -326,7 +326,7 @@ class TestComputeElboLoss:
             assert torch.isfinite(total), "NaN/Inf in loss for reasonable inputs"
 
     def test_no_nan_extreme_posterior(self):
-        beat_logits = torch.randn(B, T, 1)
+        beat_logits = torch.randn(B, T, 2)
         beat_targets = torch.randint(0, 2, (B, T)).float()
         posterior = {
             "meter_logits": torch.randn(B, T, K) * 100,
@@ -367,7 +367,7 @@ class TestSVTModelForward:
 
     def test_forward_shapes(self, model, activations, z_prev):
         out = model(activations, z_prev)
-        assert out["beat_logits"].shape == (B, T, 1)
+        assert out["beat_logits"].shape == (B, T, 2)
 
         post = out["posterior"]
         assert post["meter_logits"].shape == (B, T, K)
@@ -389,107 +389,91 @@ class TestSVTModelForward:
         assert samp["log_tempo"].shape == (B, T)
 
 
-class TestEncodeAcoustics:
+class TestEncodePosterior:
     def test_output_shape(self, model, activations):
-        h = model.encode_acoustics(activations)
-        assert h.shape == (B, T, D)
+        beat_targets = torch.zeros(B, T)
+        post = model.encode_posterior(activations, beat_targets, beat_targets)
+        assert post["phase_mu"].shape == (B, T)
+        assert post["tempo_mu"].shape == (B, T)
 
 
 class TestEncodePrior:
-    def test_output_shape(self, model, z_prev):
-        z_cat = torch.cat(
-            [z_prev["phase"], z_prev["log_tempo"], z_prev["meter_onehot"]],
-            dim=-1,
-        )
-        h = model.encode_prior(z_cat)
-        assert h.shape == (B, T, D)
+    def test_output_shape(self, model, activations):
+        h_prior, prior_params = model.encode_prior(activations)
+        assert h_prior.shape == (B, T, D)
+        assert "phase_kappa" in prior_params
+        assert "tempo_sigma" in prior_params
 
 
-class TestComputePriorParams:
-    def test_shapes_and_finite(self, model, z_prev):
-        h_prior = torch.randn(B, T, D)
-        prior = model.compute_prior_params(
-            h_prior,
-            z_prev["phase"],
-            z_prev["log_tempo"],
-            z_prev["meter_onehot"],
+class TestComputePriorAtT:
+    def test_shapes_and_finite(self, model, activations, z_prev):
+        _, prior_params = model.encode_prior(activations)
+        prior = model.compute_prior_at_t(
+            prior_params, t=1,
+            phase_prev=z_prev["phase"][:, 0, :],       # [B, 1]
+            log_tempo_prev=z_prev["log_tempo"][:, 0, :],  # [B, 1]
+            meter_onehot_prev=z_prev["meter_onehot"][:, 0],  # [B, K]
         )
-        assert prior["meter_logits"].shape == (B, T, K)
-        assert prior["phase_mu"].shape == (B, T)
-        assert prior["phase_kappa"].shape == (B, T)
-        assert prior["tempo_mu"].shape == (B, T)
-        assert prior["tempo_sigma"].shape == (B, T)
+        assert prior["phase_mu"].shape == (B,)
+        assert prior["phase_kappa"].shape == (B,)
+        assert prior["tempo_mu"].shape == (B,)
+        assert prior["tempo_sigma"].shape == (B,)
         for k, v in prior.items():
             assert torch.isfinite(v).all(), f"prior[{k}] has non-finite values"
 
-    def test_phase_mu_wraps_to_0_2pi(self, model, z_prev):
-        h_prior = torch.randn(B, T, D)
-        prior = model.compute_prior_params(
-            h_prior,
-            z_prev["phase"],
-            z_prev["log_tempo"],
-            z_prev["meter_onehot"],
+    def test_phase_mu_wraps_to_0_2pi(self, model, activations, z_prev):
+        _, prior_params = model.encode_prior(activations)
+        prior = model.compute_prior_at_t(
+            prior_params, t=1,
+            phase_prev=z_prev["phase"][:, 0, :],       # [B, 1]
+            log_tempo_prev=z_prev["log_tempo"][:, 0, :],  # [B, 1]
+            meter_onehot_prev=z_prev["meter_onehot"][:, 0],  # [B, K]
         )
         assert (prior["phase_mu"] >= 0).all()
         assert (prior["phase_mu"] < TWO_PI + 1e-5).all()
 
 
 class TestComputePosteriorParams:
-    def test_shapes_and_finite(self, model):
-        h_fused = torch.randn(B, T, D * 2)
-        post = model.compute_posterior_params(h_fused)
+    def test_shapes_and_finite(self, model, activations):
+        beat_targets = torch.zeros(B, T)
+        post = model.encode_posterior(activations, beat_targets, beat_targets)
         assert post["meter_logits"].shape == (B, T, K)
         assert post["phase_mu"].shape == (B, T)
-        assert post["phase_log_kappa"].shape == (B, T)
+        assert post["phase_kappa"].shape == (B, T)
         assert post["tempo_mu"].shape == (B, T)
-        assert post["tempo_log_sigma"].shape == (B, T)
+        assert post["tempo_sigma"].shape == (B, T)
         for k, v in post.items():
             assert torch.isfinite(v).all(), f"posterior[{k}] has non-finite values"
 
 
 class TestSampleLatent:
-    def test_shapes_and_finite(self, model):
-        posterior = {
-            "meter_logits": torch.randn(B, T, K),
-            "phase_mu": torch.randn(B, T),
-            "phase_log_kappa": torch.randn(B, T),
-            "tempo_mu": torch.randn(B, T),
-            "tempo_log_sigma": torch.randn(B, T),
-        }
-        samples = model.sample_latent(posterior)
-        assert samples["meter_soft"].shape == (B, T, K)
-        assert samples["meter_onehot"].shape == (B, T, K)
-        assert samples["phase"].shape == (B, T)
-        assert samples["log_tempo"].shape == (B, T)
-        for k, v in samples.items():
-            assert torch.isfinite(v).all(), f"samples[{k}] has non-finite values"
+    def test_shapes_and_finite(self, model, activations):
+        beat_targets = torch.zeros(B, T)
+        posterior = model.encode_posterior(activations, beat_targets, beat_targets)
+        phase = von_mises_sample(posterior["phase_mu"], posterior["phase_kappa"])
+        phase = torch.remainder(phase, TWO_PI)
+        assert phase.shape == (B, T)
+        assert torch.isfinite(phase).all()
 
-    def test_phase_in_0_2pi(self, model):
-        posterior = {
-            "meter_logits": torch.randn(B, T, K),
-            "phase_mu": torch.randn(B, T) * 10,
-            "phase_log_kappa": torch.zeros(B, T),
-            "tempo_mu": torch.randn(B, T),
-            "tempo_log_sigma": torch.randn(B, T),
-        }
-        samples = model.sample_latent(posterior)
-        assert (samples["phase"] >= 0).all()
-        assert (samples["phase"] < TWO_PI).all()
+    def test_phase_in_0_2pi(self, model, activations):
+        beat_targets = torch.zeros(B, T)
+        posterior = model.encode_posterior(activations, beat_targets, beat_targets)
+        phase = von_mises_sample(posterior["phase_mu"], posterior["phase_kappa"])
+        phase = torch.remainder(phase, TWO_PI)
+        assert (phase >= 0).all()
+        assert (phase < TWO_PI).all()
 
 
 class TestDecode:
-    def test_output_shape(self, model):
+    def test_output_shape(self, model, activations):
+        h_prior, _ = model.encode_prior(activations)
         samples = {
-            "phase": torch.randn(B, T),
-            "log_tempo": torch.randn(B, T),
-            "meter_soft": torch.softmax(torch.randn(B, T, K), dim=-1),
-            "meter_onehot": torch.nn.functional.one_hot(
-                torch.randint(0, K, (B, T)), K
-            ).float(),
+            "phase": torch.rand(B) * TWO_PI,
+            "log_tempo": torch.randn(B),
+            "meter_soft": torch.softmax(torch.randn(B, K), dim=-1),
         }
-        h_audio = torch.randn(B, T, D)
-        logits = model.decode(samples, h_audio)
-        assert logits.shape == (B, T, 1)
+        logits = model.decode_at_t(samples, h_prior[:, 0, :])
+        assert logits.shape == (B, 2)
 
 
 class TestForwardBackward:
