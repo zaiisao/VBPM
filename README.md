@@ -8,7 +8,12 @@ CHART is a Sequential Variational Transformer (SVT) realisation of the bar-point
 
 Training optimises the ELBO: BCE-with-logits on Gaussian-smoothed beat/downbeat targets, plus closed-form KLs (Categorical, von Mises with implicit reparameterisation, Gaussian-in-log-space) with optional per-latent free-bits. Inference samples sequentially from the prior alone; beats are read off phase wrap-arounds.
 
-The audio frontend is [WaveBeat](extractors/wavebeat) (Steinmetz & Reiss, AES 2021), vendored under [extractors/wavebeat/](extractors/wavebeat) with local patches for PyTorch Lightning 2.x and dataset-path resolution, and trained jointly in end-to-end mode.
+The audio frontend is pluggable. Two backends are vendored:
+
+- **WaveBeat** (Steinmetz & Reiss, AES 2021) under [extractors/wavebeat/](extractors/wavebeat), with local patches for PyTorch Lightning 2.x and dataset-path resolution. Default backend; native frame rate 86.13 fps (sr=22050, hop=256).
+- **Beat This!** (Foscarin & Schlüter, ISMIR 2024) under [extractors/beat_this/](extractors/beat_this); native frame rate 50 fps (sr=22050, hop=441). Selectable with `--extractor beat_this`.
+
+Both are jointly trained with the SVT in end-to-end mode.
 
 ## Setup
 
@@ -37,7 +42,7 @@ models/
 training/
   train.py            entrypoint for both modes; DDP-aware; top-3 ckpt by val F-measure
   dataset.py          ActivationDataset, AudioPhaseBridgeDataset, multi-source aggregator
-  extractors/         pluggable frontends (currently: wavebeat)
+  extractors/         pluggable frontends (wavebeat, beat_this)
   phase_generation/   per-dataset beat-annotation -> phase .npy converters
 evaluation/
   inference.py        prior-only sampling CLI
@@ -45,6 +50,7 @@ evaluation/
   score.py            mir_eval wrappers (F-measure, CMLc/t, AMLc/t)
 tests/test_pipeline.py
 extractors/wavebeat   vendored WaveBeat package (csteinmetz1/wavebeat + local patches)
+extractors/beat_this  vendored Beat This! package (CPJKU/beat_this)
 ```
 
 ## Data preparation
@@ -128,6 +134,21 @@ The trainer keeps the **top-3 checkpoints by validation beat F-measure**, named 
 NaN/Inf losses and gradients are detected before the optimiser step; offending batches are skipped and a one-time diagnostic dump is printed.
 
 The WaveBeat backend uses the **paper-correct values from the WaveBeat README** (`audio_sample_rate=22050`, `train_length=2097152`, `target_factor=256`), not the WaveBeat code defaults — see [training/extractors/wavebeat_backend.py](training/extractors/wavebeat_backend.py).
+
+### Beat This! backend
+
+```bash
+python -m training.train --mode end2end --extractor beat_this \
+    --dataset_root <dataset_root> \
+    --extractor_fps_mode native \
+    --beat_this_checkpoint final0 \
+    --batch_size 8 --num_epochs 100 --lr 1e-4 \
+    --save_ckpt_path checkpoints/chart_beat_this.pt
+```
+
+`--extractor_fps_mode native` (default) runs the entire pipeline at Beat This' 50 fps (sr=22050, hop=441). `--extractor_fps_mode resample` linearly upsamples the 50 fps logits to 86.13 fps so the SVT, target alignment, and the 512-frame crop window stay byte-equivalent with the WaveBeat backend — useful for A/B-ing.
+
+The pretrained checkpoint is auto-downloaded from the Beat This! release on first use. Override with `--extractor_ckpt /path/to/local.ckpt`. See [training/extractors/beat_this_backend.py](training/extractors/beat_this_backend.py).
 
 ## Inference
 
