@@ -175,16 +175,14 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
 
-checkpoints/
+# Repo-root-only rules — vendored upstream trees may have same-named
+# directories that we DO want to track (e.g., extractors/wavebeat/checkpoints/).
+/checkpoints/
+/wandb/
+/logs/
 
 # Claude Code
 .claude/
 
-# Weights & Biases
-wandb/
-
-# CHART scratch experiment outputs
-logs/
-
 # Pre-trained extractor checkpoints (downloadable from Zenodo)
-wavebeat_epoch=*.ckpt
+/wavebeat_epoch=*.ckpt
