@@ -1,3 +1,0 @@
-[submodule "extractors/wavebeat"]
-	path = extractors/wavebeat
-	url = https://github.com/csteinmetz1/wavebeat.git
