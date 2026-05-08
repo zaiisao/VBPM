@@ -8,15 +8,13 @@ CHART is a Sequential Variational Transformer (SVT) realisation of the bar-point
 
 Training optimises the ELBO: BCE-with-logits on Gaussian-smoothed beat/downbeat targets, plus closed-form KLs (Categorical, von Mises with implicit reparameterisation, Gaussian-in-log-space) with optional per-latent free-bits. Inference samples sequentially from the prior alone; beats are read off phase wrap-arounds.
 
-The audio frontend is [WaveBeat](extractors/wavebeat) (Steinmetz & Reiss, AES 2021), included as a git submodule and trained jointly in end-to-end mode.
+The audio frontend is [WaveBeat](extractors/wavebeat) (Steinmetz & Reiss, AES 2021), vendored under [extractors/wavebeat/](extractors/wavebeat) with local patches for PyTorch Lightning 2.x and dataset-path resolution, and trained jointly in end-to-end mode.
 
 ## Setup
 
 ```bash
-git clone --recurse-submodules <repo-url> CHART
+git clone <repo-url> CHART
 cd CHART
-# or, if already cloned without submodules:
-git submodule update --init
 
 conda env create -f environment.yml
 conda activate chart
@@ -46,7 +44,7 @@ evaluation/
   phase_converter.py  peak-pick + phase-wrap beat extraction
   score.py            mir_eval wrappers (F-measure, CMLc/t, AMLc/t)
 tests/test_pipeline.py
-extractors/wavebeat   git submodule (csteinmetz1/wavebeat)
+extractors/wavebeat   vendored WaveBeat package (csteinmetz1/wavebeat + local patches)
 ```
 
 ## Data preparation
@@ -147,7 +145,7 @@ python -m evaluation.inference \
 - `--temperature` controls the Gumbel-Softmax for meter (low ⇒ more discrete; default 0.1).
 - `--fps` must match the activation frame rate (default 86.1328125 = 22050 / 256).
 
-The CLI loads only the SVT submodule of a saved end-to-end checkpoint; WaveBeat activations must be produced separately (e.g. by running the WaveBeat dsTCN saved under `extractor_model` in the same checkpoint).
+The CLI loads only the SVT weights from a saved end-to-end checkpoint; WaveBeat activations must be produced separately (e.g. by running the WaveBeat dsTCN saved under `extractor_model` in the same checkpoint).
 
 ## Evaluation
 
