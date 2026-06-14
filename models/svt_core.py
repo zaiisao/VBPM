@@ -85,14 +85,32 @@ def _softplus_pos(raw: Tensor) -> Tensor:
 # Per-step posterior head (transition: t >= 1)
 # ---------------------------------------------------------------------------
 
-def _split_head(out: Tensor, K: int) -> dict[str, Tensor]:
+def _split_head(
+    out: Tensor,
+    K: int,
+    phi_prev: Tensor | None = None,
+    phase_delta_scale: float = math.pi,
+) -> dict[str, Tensor]:
     """Slice fused [..., K+4] head output into the five distribution params.
 
     Layout: [meter_logits (K) | phase_mu_raw | phase_kappa_raw | tempo_mu | tempo_sigma_raw]
+
+    Phase mean parameterization:
+      - absolute (default, ``phi_prev is None``): μ_φ = π·tanh(raw) — a free
+        per-frame angle.
+      - recursive (``phi_prev`` given): μ_φ = wrap(φ_{t-1} + δ·tanh(raw)) with
+        δ = ``phase_delta_scale`` — continuity by construction (smooth ramp),
+        which removes the free-absolute jitter degree of freedom.
     """
+    if phi_prev is None:
+        phase_mu = math.pi * torch.tanh(out[..., K])
+    else:
+        phase_mu = torch.remainder(
+            phi_prev + phase_delta_scale * torch.tanh(out[..., K]), TWO_PI,
+        )
     return {
         "meter_logits": out[..., :K],
-        "phase_mu": math.pi * torch.tanh(out[..., K]),
+        "phase_mu": phase_mu,
         "phase_kappa": _softplus_pos(out[..., K + 1]),
         "tempo_mu": out[..., K + 2],
         "tempo_sigma": _softplus_pos(out[..., K + 3]),
@@ -112,11 +130,19 @@ def _init_fused_head(head: nn.Linear, K: int) -> None:
 class _TransPosteriorHead(nn.Module):
     """Posterior FFN at t>=1: q_phi(z_t | h_post_t, ẑ_{t-1})."""
 
-    def __init__(self, hidden_dim: int, K: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        K: int,
+        recursive_phase: bool = False,
+        phase_delta_scale: float = math.pi / 4,
+    ) -> None:
         super().__init__()
         # z_prev_feat = [cos φ̂, sin φ̂, log τ̂, m̂_soft (K)]  -> 3 + K
         in_dim = hidden_dim + 3 + K
         self.K = K
+        self.recursive_phase = recursive_phase
+        self.phase_delta_scale = phase_delta_scale
         self.shared = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
@@ -125,9 +151,15 @@ class _TransPosteriorHead(nn.Module):
         self.fused_head = nn.Linear(hidden_dim, K + 4)
         _init_fused_head(self.fused_head, K)
 
-    def forward(self, h_post_t: Tensor, z_prev_feat: Tensor) -> dict[str, Tensor]:
+    def forward(
+        self, h_post_t: Tensor, z_prev_feat: Tensor, phi_prev: Tensor | None = None,
+    ) -> dict[str, Tensor]:
         h = self.shared(torch.cat([h_post_t, z_prev_feat], dim=-1))
-        return _split_head(self.fused_head(h), self.K)
+        out = self.fused_head(h)
+        if self.recursive_phase and phi_prev is not None:
+            return _split_head(out, self.K, phi_prev=phi_prev,
+                               phase_delta_scale=self.phase_delta_scale)
+        return _split_head(out, self.K)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +223,8 @@ class SVTModel(nn.Module):
         input_dim: int = 2,
         phase_corr_scale: float = PHASE_CORR_SCALE,
         tempo_corr_scale: float = TEMPO_CORR_SCALE,
+        decoder_use_h_prior: bool = True,
+        posterior_phase_recursive: bool = False,
         **kwargs,  # absorb extras for backward compat
     ) -> None:
         super().__init__()
@@ -268,16 +302,31 @@ class SVTModel(nn.Module):
         self.init_post_head = _InitPosteriorHead(hidden_dim, K)
 
         # ---- Per-step posterior head (transition) ----
-        self.trans_post_head = _TransPosteriorHead(hidden_dim, K)
+        # recursive_phase makes q's phase mean μ_q,t = wrap(φ_{t-1}+δ·tanh(·)),
+        # a smooth ramp by construction (vs a free per-frame absolute angle that
+        # jitters and drags the prior with it via the KL).
+        self.posterior_phase_recursive = posterior_phase_recursive
+        self.trans_post_head = _TransPosteriorHead(
+            hidden_dim, K, recursive_phase=posterior_phase_recursive,
+        )
 
         # ---- Decoder p_theta(b_t | z_t, h) ----
+        # decoder_use_h_prior=False makes the decoder LATENT-ONLY
+        # ([cos φ, sin φ, log τ, m]) — reconstruction can no longer shortcut
+        # through audio (h_prior), so the phase MUST wrap on beats for the
+        # decoder to fire. This is what forces the bar-pointer dynamics to be
+        # real (a clean beat-locked sawtooth) rather than decorative, lifting
+        # the phase-wrap inference read-out.
+        self.decoder_use_h_prior = decoder_use_h_prior
         self.h_prior_bottleneck_dim = h_prior_bottleneck
-        if h_prior_bottleneck > 0:
+        if not decoder_use_h_prior:
+            h_dim_for_decoder = 0
+        elif h_prior_bottleneck > 0:
             self.h_prior_bottleneck_proj = nn.Linear(hidden_dim, h_prior_bottleneck)
             h_dim_for_decoder = h_prior_bottleneck
         else:
             h_dim_for_decoder = hidden_dim
-        decoder_input_dim = 3 + K + h_dim_for_decoder  # [cos φ, sin φ, log τ, m, h]
+        decoder_input_dim = 3 + K + h_dim_for_decoder  # [cos φ, sin φ, log τ, m, (h)]
         self.emission_decoder = nn.Sequential(
             nn.Linear(decoder_input_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 2),  # beat, downbeat
@@ -329,6 +378,36 @@ class SVTModel(nn.Module):
             self.prior_tempo_corr_ffn(h_prior).squeeze(-1)
         )
         return phase_corr, tempo_corr
+
+    # ---------------------------------------------------------------------
+    # Decoder p_theta(b_t | z_t, h)
+    # ---------------------------------------------------------------------
+
+    def _decode(
+        self,
+        phase: Tensor,        # [B, T]
+        log_tempo: Tensor,    # [B, T]
+        meter_soft: Tensor,   # [B, T, K]
+        h_prior: Tensor,      # [B, T, D]
+    ) -> Tensor:
+        """Emit beat/downbeat logits [B, T, 2] from the latent (+ optional audio).
+
+        When ``decoder_use_h_prior`` is False the decoder is LATENT-ONLY, so
+        reconstruction must flow through the phase/tempo/meter latent — forcing
+        the phase to wrap on beats.
+        """
+        feats = [
+            torch.cos(phase).unsqueeze(-1),
+            torch.sin(phase).unsqueeze(-1),
+            log_tempo.unsqueeze(-1),
+            meter_soft,
+        ]
+        if self.decoder_use_h_prior:
+            h = h_prior
+            if self.h_prior_bottleneck_dim > 0:
+                h = self.h_prior_bottleneck_proj(h)
+            feats.append(h)
+        return self.emission_decoder(torch.cat(feats, dim=-1))
 
     # ---------------------------------------------------------------------
     # Beat-distance feature (continuous interpolation between beats)
@@ -463,7 +542,7 @@ class SVTModel(nn.Module):
                 meter_soft_prev,
             ], dim=-1)  # [B, K + 3]
 
-            post_t = self.trans_post_head(h_post[:, t], z_prev_feat)
+            post_t = self.trans_post_head(h_post[:, t], z_prev_feat, phi_prev=phase_prev)
 
             # Sample phase first (needed by meter prior)
             phase_t = von_mises_sample(post_t["phase_mu"], post_t["phase_kappa"])
@@ -543,17 +622,9 @@ class SVTModel(nn.Module):
         }
 
         # ---- Decode (parallel) ----
-        h = h_prior
-        if self.h_prior_bottleneck_dim > 0:
-            h = self.h_prior_bottleneck_proj(h)
-        decoder_input = torch.cat([
-            torch.cos(samples["phase"]).unsqueeze(-1),
-            torch.sin(samples["phase"]).unsqueeze(-1),
-            samples["log_tempo"].unsqueeze(-1),
-            samples["meter_soft"],
-            h,
-        ], dim=-1)
-        beat_logits = self.emission_decoder(decoder_input)  # [B, T, 2]
+        beat_logits = self._decode(
+            samples["phase"], samples["log_tempo"], samples["meter_soft"], h_prior,
+        )  # [B, T, 2]
 
         return {
             "beat_logits": beat_logits,
@@ -654,18 +725,8 @@ class SVTModel(nn.Module):
             num_classes=self.num_meter_classes,
         ).to(meter_soft_traj.dtype)
 
-        # Decode for diagnostic comparison
-        h = h_prior
-        if self.h_prior_bottleneck_dim > 0:
-            h = self.h_prior_bottleneck_proj(h)
-        decoder_input = torch.cat([
-            torch.cos(phase_traj).unsqueeze(-1),
-            torch.sin(phase_traj).unsqueeze(-1),
-            log_tempo_traj.unsqueeze(-1),
-            meter_soft_traj,
-            h,
-        ], dim=-1)
-        beat_logits = self.emission_decoder(decoder_input)  # [B, T, 2]
+        # Decode (latent-only when decoder_use_h_prior=False)
+        beat_logits = self._decode(phase_traj, log_tempo_traj, meter_soft_traj, h_prior)
 
         return {
             "phase": phase_traj,

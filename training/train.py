@@ -836,6 +836,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tempo_corr_scale", type=float, default=1.0,
                         help="Max audio-driven log-tempo-mean correction. Default 1.0. Smaller = "
                              "tempo stays closer to the random-walk prediction (less drift).")
+    parser.add_argument("--decoder_latent_only", action="store_true",
+                        help="Decoder ignores h_prior (audio) and reconstructs beats from the latent "
+                             "[cos φ, sin φ, log τ, meter] ALONE. Removes the audio shortcut so the "
+                             "phase must wrap on beats -> makes the phase-wrap inference read-out real.")
+    parser.add_argument("--posterior_phase_recursive", action="store_true",
+                        help="Posterior phase mean = wrap(φ_{t-1} + (π/4)·tanh(·)) instead of a free "
+                             "absolute angle -> smooth ramp by construction (less phase jitter).")
 
     # End-to-end
     parser.add_argument("--extractor_ckpt", type=str, default=None)
@@ -999,6 +1006,8 @@ def main() -> None:
     svt_model = SVTModel(
         hidden_dim=128, nhead=4, num_layers=2, num_meter_classes=K,
         phase_corr_scale=args.phase_corr_scale, tempo_corr_scale=args.tempo_corr_scale,
+        decoder_use_h_prior=not args.decoder_latent_only,
+        posterior_phase_recursive=args.posterior_phase_recursive,
     ).to(device)
 
     if is_distributed:

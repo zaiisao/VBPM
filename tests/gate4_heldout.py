@@ -117,11 +117,17 @@ def main() -> int:
         hidden_dim=128, nhead=4, num_layers=2, num_meter_classes=K,
         phase_corr_scale=saved.get("phase_corr_scale", _m.pi),
         tempo_corr_scale=saved.get("tempo_corr_scale", 1.0),
+        # These change the architecture (decoder input dim / posterior phase), so
+        # they MUST match the checkpoint or load_state_dict fails.
+        decoder_use_h_prior=not saved.get("decoder_latent_only", False),
+        posterior_phase_recursive=saved.get("posterior_phase_recursive", False),
     ).to(device)
     model.load_state_dict(ckpt["svt_model"] if "svt_model" in ckpt else ckpt, strict=True)
     model.eval()
     print(f"[Gate4] ckpt={cli.checkpoint} phase_corr_scale={model.phase_corr_scale:.3f} "
-          f"tempo_corr_scale={model.tempo_corr_scale}")
+          f"tempo_corr_scale={model.tempo_corr_scale} "
+          f"latent_only={not model.decoder_use_h_prior} "
+          f"recursive_phase={model.posterior_phase_recursive}")
 
     sums: dict[str, float] = {}
     counts: dict[str, int] = {}
