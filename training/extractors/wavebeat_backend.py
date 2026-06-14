@@ -243,6 +243,8 @@ class WaveBeatBackend:
             shuffle=shuffle,
             num_workers=args.num_workers,
             pin_memory=torch.cuda.is_available(),
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=4 if args.num_workers > 0 else None,
         )
 
     def build_val_dataloader(self, args: argparse.Namespace) -> DataLoader | None:
@@ -341,6 +343,8 @@ class WaveBeatBackend:
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=torch.cuda.is_available(),
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=4 if args.num_workers > 0 else None,
         )
 
     def build_model(self, args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
@@ -391,7 +395,14 @@ class WaveBeatBackend:
         model: torch.nn.Module,
         audio: torch.Tensor,
         target: torch.Tensor,
+        frozen: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if frozen:
+            with torch.no_grad():
+                logits = model(audio)
+                activations = torch.sigmoid(logits).transpose(1, 2)
+            zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
+            return zero, activations
         logits = model(audio)
         aligned_target = _center_crop_last_dim(target, logits.shape[-1])
         loss = self._criterion(logits, aligned_target)

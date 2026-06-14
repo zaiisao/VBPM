@@ -39,5 +39,10 @@ class ExtractorBackend(Protocol):
         model: torch.nn.Module,
         audio: torch.Tensor,
         target: torch.Tensor,
+        frozen: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return `(extractor_loss, activations)` for CHART training."""
+        """Return `(extractor_loss, activations)` for CHART training.
+
+        When ``frozen`` is True, the extractor forward runs under no_grad and
+        the loss is returned as a detached zero (purely a logging placeholder).
+        """

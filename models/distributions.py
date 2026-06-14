@@ -341,8 +341,10 @@ def lognormal_kl(
     Returns:
         KL divergence, same shape as inputs.
     """
-    sigma_q = sigma_q.clamp(min=1e-4)
-    sigma_p = sigma_p.clamp(min=1e-2)
+    # Numerical floor only: prevents log(0) / div-by-zero. Symmetric so neither
+    # q nor p is implicitly biased. Behavior is fully controlled by Softplus(NN).
+    sigma_q = sigma_q.clamp(min=1e-6)
+    sigma_p = sigma_p.clamp(min=1e-6)
 
     return (
         torch.log(sigma_p / sigma_q)
