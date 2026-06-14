@@ -2,14 +2,18 @@
 
 At inference time, beat annotations (b_{1:T}) are unavailable. The model
 uses the PRIOR (not posterior) to generate latent trajectories from audio
-alone. Beats are extracted from the phase trajectory by detecting
-wrap-around points (phase crossing 2*pi -> 0), following the bar pointer
-model's physics. The decoder is a training-time loss signal; at inference
-we read beats directly from the learned dynamics.
+alone. The prior means are audio-driven (g^φ_ψ(h_t), g^φ̇_ψ(h_t) corrections
+on the bar-pointer recursion), so the rolled-out dynamics track the signal
+rather than free-running an uninformed random walk.
+
+Two beat read-outs are available and reported side-by-side:
+  - phase-wrap: beats from phase wrap-arounds of the rolled-out latent
+    (the bar pointer's own dynamics);
+  - decoder:    beats from the decoder's beat channel (also audio-driven).
 
 This mirrors Stable Diffusion's approach: the encoder (posterior) provides
 structured training targets, but inference uses the generative model
-(prior/diffusion) without the encoder.
+(prior) without the encoder.
 """
 
 from __future__ import annotations
@@ -25,7 +29,10 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from models.svt_core import SVTModel
-from evaluation.phase_converter import extract_beats_from_phase_trajectory
+from evaluation.phase_converter import (
+    extract_beat_timestamps,
+    extract_beats_from_phase_trajectory,
+)
 
 TWO_PI = 2.0 * math.pi
 
@@ -143,16 +150,23 @@ def run_inference(
     log_tempo_traj = out["log_tempo"]                              # [B, T]
     meter_traj = out["meter_onehot"].argmax(dim=-1)                # [B, T]
     beat_logits = out["beat_logits"][:, :, 0]                      # [B, T]
+    db_logits = out["beat_logits"][:, :, 1]                        # [B, T]
 
-    # Extract beats from phase wrap-arounds (primary method)
+    # Extract beats two ways: phase wrap-arounds (dynamics) and the decoder
+    # beat channel (also audio-driven). Downbeats: decoder downbeat channel.
     phase_np = phase_traj.cpu().numpy()
-    beat_times_list = []
+    beat_probs_np = torch.sigmoid(beat_logits).cpu().numpy()
+    db_probs_np = torch.sigmoid(db_logits).cpu().numpy()
+    beat_times_list, beat_times_decoder_list, downbeat_times_list = [], [], []
     for b in range(B):
-        bt = extract_beats_from_phase_trajectory(phase_np[b], fps=fps)
-        beat_times_list.append(bt)
+        beat_times_list.append(extract_beats_from_phase_trajectory(phase_np[b], fps=fps))
+        beat_times_decoder_list.append(extract_beat_timestamps(beat_probs_np[b], fps=fps))
+        downbeat_times_list.append(extract_beat_timestamps(db_probs_np[b], fps=fps))
 
     return {
-        "beat_times": beat_times_list,
+        "beat_times": beat_times_list,             # phase-wrap read-out (primary)
+        "beat_times_decoder": beat_times_decoder_list,
+        "downbeat_times": downbeat_times_list,
         "phase": phase_traj,
         "log_tempo": log_tempo_traj,
         "tempo": log_tempo_traj.exp(),
@@ -190,16 +204,21 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(output_path, beat_times)
 
-    print(f"Saved {len(beat_times)} beat timestamps to: {output_path}")
-    if len(beat_times) > 0:
-        avg_bpm = 60.0 / np.mean(np.diff(beat_times)) if len(beat_times) > 1 else 0
-        print(f"Estimated tempo: {avg_bpm:.1f} BPM")
+    beat_times_decoder = results["beat_times_decoder"][0]
+    downbeat_times = results["downbeat_times"][0]
+    print(f"Saved {len(beat_times)} phase-wrap beat timestamps to: {output_path}")
+    print(f"  decoder read-out: {len(beat_times_decoder)} beats | {len(downbeat_times)} downbeats")
+    if len(beat_times) > 1:
+        avg_bpm = 60.0 / np.mean(np.diff(beat_times))
+        print(f"Estimated tempo (phase-wrap): {avg_bpm:.1f} BPM")
 
     # Also save full trajectories
     traj_path = output_path.with_suffix(".trajectories.npz")
     np.savez(
         traj_path,
         beat_times=beat_times,
+        beat_times_decoder=beat_times_decoder,
+        downbeat_times=downbeat_times,
         phase=results["phase"][0].cpu().numpy(),
         tempo=results["tempo"][0].cpu().numpy(),
         meter=results["meter"][0].cpu().numpy(),

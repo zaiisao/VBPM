@@ -24,7 +24,7 @@ except ImportError:
 
 from models.svt_core import SVTModel
 from models.loss import compute_elbo_loss
-from evaluation.phase_converter import extract_beat_timestamps, extract_downbeat_timestamps, extract_beats_from_phase_trajectory
+from evaluation.phase_converter import extract_beat_timestamps, extract_beats_from_phase_trajectory
 from evaluation.score import evaluate_beats, evaluate_downbeats, frames_to_beat_times
 from training.dataset import ActivationDataset
 from training.extractors import get_extractor_backend, list_extractor_backends
@@ -66,16 +66,6 @@ def _center_crop_seq_dim(x: Tensor, length: int) -> Tensor:
         raise ValueError(f"Cannot crop sequence length {x.shape[1]} to larger length {length}")
     start = (x.shape[1] - length) // 2
     return x[:, start : start + length]
-
-
-def _center_crop_seq_dim_1d(x: Tensor, length: int) -> Tensor:
-    """Center-crop a 1D or 2D tensor along dim 0 (seq dimension)."""
-    if x.shape[0] == length:
-        return x
-    if x.shape[0] < length:
-        raise ValueError(f"Cannot crop length {x.shape[0]} to {length}")
-    start = (x.shape[0] - length) // 2
-    return x[start : start + length]
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +334,7 @@ def train_epoch(
     device: torch.device,
     temperature: float = 1.0,
     beta: float = 1.0,
-    pos_weight: float = 20.0,
+    pos_weight: float = 1.0,
     pos_weight_db: float | None = None,
     max_grad_norm: float = 1.0,
     epoch: int = 1,
@@ -419,7 +409,7 @@ def train_epoch_end_to_end(
     device: torch.device,
     temperature: float = 1.0,
     beta: float = 1.0,
-    pos_weight: float = 20.0,
+    pos_weight: float = 1.0,
     pos_weight_db: float | None = None,
     free_bits: float = 0.0,
     free_bits_meter: float | None = None,
@@ -617,7 +607,7 @@ def val_epoch_end_to_end(  # noqa: C901
     device: torch.device,
     temperature: float = 1.0,
     beta: float = 1.0,
-    pos_weight: float = 20.0,
+    pos_weight: float = 1.0,
     pos_weight_db: float | None = None,
     free_bits: float = 0.0,
     free_bits_meter: float | None = None,
@@ -647,6 +637,7 @@ def val_epoch_end_to_end(  # noqa: C901
     svt_sum = 0.0
     comp_sums: dict[str, float] = {}
     metric_sums: dict[str, float] = {}
+    metric_counts: dict[str, int] = {}
     num_batches = 0
     num_eval_samples = 0
 
@@ -708,41 +699,59 @@ def val_epoch_end_to_end(  # noqa: C901
         # --- mir_eval beat/downbeat metrics per sample in batch ---
         beat_probs = torch.sigmoid(out["beat_logits"][:, :, 0]).cpu().numpy()  # [B, T]
         bt_ref_np = beat_targets_cropped.cpu().numpy()  # [B, T]
+        db_ref_np = downbeat_targets_cropped.cpu().numpy()  # [B, T]
         phase_np = out["samples"]["phase"].cpu().numpy()  # [B, T]
         B = beat_probs.shape[0]
+
+        # --- INFERENCE PATH: prior-only rollout (no beats). This is the exact
+        # path used at test time (evaluation/inference.py) — score it here so
+        # validation reflects deployed behavior, not the teacher-informed
+        # posterior. Beats: phase-wrap (dynamics) vs decoder read-out.
+        prior_out = svt_model.sample_from_prior(activations, temperature=temperature)
+        prior_phase_np = prior_out["phase"].cpu().numpy()  # [B, T]
+        prior_beat_probs = torch.sigmoid(prior_out["beat_logits"][:, :, 0]).cpu().numpy()
+        prior_db_probs = torch.sigmoid(prior_out["beat_logits"][:, :, 1]).cpu().numpy()
+
+        def _add(prefix: str, scores: dict) -> None:
+            # Per-key counts so each metric (esp. downbeats, scored only when a
+            # song has >=2 downbeats) averages over its own denominator.
+            for k, v in scores.items():
+                key = f"{prefix}{k}"
+                metric_sums[key] = metric_sums.get(key, 0.0) + v
+                metric_counts[key] = metric_counts.get(key, 0) + 1
 
         for b in range(B):
             ref_beats = frames_to_beat_times(bt_ref_np[b], fps)
             if len(ref_beats) < 2:
                 continue
+            ref_downbeats = frames_to_beat_times(db_ref_np[b], fps)
 
-            # --- Decoder-based beat extraction ---
+            # --- Decoder-based beat extraction (posterior forward) ---
             est_beats = extract_beat_timestamps(beat_probs[b], fps=fps)
             if len(est_beats) > 0:
-                beat_scores = evaluate_beats(ref_beats, est_beats)
-                for k, v in beat_scores.items():
-                    metric_sums[k] = metric_sums.get(k, 0.0) + v
-
-                # Downbeat metrics
-                est_downbeats = extract_downbeat_timestamps(est_beats, phase_np[b], fps=fps)
-                ref_downbeats = extract_downbeat_timestamps(
-                    ref_beats,
-                    _center_crop_seq_dim_1d(
-                        batch["phase"][b].squeeze(-1), T_act
-                    ).numpy() / 1.0,
-                    fps=fps,
+                _add("", evaluate_beats(ref_beats, est_beats))
+                # Downbeat metrics (decoder downbeat channel vs GT downbeats)
+                est_downbeats = extract_beat_timestamps(
+                    torch.sigmoid(out["beat_logits"][b, :, 1]).cpu().numpy(), fps=fps
                 )
                 if len(ref_downbeats) >= 2 and len(est_downbeats) >= 2:
-                    db_scores = evaluate_downbeats(ref_downbeats, est_downbeats)
-                    for k, v in db_scores.items():
-                        metric_sums[k] = metric_sums.get(k, 0.0) + v
+                    _add("", evaluate_downbeats(ref_downbeats, est_downbeats))
 
-            # --- Phase-based beat extraction (bar pointer wraps) ---
+            # --- Phase-based beat extraction (bar pointer wraps, posterior) ---
             est_beats_phase = extract_beats_from_phase_trajectory(phase_np[b], fps=fps)
             if len(est_beats_phase) > 0:
-                phase_beat_scores = evaluate_beats(ref_beats, est_beats_phase)
-                for k, v in phase_beat_scores.items():
-                    metric_sums[f"phase_{k}"] = metric_sums.get(f"phase_{k}", 0.0) + v
+                _add("phase_", evaluate_beats(ref_beats, est_beats_phase))
+
+            # --- INFERENCE: prior-rollout read-outs (the deployed path) ---
+            est_prior_phase = extract_beats_from_phase_trajectory(prior_phase_np[b], fps=fps)
+            if len(est_prior_phase) > 0:
+                _add("prior_phase_", evaluate_beats(ref_beats, est_prior_phase))
+            est_prior_dec = extract_beat_timestamps(prior_beat_probs[b], fps=fps)
+            if len(est_prior_dec) > 0:
+                _add("prior_dec_", evaluate_beats(ref_beats, est_prior_dec))
+                est_prior_db = extract_beat_timestamps(prior_db_probs[b], fps=fps)
+                if len(ref_downbeats) >= 2 and len(est_prior_db) >= 2:
+                    _add("prior_", evaluate_downbeats(ref_downbeats, est_prior_db))
 
             num_eval_samples += 1
 
@@ -753,7 +762,7 @@ def val_epoch_end_to_end(  # noqa: C901
         return 0.0, 0.0, 0.0, {}, {}
 
     avg_comps = {k: v / num_batches for k, v in comp_sums.items()}
-    avg_metrics = {k: v / max(num_eval_samples, 1) for k, v in metric_sums.items()}
+    avg_metrics = {k: v / max(metric_counts.get(k, 1), 1) for k, v in metric_sums.items()}
     return (
         total_sum / num_batches,
         extractor_sum / num_batches,
@@ -820,6 +829,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Number of past z frames for posterior context. 1=Markov (paper), >1=extended context.")
     parser.add_argument("--h_prior_bottleneck", type=int, default=0,
                         help="Bottleneck dim for h_prior in decoder. 0=full (default), >0=compressed.")
+    parser.add_argument("--phase_corr_scale", type=float, default=math.pi,
+                        help="Max audio-driven phase-mean correction (rad). Default pi (full reach, "
+                             "max KL reducibility). Smaller = audio NUDGES the bar-pointer recursion "
+                             "(cleaner sawtooth / more faithful dynamics).")
+    parser.add_argument("--tempo_corr_scale", type=float, default=1.0,
+                        help="Max audio-driven log-tempo-mean correction. Default 1.0. Smaller = "
+                             "tempo stays closer to the random-walk prediction (less drift).")
 
     # End-to-end
     parser.add_argument("--extractor_ckpt", type=str, default=None)
@@ -982,6 +998,7 @@ def main() -> None:
 
     svt_model = SVTModel(
         hidden_dim=128, nhead=4, num_layers=2, num_meter_classes=K,
+        phase_corr_scale=args.phase_corr_scale, tempo_corr_scale=args.tempo_corr_scale,
     ).to(device)
 
     if is_distributed:
@@ -1101,7 +1118,13 @@ def main() -> None:
                 f"  [Val] total={v_total:.6f} | ext={v_ext:.6f} | svt={v_svt:.6f} | "
                 f"{v_comp_str}"
             )
-            val_f_measure = v_metrics.get("F-measure", 0.0)
+            # Select checkpoints on the INFERENCE-path metric — the best of the
+            # two prior-rollout read-outs (phase-wrap dynamics vs decoder), which
+            # is exactly what Gate 4 scores. NOT the teacher-informed posterior.
+            val_f_measure = max(
+                v_metrics.get("prior_phase_F-measure", 0.0),
+                v_metrics.get("prior_dec_F-measure", 0.0),
+            )
             m_str = " | ".join(f"{k}={v:.4f}" for k, v in v_metrics.items()) if v_metrics else "F-measure=0.0000"
             print(f"  [Val mir_eval] {m_str}")
 
