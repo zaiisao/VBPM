@@ -54,14 +54,8 @@ def activations():
 
 
 @pytest.fixture()
-def z_prev():
-    return {
-        "phase": torch.rand(B, T, 1) * TWO_PI,
-        "log_tempo": torch.randn(B, T, 1),
-        "meter_onehot": torch.nn.functional.one_hot(
-            torch.randint(0, K, (B, T)), K
-        ).float(),
-    }
+def beat_targets():
+    return torch.randint(0, 2, (B, T)).float()
 
 
 def _make_posterior_prior(requires_grad: bool = False):
@@ -361,12 +355,12 @@ class TestSVTModelConstruction:
 
 
 class TestSVTModelForward:
-    def test_forward_returns_correct_keys(self, model, activations, z_prev):
-        out = model(activations, z_prev)
+    def test_forward_returns_correct_keys(self, model, activations, beat_targets):
+        out = model(activations, beat_targets=beat_targets)
         assert set(out.keys()) == {"beat_logits", "posterior", "prior", "samples"}
 
-    def test_forward_shapes(self, model, activations, z_prev):
-        out = model(activations, z_prev)
+    def test_forward_shapes(self, model, activations, beat_targets):
+        out = model(activations, beat_targets=beat_targets)
         assert out["beat_logits"].shape == (B, T, 2)
 
         post = out["posterior"]
@@ -391,96 +385,40 @@ class TestSVTModelForward:
 
 class TestEncodePosterior:
     def test_output_shape(self, model, activations):
-        beat_targets = torch.zeros(B, T)
-        post = model.encode_posterior(activations, beat_targets, beat_targets)
-        assert post["phase_mu"].shape == (B, T)
-        assert post["tempo_mu"].shape == (B, T)
+        bt = torch.zeros(B, T)
+        h_post = model.encode_posterior(activations, bt, bt)
+        assert h_post.shape == (B, T, D)
 
 
 class TestEncodePrior:
     def test_output_shape(self, model, activations):
-        h_prior, prior_params = model.encode_prior(activations)
+        h_prior = model.encode_prior(activations)
         assert h_prior.shape == (B, T, D)
-        assert "phase_kappa" in prior_params
-        assert "tempo_sigma" in prior_params
 
 
-class TestComputePriorAtT:
-    def test_shapes_and_finite(self, model, activations, z_prev):
-        _, prior_params = model.encode_prior(activations)
-        prior = model.compute_prior_at_t(
-            prior_params, t=1,
-            phase_prev=z_prev["phase"][:, 0, :],       # [B, 1]
-            log_tempo_prev=z_prev["log_tempo"][:, 0, :],  # [B, 1]
-            meter_onehot_prev=z_prev["meter_onehot"][:, 0],  # [B, K]
-        )
-        assert prior["phase_mu"].shape == (B,)
-        assert prior["phase_kappa"].shape == (B,)
-        assert prior["tempo_mu"].shape == (B,)
-        assert prior["tempo_sigma"].shape == (B,)
-        for k, v in prior.items():
-            assert torch.isfinite(v).all(), f"prior[{k}] has non-finite values"
-
-    def test_phase_mu_wraps_to_0_2pi(self, model, activations, z_prev):
-        _, prior_params = model.encode_prior(activations)
-        prior = model.compute_prior_at_t(
-            prior_params, t=1,
-            phase_prev=z_prev["phase"][:, 0, :],       # [B, 1]
-            log_tempo_prev=z_prev["log_tempo"][:, 0, :],  # [B, 1]
-            meter_onehot_prev=z_prev["meter_onehot"][:, 0],  # [B, K]
-        )
-        assert (prior["phase_mu"] >= 0).all()
-        assert (prior["phase_mu"] < TWO_PI + 1e-5).all()
-
-
-class TestComputePosteriorParams:
-    def test_shapes_and_finite(self, model, activations):
-        beat_targets = torch.zeros(B, T)
-        post = model.encode_posterior(activations, beat_targets, beat_targets)
-        assert post["meter_logits"].shape == (B, T, K)
-        assert post["phase_mu"].shape == (B, T)
-        assert post["phase_kappa"].shape == (B, T)
-        assert post["tempo_mu"].shape == (B, T)
-        assert post["tempo_sigma"].shape == (B, T)
-        for k, v in post.items():
-            assert torch.isfinite(v).all(), f"posterior[{k}] has non-finite values"
-
-
-class TestSampleLatent:
-    def test_shapes_and_finite(self, model, activations):
-        beat_targets = torch.zeros(B, T)
-        posterior = model.encode_posterior(activations, beat_targets, beat_targets)
-        phase = von_mises_sample(posterior["phase_mu"], posterior["phase_kappa"])
-        phase = torch.remainder(phase, TWO_PI)
-        assert phase.shape == (B, T)
-        assert torch.isfinite(phase).all()
-
-    def test_phase_in_0_2pi(self, model, activations):
-        beat_targets = torch.zeros(B, T)
-        posterior = model.encode_posterior(activations, beat_targets, beat_targets)
-        phase = von_mises_sample(posterior["phase_mu"], posterior["phase_kappa"])
-        phase = torch.remainder(phase, TWO_PI)
+class TestPhaseSampleRange:
+    def test_phase_in_0_2pi(self, model, activations, beat_targets):
+        out = model(activations, beat_targets=beat_targets)
+        phase = out["samples"]["phase"]
         assert (phase >= 0).all()
         assert (phase < TWO_PI).all()
 
 
-class TestDecode:
-    def test_output_shape(self, model, activations):
-        h_prior, _ = model.encode_prior(activations)
-        samples = {
-            "phase": torch.rand(B) * TWO_PI,
-            "log_tempo": torch.randn(B),
-            "meter_soft": torch.softmax(torch.randn(B, K), dim=-1),
-        }
-        logits = model.decode_at_t(samples, h_prior[:, 0, :])
-        assert logits.shape == (B, 2)
+class TestSampleFromPrior:
+    def test_output_shapes(self, model, activations):
+        out = model.sample_from_prior(activations, temperature=0.1)
+        assert out["phase"].shape == (B, T)
+        assert out["log_tempo"].shape == (B, T)
+        assert out["meter_soft"].shape == (B, T, K)
+        assert out["beat_logits"].shape == (B, T, 2)
+        for k, v in out.items():
+            assert torch.isfinite(v).all(), f"sample_from_prior[{k}] non-finite"
 
 
 class TestForwardBackward:
-    def test_no_nan_in_loss_and_grads(self, model, activations, z_prev):
-        out = model(activations, z_prev)
-        beat_targets = torch.randint(0, 2, (B, T)).float()
-        total, components = compute_elbo_loss(
+    def test_no_nan_in_loss_and_grads(self, model, activations, beat_targets):
+        out = model(activations, beat_targets=beat_targets)
+        total, _ = compute_elbo_loss(
             out["beat_logits"], beat_targets,
             out["posterior"], out["prior"],
         )
@@ -526,72 +464,22 @@ class TestNumericalStability:
         )
         assert torch.isfinite(kl).all()
 
-    def test_forward_backward_extreme_z_prev(self, model, activations):
-        """Extreme z_prev values (log_tempo = +/-10) should not crash."""
-        z_prev = {
-            "phase": torch.rand(B, T, 1) * TWO_PI,
-            "log_tempo": torch.full((B, T, 1), 10.0),
-            "meter_onehot": torch.nn.functional.one_hot(
-                torch.randint(0, K, (B, T)), K
-            ).float(),
-        }
-        model.zero_grad()
-        out = model(activations, z_prev)
-        beat_targets = torch.randint(0, 2, (B, T)).float()
-        total, _ = compute_elbo_loss(
-            out["beat_logits"], beat_targets,
-            out["posterior"], out["prior"],
-        )
-        assert torch.isfinite(total), f"Loss = {total.item()} with extreme z_prev"
-        total.backward()
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                assert torch.isfinite(p.grad).all(), (
-                    f"NaN/Inf gradient for {name} with extreme z_prev"
-                )
-
-    def test_forward_backward_negative_extreme_log_tempo(self, model, activations):
-        z_prev = {
-            "phase": torch.rand(B, T, 1) * TWO_PI,
-            "log_tempo": torch.full((B, T, 1), -10.0),
-            "meter_onehot": torch.nn.functional.one_hot(
-                torch.randint(0, K, (B, T)), K
-            ).float(),
-        }
-        model.zero_grad()
-        out = model(activations, z_prev)
-        beat_targets = torch.randint(0, 2, (B, T)).float()
-        total, _ = compute_elbo_loss(
-            out["beat_logits"], beat_targets,
-            out["posterior"], out["prior"],
-        )
-        assert torch.isfinite(total), f"Loss = {total.item()} with log_tempo=-10"
-        total.backward()
-
     def test_100_iterations_no_nan(self, model):
         """Run 100 forward+backward passes. Loss must never be NaN."""
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         for i in range(100):
             torch.manual_seed(i)
             act = torch.randn(B, T, 2)
-            zp = {
-                "phase": torch.rand(B, T, 1) * TWO_PI,
-                "log_tempo": torch.randn(B, T, 1),
-                "meter_onehot": torch.nn.functional.one_hot(
-                    torch.randint(0, K, (B, T)), K
-                ).float(),
-            }
             bt = torch.randint(0, 2, (B, T)).float()
 
             optimizer.zero_grad()
-            out = model(act, zp)
+            out = model(act, beat_targets=bt)
             total, _ = compute_elbo_loss(
                 out["beat_logits"], bt,
                 out["posterior"], out["prior"],
             )
             assert torch.isfinite(total), f"NaN loss at iteration {i}: {total.item()}"
             total.backward()
-            # Clip grads to prevent explosion that could cause NaN next iter
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -602,10 +490,9 @@ class TestNumericalStability:
 
 
 class TestEndToEndGradientFlow:
-    def test_all_params_have_gradients(self, model, activations, z_prev):
+    def test_all_params_have_gradients(self, model, activations, beat_targets):
         model.zero_grad()
-        out = model(activations, z_prev)
-        beat_targets = torch.randint(0, 2, (B, T)).float()
+        out = model(activations, beat_targets=beat_targets)
         total, _ = compute_elbo_loss(
             out["beat_logits"], beat_targets,
             out["posterior"], out["prior"],
@@ -627,11 +514,10 @@ class TestEndToEndGradientFlow:
             f"Parameters with NaN/Inf gradients: {params_with_nan_grad}"
         )
 
-    def test_gradients_are_nonzero_somewhere(self, model, activations, z_prev):
+    def test_gradients_are_nonzero_somewhere(self, model, activations, beat_targets):
         """At least most parameters should have non-zero gradients."""
         model.zero_grad()
-        out = model(activations, z_prev)
-        beat_targets = torch.randint(0, 2, (B, T)).float()
+        out = model(activations, beat_targets=beat_targets)
         total, _ = compute_elbo_loss(
             out["beat_logits"], beat_targets,
             out["posterior"], out["prior"],
@@ -640,12 +526,11 @@ class TestEndToEndGradientFlow:
 
         nonzero_count = 0
         total_count = 0
-        for name, p in model.named_parameters():
+        for _, p in model.named_parameters():
             total_count += 1
             if p.grad is not None and p.grad.abs().max() > 1e-12:
                 nonzero_count += 1
 
-        # At least 80% of parameters should have non-trivial gradients
         ratio = nonzero_count / total_count
         assert ratio > 0.8, (
             f"Only {nonzero_count}/{total_count} params have non-zero grads"

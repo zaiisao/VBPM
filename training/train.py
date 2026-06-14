@@ -6,7 +6,6 @@ import argparse
 import math
 import os
 import sys
-from collections.abc import Mapping, Sequence
 
 import heapq
 import numpy as np
@@ -58,15 +57,6 @@ def _kl_beta(epoch: int, anneal_epochs: int) -> float:
     if anneal_epochs <= 0:
         return 1.0
     return min(epoch / anneal_epochs, 1.0)
-
-
-def _build_z_prev(batch: Mapping[str, Tensor], device: torch.device) -> dict[str, Tensor]:
-    """Extract z_prev dict from a batch mapping."""
-    return {
-        "phase": batch["phase_prev"].to(device),
-        "log_tempo": batch["log_tempo_prev"].to(device),
-        "meter_onehot": batch["meter_onehot_prev"].to(device),
-    }
 
 
 def _center_crop_seq_dim(x: Tensor, length: int) -> Tensor:
@@ -128,12 +118,27 @@ def _save_beat_viz(
     bpm = tempo * 60 * fps / TWO_PI
     phase_wrapped = phase % TWO_PI
 
+    # Posterior μ^q (the model's BELIEF about tempo, separate from noisy samples).
+    # Plot this as the principal trace; show samples as a faded background.
+    post_log_tempo_mu = out["posterior"]["tempo_mu"][0].detach().cpu().numpy()
+    post_log_tempo_sigma = out["posterior"]["tempo_log_sigma"][0].exp().detach().cpu().numpy()
+    post_bpm = np.exp(np.clip(post_log_tempo_mu, -10, 10)) * 60 * fps / TWO_PI
+    post_bpm_lo = np.exp(np.clip(post_log_tempo_mu - post_log_tempo_sigma, -10, 10)) * 60 * fps / TWO_PI
+    post_bpm_hi = np.exp(np.clip(post_log_tempo_mu + post_log_tempo_sigma, -10, 10)) * 60 * fps / TWO_PI
+
+    # Model phase wrap events: detect drops > π (i.e. (φ_{t-1}+τ_{t-1}) crossed 2π).
+    phase_diff = np.diff(phase_wrapped, prepend=phase_wrapped[0])
+    model_wrap_frames = np.where(phase_diff < -np.pi)[0]
+
     # GT sawtooth from z_prev if available
     gt_phase_rad = None
     gt_bpm = None
+    gt_wrap_frames = np.array([], dtype=int)
     if gt_z_prev is not None and "phase" in gt_z_prev:
         gp = gt_z_prev["phase"][0, :T].detach().cpu().numpy()
         gt_phase_rad = (gp[:, 0] if gp.ndim == 2 else gp) % TWO_PI
+        gt_phase_diff = np.diff(gt_phase_rad, prepend=gt_phase_rad[0])
+        gt_wrap_frames = np.where(gt_phase_diff < -np.pi)[0]
         glt = gt_z_prev["log_tempo"][0, :T].detach().cpu().numpy()
         gt_log_tempo = glt[:, 0] if glt.ndim == 2 else glt
         gt_bpm = np.exp(np.clip(gt_log_tempo, -10, 10)) * 60 * fps / TWO_PI
@@ -179,38 +184,54 @@ def _save_beat_viz(
     axes[1].set_title("Downbeat P (blue) | GT downbeats (red)")
     axes[1].legend()
 
-    # 2. Phase: model vs GT sawtooth
-    axes[2].plot(phase_wrapped, "purple", lw=0.5, alpha=0.7, label="model phase")
+    # 2. Phase: model vs GT sawtooth, with explicit wrap markers
+    axes[2].plot(phase_wrapped, "purple", lw=0.5, alpha=0.5, label="model phase")
     if gt_phase_rad is not None:
-        axes[2].plot(gt_phase_rad, "green", lw=0.5, alpha=0.5, label="GT phase (sawtooth)")
+        axes[2].plot(gt_phase_rad, "green", lw=0.5, alpha=0.4, label="GT phase (sawtooth)")
+    # Markers: model wraps (purple ticks at top), GT wraps (green ticks at bottom)
+    for wf in model_wrap_frames:
+        axes[2].axvline(wf, color="purple", alpha=0.6, lw=1.0, ymin=0.85, ymax=1.0)
+    for wf in gt_wrap_frames:
+        axes[2].axvline(wf, color="green", alpha=0.6, lw=1.0, ymin=0.0, ymax=0.15)
     axes[2].axhline(0, color="k", ls=":", alpha=0.2)
     axes[2].axhline(TWO_PI, color="k", ls=":", alpha=0.2)
     axes[2].set_ylabel("Phase mod 2π")
-    axes[2].set_title("Phase: model (purple) vs GT sawtooth (green)")
+    axes[2].set_title(
+        f"Phase: model (purple, {len(model_wrap_frames)} wraps) vs GT sawtooth (green, {len(gt_wrap_frames)} wraps) "
+        "— ticks at top/bottom mark wrap events"
+    )
     axes[2].legend()
 
     # 3. Prior vs Posterior phase mu
     axes[3].plot(post_phase_mu, "blue", lw=0.5, alpha=0.7, label="posterior μ_φ")
-    axes[3].plot(prior_phase_mu, "red", lw=0.5, alpha=0.7, label="prior μ_φ (from GT z_prev)")
+    axes[3].plot(prior_phase_mu, "red", lw=0.5, alpha=0.7, label="prior μ_φ (autoregressive ẑ_{t-1})")
     if gt_phase_rad is not None:
         axes[3].plot(gt_phase_rad, "green", lw=0.3, alpha=0.3, label="GT phase")
     axes[3].set_ylabel("μ_φ mod 2π")
-    axes[3].set_title("Prior mean (red, from GT) vs Posterior mean (blue) — should overlap")
+    axes[3].set_title("Prior mean (red, sampled) vs Posterior mean (blue) — should track GT sawtooth")
     axes[3].legend()
 
-    # 4. Tempo BPM: model vs GT
-    axes[4].plot(bpm, "orange", lw=0.5, alpha=0.7, label="model BPM")
+    # 4. Tempo BPM: posterior belief (μ^q with ±σ band) vs raw samples vs GT
+    axes[4].fill_between(
+        np.arange(T), post_bpm_lo, post_bpm_hi,
+        color="orange", alpha=0.15, label="posterior μ^q ± σ^q",
+    )
+    axes[4].plot(post_bpm, "orange", lw=1.5, alpha=0.95, label="posterior μ^q (belief)")
+    axes[4].plot(bpm, "darkgray", lw=0.4, alpha=0.4, label="raw samples")
     if gt_bpm is not None:
-        axes[4].plot(gt_bpm, "green", lw=0.5, alpha=0.5, label="GT BPM")
+        axes[4].plot(gt_bpm, "green", lw=1.0, alpha=0.7, label="GT BPM")
     axes[4].set_ylabel("BPM")
-    axes[4].set_title(f"Tempo: model mean={bpm.mean():.0f} BPM" + (f", GT mean={gt_bpm.mean():.0f}" if gt_bpm is not None else ""))
+    title = f"Tempo: posterior μ^q={post_bpm.mean():.0f} BPM (samples mean={bpm.mean():.0f})"
+    if gt_bpm is not None:
+        title += f" | GT={gt_bpm.mean():.0f}"
+    axes[4].set_title(title)
     axes[4].legend()
 
     # 5. Per-frame KL
     axes[5].plot(kl_phase_t, "purple", lw=0.5, label=f"KL phase (mean={kl_phase_t.mean():.2f})")
     axes[5].plot(kl_tempo_t, "orange", lw=0.5, label=f"KL tempo (mean={kl_tempo_t.mean():.2f})")
     axes[5].set_ylabel("KL (nats)")
-    axes[5].set_title("Per-frame KL — high means posterior disagrees with GT-anchored prior")
+    axes[5].set_title("Per-frame KL — high means posterior disagrees with autoregressive prior")
     axes[5].legend()
 
     # 6. Prior uncertainty
@@ -324,6 +345,7 @@ def train_epoch(
     temperature: float = 1.0,
     beta: float = 1.0,
     pos_weight: float = 20.0,
+    pos_weight_db: float | None = None,
     max_grad_norm: float = 1.0,
     epoch: int = 1,
     num_epochs: int = 1,
@@ -344,17 +366,11 @@ def train_epoch(
     for batch_idx, batch in enumerate(dataloader, start=1):
         activations = batch["activations"].to(device)
         beat_targets = batch["beat_targets"].to(device)
-        z_prev = _build_z_prev(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Algorithm 1: sequential autoregressive (seed from first frame)
-        z_prev_init = {
-            "phase": z_prev["phase"][:, :1, :],
-            "log_tempo": z_prev["log_tempo"][:, :1, :],
-            "meter_onehot": z_prev["meter_onehot"][:, :1, :],
-        }
-        out = model(activations, z_prev_init, temperature=temperature)
+        # Algorithm 1 sequential rollout (initial state learned from h_global).
+        out = model(activations, temperature=temperature, beat_targets=beat_targets)
 
         total_loss, components = compute_elbo_loss(
             beat_logits=out["beat_logits"],
@@ -363,6 +379,7 @@ def train_epoch(
             prior=out["prior"],
             beta=beta,
             pos_weight=pos_weight,
+            pos_weight_db=pos_weight_db,
         )
 
         total_loss.backward()
@@ -403,6 +420,7 @@ def train_epoch_end_to_end(
     temperature: float = 1.0,
     beta: float = 1.0,
     pos_weight: float = 20.0,
+    pos_weight_db: float | None = None,
     free_bits: float = 0.0,
     free_bits_meter: float | None = None,
     free_bits_phase: float | None = None,
@@ -416,6 +434,7 @@ def train_epoch_end_to_end(
     is_main: bool = True,
     smooth_sigma: float = 3.0,
     smooth_sigma_db: float = 5.0,
+    frozen_extractor: bool = False,
 ) -> tuple[float, float, float, dict[str, float]]:
     """Run one end-to-end training epoch.
 
@@ -439,29 +458,41 @@ def train_epoch_end_to_end(
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Stage 1: Extractor forward
+        # Stage 1: Extractor forward (under no_grad if frozen — saves graph mem)
         extractor_loss, activations = extractor_backend.compute_loss_and_activations(
             model=extractor_model, audio=audio, target=extractor_target,
+            frozen=frozen_extractor,
         )
 
-        # Crop structured targets to match extractor output length
-        T_act = activations.shape[1]
-        beat_targets_cropped = _center_crop_seq_dim(beat_targets.unsqueeze(-1), T_act).squeeze(-1)
-
-        # Downbeat targets from extractor_target channel 1
-        downbeat_targets_cropped = _center_crop_seq_dim(
-            extractor_target[:, 1:2, :].transpose(1, 2), T_act
+        # Crop structured targets to match extractor output length, then cap
+        # for the sequential Algorithm 1 rollout (Python loop scales with T).
+        T_ext = activations.shape[1]
+        beat_targets_aligned = _center_crop_seq_dim(beat_targets.unsqueeze(-1), T_ext).squeeze(-1)
+        downbeat_targets_aligned = _center_crop_seq_dim(
+            extractor_target[:, 1:2, :].transpose(1, 2), T_ext
         ).squeeze(-1)
 
-        # Full GT z_prev trajectory (prior anchored to GT dynamics)
+        _MAX_TRAIN_FRAMES = 512  # ~6s @ 86fps, ~3 bars at 120 BPM
+        T_act = min(T_ext, _MAX_TRAIN_FRAMES)
+        if T_ext > T_act:
+            start = (T_ext - T_act) // 2
+            activations = activations[:, start : start + T_act, :]
+            beat_targets_cropped = beat_targets_aligned[:, start : start + T_act]
+            downbeat_targets_cropped = downbeat_targets_aligned[:, start : start + T_act]
+        else:
+            beat_targets_cropped = beat_targets_aligned
+            downbeat_targets_cropped = downbeat_targets_aligned
+
+        # GT z_prev kept only for diagnostic visualization, not fed to model
         z_prev_gt = {
             "phase": _center_crop_seq_dim(batch["phase_prev"].to(device), T_act),
             "log_tempo": _center_crop_seq_dim(batch["log_tempo_prev"].to(device), T_act),
             "meter_onehot": _center_crop_seq_dim(batch["meter_onehot_prev"].to(device), T_act),
         }
 
-        # Parallel forward: prior uses GT z_prev, posterior sampled independently
-        out = svt_model(activations, z_prev_gt, temperature=temperature,
+        # Algorithm 1 sequential rollout: posterior conditions on sampled ẑ_{t-1};
+        # prior means come from sampled ẑ_{t-1}; meter prior depends on sampled φ̂_t.
+        out = svt_model(activations, temperature=temperature,
                         beat_targets=beat_targets_cropped,
                         downbeat_targets=downbeat_targets_cropped)
         svt_total, components = compute_elbo_loss(
@@ -471,6 +502,7 @@ def train_epoch_end_to_end(
             prior=out["prior"],
             beta=beta,
             pos_weight=pos_weight,
+            pos_weight_db=pos_weight_db,
             free_bits=free_bits,
             free_bits_meter=free_bits_meter,
             free_bits_phase=free_bits_phase,
@@ -577,7 +609,7 @@ def train_epoch_end_to_end(
 
 
 @torch.no_grad()
-def val_epoch_end_to_end(
+def val_epoch_end_to_end(  # noqa: C901
     extractor_model: torch.nn.Module,
     extractor_backend: ExtractorBackend,
     svt_model: SVTModel,
@@ -586,6 +618,7 @@ def val_epoch_end_to_end(
     temperature: float = 1.0,
     beta: float = 1.0,
     pos_weight: float = 20.0,
+    pos_weight_db: float | None = None,
     free_bits: float = 0.0,
     free_bits_meter: float | None = None,
     free_bits_phase: float | None = None,
@@ -595,8 +628,13 @@ def val_epoch_end_to_end(
     fps: float = 86.1328125,
     smooth_sigma: float = 3.0,
     smooth_sigma_db: float = 5.0,
+    max_batches: int = 0,
 ) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
     """Run one validation epoch (no gradient updates).
+
+    Args:
+        max_batches: if > 0, stop after this many batches (random subset since
+            the loader shuffles). 0 means full val set.
 
     Returns:
         (avg_total, avg_extractor, avg_svt, avg_loss_components, avg_mir_eval_metrics).
@@ -625,9 +663,6 @@ def val_epoch_end_to_end(
         # to match the extractor's full output length, THEN cap for sequential loop.
         T_ext = activations.shape[1]  # extractor output length (center-valid)
         beat_targets_aligned = _center_crop_seq_dim(beat_targets.unsqueeze(-1), T_ext).squeeze(-1)
-        phase_prev_aligned = _center_crop_seq_dim(batch["phase_prev"].to(device), T_ext)
-        log_tempo_prev_aligned = _center_crop_seq_dim(batch["log_tempo_prev"].to(device), T_ext)
-        meter_prev_aligned = _center_crop_seq_dim(batch["meter_onehot_prev"].to(device), T_ext)
 
         # Downbeat targets from extractor_target channel 1
         downbeat_targets_aligned = _center_crop_seq_dim(
@@ -641,13 +676,7 @@ def val_epoch_end_to_end(
         beat_targets_cropped = beat_targets_aligned[:, :T_act]
         downbeat_targets_cropped = downbeat_targets_aligned[:, :T_act]
 
-        # Full GT z_prev for val
-        z_prev_gt = {
-            "phase": phase_prev_aligned[:, :T_act, :],
-            "log_tempo": log_tempo_prev_aligned[:, :T_act, :],
-            "meter_onehot": meter_prev_aligned[:, :T_act, :],
-        }
-        out = svt_model(activations, z_prev_gt, temperature=temperature,
+        out = svt_model(activations, temperature=temperature,
                         beat_targets=beat_targets_cropped,
                         downbeat_targets=downbeat_targets_cropped)
         svt_total, components = compute_elbo_loss(
@@ -657,6 +686,7 @@ def val_epoch_end_to_end(
             prior=out["prior"],
             beta=beta,
             pos_weight=pos_weight,
+            pos_weight_db=pos_weight_db,
             free_bits=free_bits,
             free_bits_meter=free_bits_meter,
             free_bits_phase=free_bits_phase,
@@ -716,6 +746,9 @@ def val_epoch_end_to_end(
 
             num_eval_samples += 1
 
+        if max_batches > 0 and num_batches >= max_batches:
+            break
+
     if num_batches == 0:
         return 0.0, 0.0, 0.0, {}, {}
 
@@ -750,12 +783,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_meter_classes", type=int, default=8)
     parser.add_argument("--gumbel_temp_start", type=float, default=1.0)
     parser.add_argument("--gumbel_temp_end", type=float, default=0.1)
-    parser.add_argument("--kl_anneal_epochs", type=int, default=10)
+    parser.add_argument("--kl_anneal_epochs", type=int, default=0,
+                        help="Linear KL warm-up over this many epochs. 0 = no annealing (strict ELBO).")
     parser.add_argument(
         "--bce_pos_weight",
         type=float,
-        default=20.0,
-        help="BCE positive-class weight to compensate for beat-frame class imbalance (~1%% positive rate). Default: 20.0",
+        default=1.0,
+        help="BCE positive-class weight for the BEAT channel. 1.0 = strict Bernoulli (PDF §5.4). Raise if all-zeros collapse persists.",
+    )
+    parser.add_argument(
+        "--bce_pos_weight_db",
+        type=float,
+        default=None,
+        help="BCE positive-class weight for the DOWNBEAT channel. None = use --bce_pos_weight. "
+             "Downbeats are ~1/4 the rate of beats, so a higher weight is often needed.",
     )
     parser.add_argument(
         "--free_bits",
@@ -769,10 +810,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Per-latent free_bits override for phase KL. Default: use --free_bits.")
     parser.add_argument("--free_bits_tempo", type=float, default=None,
                         help="Per-latent free_bits override for tempo KL. Default: use --free_bits.")
-    parser.add_argument("--smooth_sigma", type=float, default=3.0,
-                        help="Gaussian kernel sigma for beat target smoothing (frames). Default: 3.0.")
-    parser.add_argument("--smooth_sigma_db", type=float, default=5.0,
-                        help="Gaussian kernel sigma for downbeat target smoothing (frames). Default: 5.0.")
+    parser.add_argument("--smooth_sigma", type=float, default=0.0,
+                        help=argparse.SUPPRESS)  # legacy: ignored under strict Bernoulli BCE
+    parser.add_argument("--smooth_sigma_db", type=float, default=0.0,
+                        help=argparse.SUPPRESS)  # legacy: ignored under strict Bernoulli BCE
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping. Default: 1.0.")
     parser.add_argument("--z_context", type=int, default=1,
@@ -792,6 +833,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wavebeat_loss_weight", type=float, default=None, help=argparse.SUPPRESS)
 
     parser.add_argument("--save_ckpt_path", type=str, default=None)
+
+    # Validation cadence/scope (val is rank-0 only and slow under DDP)
+    parser.add_argument("--val_every", type=int, default=1,
+                        help="Run validation every N epochs (always on the final epoch). Default 1 (every epoch).")
+    parser.add_argument("--val_subset_batches", type=int, default=0,
+                        help="If >0, cap val to this many batches (math: random subset). Default 0 (full val set).")
 
     # Weights & Biases
     parser.add_argument("--wandb_project", type=str, default="chart")
@@ -862,7 +909,12 @@ def main() -> None:
 
     K = args.num_meter_classes
 
+    # JA: In our experiments, we use the "end-to-end" mode
     if args.mode == "activation":
+        # JA: Using this mode, we can process activations for each song in the dataset once using pretrained
+        # feature extractors and train the DBN in a quicker fashion. However, this mode does not allow
+        # end-to-end training and may lead to suboptimal performance if the activations are not well-aligned
+        # with the SVT model's needs.
         if args.activations_dir is None or args.phases_dir is None:
             raise ValueError("--activations_dir and --phases_dir are required for mode=activation")
 
@@ -894,6 +946,7 @@ def main() -> None:
                 temperature=temp,
                 beta=beta,
                 pos_weight=args.bce_pos_weight,
+                pos_weight_db=args.bce_pos_weight_db,
                 max_grad_norm=args.max_grad_norm,
                 epoch=epoch,
                 num_epochs=args.num_epochs,
@@ -967,6 +1020,7 @@ def main() -> None:
             temperature=temp,
             beta=beta,
             pos_weight=args.bce_pos_weight,
+            pos_weight_db=args.bce_pos_weight_db,
             free_bits=args.free_bits,
             free_bits_meter=args.free_bits_meter,
             free_bits_phase=args.free_bits_phase,
@@ -980,6 +1034,7 @@ def main() -> None:
             is_main=is_main,
             smooth_sigma=args.smooth_sigma,
             smooth_sigma_db=args.smooth_sigma_db,
+            frozen_extractor=args.freeze_extractor,
         )
 
         if is_main:
@@ -1013,7 +1068,12 @@ def main() -> None:
                 _wandb.log(train_log)
 
         val_f_measure = 0.0
-        if is_main and val_dataloader is not None:
+        do_val = (
+            is_main
+            and val_dataloader is not None
+            and (epoch % max(args.val_every, 1) == 0 or epoch == args.num_epochs)
+        )
+        if do_val:
             val_fps = getattr(args, "audio_sample_rate", 22050) / getattr(args, "target_factor", 256)
             v_total, v_ext, v_svt, v_comps, v_metrics = val_epoch_end_to_end(
                 extractor_model=extractor_model,
@@ -1024,6 +1084,7 @@ def main() -> None:
                 temperature=temp,
                 beta=beta,
                 pos_weight=args.bce_pos_weight,
+                pos_weight_db=args.bce_pos_weight_db,
                 free_bits=args.free_bits,
                 free_bits_meter=args.free_bits_meter,
                 free_bits_phase=args.free_bits_phase,
@@ -1032,7 +1093,8 @@ def main() -> None:
                 svt_loss_weight=args.svt_loss_weight,
                 fps=val_fps,
                 smooth_sigma=args.smooth_sigma,
-            smooth_sigma_db=args.smooth_sigma_db,
+                smooth_sigma_db=args.smooth_sigma_db,
+                max_batches=args.val_subset_batches,
             )
             v_comp_str = " | ".join(f"{k}={v:.6f}" for k, v in v_comps.items())
             print(
@@ -1051,6 +1113,7 @@ def main() -> None:
                     viz_ext_target = viz_batch["extractor_target"].to(device)
                     _, viz_act = extractor_backend.compute_loss_and_activations(
                         model=extractor_model, audio=viz_audio, target=viz_ext_target,
+                        frozen=args.freeze_extractor,
                     )
                     viz_T = min(viz_act.shape[1], 512)
                     viz_act = viz_act[:, :viz_T, :]
@@ -1065,7 +1128,7 @@ def main() -> None:
                     viz_db = _center_crop_seq_dim(
                         viz_ext_target[:, 1:2, :].transpose(1, 2), viz_T
                     ).squeeze(-1)
-                    viz_out = svt_model(viz_act, viz_z_gt, temperature=temp,
+                    viz_out = svt_model(viz_act, temperature=temp,
                                         beat_targets=viz_bt, downbeat_targets=viz_db)
                     # Get GT downbeats from extractor_target channel 1
                     viz_gt_db = None

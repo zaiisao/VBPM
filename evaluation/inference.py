@@ -25,11 +25,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from models.svt_core import SVTModel
-from models.distributions import (
-    gumbel_softmax_sample,
-    lognormal_sample_logspace,
-    von_mises_sample,
-)
 from evaluation.phase_converter import extract_beats_from_phase_trajectory
 
 TWO_PI = 2.0 * math.pi
@@ -139,73 +134,15 @@ def run_inference(
         - ``beat_logits``: ``[B, T]`` decoder beat logits (for comparison)
         - ``beat_probs``: ``[B, T]`` sigmoid of beat_logits
     """
-    B, T, _ = acoustic_activations.shape
-    device = acoustic_activations.device
-    K = model.num_meter_classes
+    B = acoustic_activations.shape[0]
 
-    # Step 0: Prior encoder — compute h_prior and uncertainty params
-    h_prior, prior_params = model.encode_prior(acoustic_activations)
+    # Sample latent trajectory from the prior alone (Algorithm 1, prior-only).
+    out = model.sample_from_prior(acoustic_activations, temperature=temperature)
 
-    # Initialize z_prev for t=0
-    phase_prev = torch.zeros(B, 1, device=device)
-    log_tempo_prev = torch.zeros(B, 1, device=device)
-    meter_prev = torch.ones(B, K, device=device) / K
-
-    # Accumulators
-    all_beat_logits = []
-    all_phase = []
-    all_log_tempo = []
-    all_meter = []
-
-    for t in range(T):
-        # Compute prior at time t
-        prior_t = model.compute_prior_at_t(
-            prior_params, t, phase_prev, log_tempo_prev, meter_prev,
-        )
-
-        # Sample from PRIOR (not posterior — no beat annotations available)
-        # Meter
-        meter_soft = gumbel_softmax_sample(
-            prior_t["meter_logits"], temperature=temperature, hard=False,
-        )
-        meter_hard = gumbel_softmax_sample(
-            prior_t["meter_logits"], temperature=temperature, hard=True,
-        )
-
-        # Phase: sample from vM(prior_mu, prior_kappa)
-        phase = von_mises_sample(prior_t["phase_mu"], prior_t["phase_kappa"])
-        phase = torch.remainder(phase, TWO_PI)
-
-        # Tempo: sample from LogNormal(prior_mu, prior_sigma)
-        log_tempo = lognormal_sample_logspace(
-            prior_t["tempo_mu"], prior_t["tempo_sigma"],
-        )
-
-        # Decode (for comparison — not used for beat extraction)
-        samp_t = {
-            "phase": phase,
-            "log_tempo": log_tempo,
-            "meter_soft": meter_soft,
-            "meter_onehot": meter_hard,
-        }
-        beat_logit_t = model.decode_at_t(samp_t, h_prior[:, t, :])
-
-        # Accumulate
-        all_beat_logits.append(beat_logit_t)
-        all_phase.append(phase)
-        all_log_tempo.append(log_tempo)
-        all_meter.append(meter_hard.argmax(dim=-1))
-
-        # Update z_prev for next step
-        phase_prev = phase.unsqueeze(-1)
-        log_tempo_prev = log_tempo.unsqueeze(-1)
-        meter_prev = meter_hard
-
-    # Stack
-    beat_logits = torch.stack(all_beat_logits, dim=1).squeeze(-1)  # [B, T]
-    phase_traj = torch.stack(all_phase, dim=1)                      # [B, T]
-    log_tempo_traj = torch.stack(all_log_tempo, dim=1)              # [B, T]
-    meter_traj = torch.stack(all_meter, dim=1)                      # [B, T]
+    phase_traj = out["phase"]                                      # [B, T]
+    log_tempo_traj = out["log_tempo"]                              # [B, T]
+    meter_traj = out["meter_onehot"].argmax(dim=-1)                # [B, T]
+    beat_logits = out["beat_logits"][:, :, 0]                      # [B, T]
 
     # Extract beats from phase wrap-arounds (primary method)
     phase_np = phase_traj.cpu().numpy()
