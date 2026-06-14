@@ -26,6 +26,30 @@ from models.distributions import (
 
 TWO_PI = 2.0 * math.pi
 
+# ---------------------------------------------------------------------------
+# Audio-driven prior-mean correction (P0 fix)
+# ---------------------------------------------------------------------------
+# The generative prior keeps the bar-pointer recursion as its inductive bias
+#   μ^p_φ,t = wrap(φ_{t-1} + φ̇_{t-1} + g^φ_ψ(h_t))
+#   μ^p_φ̇,t = log φ̇_{t-1} + g^φ̇_ψ(h_t)
+# where g_ψ are small audio-conditioned correction heads off h_prior. Without
+# the g_ψ terms (the original design) the rolled-out prior means are audio-blind
+# and inference free-runs an uninformed random walk; the heads let audio nudge
+# the dynamics (a learned Kalman/filter-style correction) while the KL keeps the
+# correction from drifting away from the posterior's beat-informed belief.
+#
+# PHASE_CORR_SCALE = π gives the correction full reach around the circle so the
+# prior phase mean can match ANY absolute posterior phase — this is what makes
+# the phase-KL reducible to ~0 (no structural floor). The tempo correction is a
+# generous ±1.0 in log-space (adjacent-frame log-tempo gaps are << 1).
+PHASE_CORR_SCALE = math.pi
+TEMPO_CORR_SCALE = 1.0
+
+# Sensible starting tempo so the freshly-initialised prior rolls out near a real
+# musical tempo (~120 BPM) instead of exp(0)=1 rad/frame (~820 BPM). This is an
+# initialisation only — the (unbounded) tempo head can represent any BPM.
+_INIT_LOG_TEMPO = math.log(120.0 / 60.0 * TWO_PI / 86.1328125)  # ≈ -1.93
+
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding (batch-first)."""
@@ -75,6 +99,16 @@ def _split_head(out: Tensor, K: int) -> dict[str, Tensor]:
     }
 
 
+def _init_fused_head(head: nn.Linear, K: int) -> None:
+    """Bias the tempo_mu output (slot K+2) toward a real musical tempo.
+
+    Removes the absurd exp(0)=1 rad/frame (~820 BPM) starting point WITHOUT
+    baking in a bounded tempo window (the head output stays unbounded).
+    """
+    with torch.no_grad():
+        head.bias[K + 2] = _INIT_LOG_TEMPO
+
+
 class _TransPosteriorHead(nn.Module):
     """Posterior FFN at t>=1: q_phi(z_t | h_post_t, ẑ_{t-1})."""
 
@@ -89,6 +123,7 @@ class _TransPosteriorHead(nn.Module):
         )
         # Fused head: meter_logits (K) + 4 scalar params concatenated.
         self.fused_head = nn.Linear(hidden_dim, K + 4)
+        _init_fused_head(self.fused_head, K)
 
     def forward(self, h_post_t: Tensor, z_prev_feat: Tensor) -> dict[str, Tensor]:
         h = self.shared(torch.cat([h_post_t, z_prev_feat], dim=-1))
@@ -110,6 +145,7 @@ class _InitPosteriorHead(nn.Module):
             nn.ReLU(),
         )
         self.fused_head = nn.Linear(hidden_dim, K + 4)
+        _init_fused_head(self.fused_head, K)
 
     def forward(self, h_post_0: Tensor) -> dict[str, Tensor]:
         h = self.shared(h_post_0)
@@ -131,6 +167,7 @@ class _InitPriorHead(nn.Module):
             nn.ReLU(),
         )
         self.fused_head = nn.Linear(hidden_dim, K + 4)
+        _init_fused_head(self.fused_head, K)
 
     def forward(self, h_global: Tensor) -> dict[str, Tensor]:
         h = self.shared(h_global)
@@ -152,11 +189,19 @@ class SVTModel(nn.Module):
         num_meter_classes: int = 8,
         h_prior_bottleneck: int = 0,
         input_dim: int = 2,
+        phase_corr_scale: float = PHASE_CORR_SCALE,
+        tempo_corr_scale: float = TEMPO_CORR_SCALE,
         **kwargs,  # absorb extras for backward compat
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_meter_classes = num_meter_classes
+        # Audio-driven prior-mean correction magnitudes. Defaults reproduce the
+        # original behaviour; a smaller phase_corr_scale makes audio a *nudge*
+        # on the bar-pointer recursion (cleaner sawtooth, more faithful dynamics)
+        # at the cost of some phase-KL reducibility.
+        self.phase_corr_scale = float(phase_corr_scale)
+        self.tempo_corr_scale = float(tempo_corr_scale)
         K = num_meter_classes
 
         # ---- Prior encoder (parallel; once per forward) ----
@@ -184,6 +229,27 @@ class SVTModel(nn.Module):
         self.prior_tempo_sigma_ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1),
         )
+
+        # ---- Audio-driven prior-MEAN correction heads (P0 fix) ----
+        # g^φ_ψ(h_t), g^φ̇_ψ(h_t): small per-frame corrections that couple audio
+        # to WHERE the latent state is at rollout time. Without these the prior
+        # means are a pure recursion of the previous sample (audio-blind), so
+        # inference free-runs an uninformed random walk. See PHASE/TEMPO_CORR_SCALE.
+        self.prior_phase_corr_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1),
+        )
+        self.prior_tempo_corr_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1),
+        )
+        # Start the correction near zero (model begins as the pure bar-pointer and
+        # learns to nudge), but keep weights nonzero so the audio→mean gradient is
+        # nonzero from step 0 (Gate 1). Scale down the final layer, zero its bias.
+        for _ffn in (self.prior_phase_corr_ffn, self.prior_tempo_corr_ffn):
+            last = _ffn[-1]
+            assert isinstance(last, nn.Linear)
+            with torch.no_grad():
+                last.weight.mul_(0.01)
+                last.bias.zero_()
 
         # ---- Meter transition prior (per-step) ----
         # PDF §3 (Our model): bar boundary detection is based on the predicted
@@ -242,6 +308,27 @@ class SVTModel(nn.Module):
         x = self.post_proj(x)
         x = self.post_pos_enc(x)
         return self.post_encoder(x)  # [B, T, D]
+
+    # ---------------------------------------------------------------------
+    # Audio-driven prior-mean corrections (P0 fix)
+    # ---------------------------------------------------------------------
+
+    def prior_mean_corrections(self, h_prior: Tensor) -> tuple[Tensor, Tensor]:
+        """Audio-conditioned corrections g^φ_ψ(h), g^φ̇_ψ(h) for the prior means.
+
+        Accepts ``h_prior`` of shape ``[B, T, D]`` (parallel over time) or
+        ``[B, D]`` (single step) and returns ``(phase_corr, tempo_corr)`` with
+        the trailing feature dim removed. ``phase_corr`` is bounded to ±π so the
+        prior phase mean can reach any point on the circle (making the phase-KL
+        reducible); ``tempo_corr`` is a generous ±1.0 nudge in log-space.
+        """
+        phase_corr = self.phase_corr_scale * torch.tanh(
+            self.prior_phase_corr_ffn(h_prior).squeeze(-1)
+        )
+        tempo_corr = self.tempo_corr_scale * torch.tanh(
+            self.prior_tempo_corr_ffn(h_prior).squeeze(-1)
+        )
+        return phase_corr, tempo_corr
 
     # ---------------------------------------------------------------------
     # Beat-distance feature (continuous interpolation between beats)
@@ -323,6 +410,8 @@ class SVTModel(nn.Module):
         prior_tempo_sigma_all = _softplus_pos(
             self.prior_tempo_sigma_ffn(h_prior).squeeze(-1)
         )  # [B, T]
+        # Pre-compute per-frame audio-driven prior-mean corrections (P0 fix)
+        prior_phase_corr_all, prior_tempo_corr_all = self.prior_mean_corrections(h_prior)  # [B, T] each
 
         # ---- Initial state (t = 0) ----
         h_global = h_prior.mean(dim=1)  # [B, D]
@@ -388,15 +477,21 @@ class SVTModel(nn.Module):
                 post_t["meter_logits"], temperature=temperature, hard=False,
             )
 
-            # ---- Prior at t (uses sampled ẑ_{t-1}) ----
+            # ---- Prior at t (uses sampled ẑ_{t-1} + audio correction g_ψ(h_t)) ----
+            # μ^p_φ,t = wrap(φ_{t-1} + φ̇_{t-1} + g^φ_ψ(h_t))
+            # μ^p_φ̇,t = log φ̇_{t-1} + g^φ̇_ψ(h_t)
             tempo_prev_lin = torch.exp(log_tempo_prev.clamp(max=10.0))
-            prior_phase_mu_t = torch.remainder(phase_prev + tempo_prev_lin, TWO_PI)
+            prior_phase_mu_t = torch.remainder(
+                phase_prev + tempo_prev_lin + prior_phase_corr_all[:, t], TWO_PI
+            )
             prior_phase_kappa_t = prior_phase_kappa_all[:, t]
-            prior_tempo_mu_t = log_tempo_prev
+            prior_tempo_mu_t = log_tempo_prev + prior_tempo_corr_all[:, t]
             prior_tempo_sigma_t = prior_tempo_sigma_all[:, t]
 
             # Meter prior: PDF §3 — boundary based on PREDICTED PHASE MEAN
-            # (φ̂_{t-1} + φ̇̂_{t-1}) ≥ 2π. Fed as a hard 0/1 indicator.
+            # (φ̂_{t-1} + φ̇̂_{t-1}) ≥ 2π. Fed as a hard 0/1 indicator. The
+            # bar-boundary test uses the deterministic advance (NOT the audio
+            # correction or the noisy sample), per the PDF.
             boundary = ((phase_prev + tempo_prev_lin) >= TWO_PI).float()  # [B]
             meter_prior_input = torch.cat([
                 meter_soft_prev,                # K
@@ -488,6 +583,9 @@ class SVTModel(nn.Module):
         h_prior = self.encode_prior(activations)
         prior_phase_kappa_all = _softplus_pos(self.prior_phase_kappa_ffn(h_prior).squeeze(-1))
         prior_tempo_sigma_all = _softplus_pos(self.prior_tempo_sigma_ffn(h_prior).squeeze(-1))
+        # Audio-driven prior-mean corrections (P0 fix): this is what couples the
+        # held-out audio to WHERE beats land during the inference rollout.
+        prior_phase_corr_all, prior_tempo_corr_all = self.prior_mean_corrections(h_prior)
 
         # Initial state from prior
         h_global = h_prior.mean(dim=1)
@@ -516,14 +614,16 @@ class SVTModel(nn.Module):
             cos_pp, sin_pp = cos_t, sin_t
 
             tempo_prev_lin = torch.exp(log_tempo_prev.clamp(max=10.0))
-            prior_phase_mu_t = torch.remainder(phase_prev + tempo_prev_lin, TWO_PI)
+            prior_phase_mu_t = torch.remainder(
+                phase_prev + tempo_prev_lin + prior_phase_corr_all[:, t], TWO_PI
+            )
 
             phase_t = von_mises_sample(prior_phase_mu_t, prior_phase_kappa_all[:, t])
             phase_t = torch.remainder(phase_t, TWO_PI)
             cos_t = torch.cos(phase_t)
             sin_t = torch.sin(phase_t)
             log_tempo_t = lognormal_sample_logspace(
-                log_tempo_prev, prior_tempo_sigma_all[:, t],
+                log_tempo_prev + prior_tempo_corr_all[:, t], prior_tempo_sigma_all[:, t],
             )
 
             boundary = ((phase_prev + tempo_prev_lin) >= TWO_PI).float()
