@@ -467,11 +467,43 @@ class BeatThisBackend:
     # Forward + loss
     # ------------------------------------------------------------------
 
+    def _align_to_target(
+        self,
+        beat_logits: torch.Tensor,
+        downbeat_logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Bring (beat, downbeat) logits and targets to a common frame axis.
+
+        resample: linear-interp the 50 fps logits up to the target's fps.
+        native:   crop the longer of (logits, target) down to the shorter
+                  (LogMelSpect with center=True emits one extra frame).
+        Returns ``(beat_logits, downbeat_logits, beat_target, downbeat_target)``.
+        """
+        if self._fps_mode == "resample":
+            T_target = target.shape[-1]
+            beat_logits = F.interpolate(
+                beat_logits.unsqueeze(1), size=T_target, mode="linear", align_corners=False,
+            ).squeeze(1)
+            downbeat_logits = F.interpolate(
+                downbeat_logits.unsqueeze(1), size=T_target, mode="linear", align_corners=False,
+            ).squeeze(1)
+            beat_target = target[:, 0, :].float()
+            downbeat_target = target[:, 1, :].float()
+        else:
+            T_aligned = min(beat_logits.shape[-1], target.shape[-1])
+            beat_logits = _center_crop_last_dim(beat_logits, T_aligned)
+            downbeat_logits = _center_crop_last_dim(downbeat_logits, T_aligned)
+            beat_target = _center_crop_last_dim(target[:, 0, :], T_aligned).float()
+            downbeat_target = _center_crop_last_dim(target[:, 1, :], T_aligned).float()
+        return beat_logits, downbeat_logits, beat_target, downbeat_target
+
     def compute_loss_and_activations(
         self,
         model: torch.nn.Module,
         audio: torch.Tensor,
         target: torch.Tensor,
+        frozen: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._spect is None or self._criterion is None:
             raise RuntimeError(
@@ -489,44 +521,31 @@ class BeatThisBackend:
         if spect_device != audio.device:
             self._spect = self._spect.to(audio.device)
 
+        # Frozen: forward under no_grad, no extractor loss (logging placeholder).
+        # Mirrors WaveBeatBackend so train.py's --freeze_extractor path works.
+        if frozen:
+            with torch.no_grad():
+                spect = self._spect(audio)
+                out = model(spect)
+                beat_logits, downbeat_logits, _, _ = self._align_to_target(
+                    out["beat"], out["downbeat"], target,
+                )
+                activations = torch.stack(
+                    [torch.sigmoid(beat_logits), torch.sigmoid(downbeat_logits)], dim=-1,
+                )
+            zero = torch.zeros((), device=audio.device, dtype=activations.dtype)
+            return zero, activations
+
         spect = self._spect(audio)  # [B, T_native, 128]
         out = model(spect)
-        beat_logits = out["beat"]          # [B, T_native]
-        downbeat_logits = out["downbeat"]  # [B, T_native]
-
-        if self._fps_mode == "resample":
-            T_target = target.shape[-1]
-            beat_logits = F.interpolate(
-                beat_logits.unsqueeze(1),
-                size=T_target,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(1)
-            downbeat_logits = F.interpolate(
-                downbeat_logits.unsqueeze(1),
-                size=T_target,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(1)
-            beat_target = target[:, 0, :].float()
-            downbeat_target = target[:, 1, :].float()
-        else:
-            # Native 50 fps. Beat This' LogMelSpect (torchaudio MelSpectrogram
-            # with center=True) emits one extra frame versus N//hop, so we
-            # align the longer of (logits, target) down to the shorter.
-            T_native = beat_logits.shape[-1]
-            T_target_dim = target.shape[-1]
-            T_aligned = min(T_native, T_target_dim)
-            beat_logits = _center_crop_last_dim(beat_logits, T_aligned)
-            downbeat_logits = _center_crop_last_dim(downbeat_logits, T_aligned)
-            beat_target = _center_crop_last_dim(target[:, 0, :], T_aligned).float()
-            downbeat_target = _center_crop_last_dim(target[:, 1, :], T_aligned).float()
+        beat_logits, downbeat_logits, beat_target, downbeat_target = self._align_to_target(
+            out["beat"], out["downbeat"], target,
+        )
 
         loss = self._criterion(beat_logits, beat_target) + self._criterion(
             downbeat_logits, downbeat_target,
         )
-
-        beat_act = torch.sigmoid(beat_logits)
-        db_act = torch.sigmoid(downbeat_logits)
-        activations = torch.stack([beat_act, db_act], dim=-1)  # [B, T, 2]
+        activations = torch.stack(
+            [torch.sigmoid(beat_logits), torch.sigmoid(downbeat_logits)], dim=-1,
+        )  # [B, T, 2]
         return loss, activations
