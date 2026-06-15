@@ -236,6 +236,9 @@ class SVTModel(nn.Module):
         tempo_corr_scale: float = TEMPO_CORR_SCALE,
         decoder_use_h_prior: bool = True,
         posterior_phase_recursive: bool = False,
+        tempo_anchor_mode: str = "none",
+        tempo_reversion_alpha: float = 0.0,
+        tempo_anchor_ema_beta: float = 0.02,
         **kwargs,  # absorb extras for backward compat
     ) -> None:
         super().__init__()
@@ -247,6 +250,23 @@ class SVTModel(nn.Module):
         # at the cost of some phase-KL reducibility.
         self.phase_corr_scale = float(phase_corr_scale)
         self.tempo_corr_scale = float(tempo_corr_scale)
+        # ---- Mean-reverting (Ornstein-Uhlenbeck) tempo prior ----
+        # The paper's tempo prior μ^p_φ̇,t = log φ̇_{t-1} is a pure random walk: each
+        # step's tempo change is penalised (Gaussian) but the LEVEL is uncontrolled,
+        # so cumulative variance grows ∝ t and the free-running rollout diverges.
+        # A weak reversion μ^p_φ̇,t = logφ̇_{t-1} + α(τ_anchor − logφ̇_{t-1}) + corr
+        # keeps within-bar fluctuation possible (rubato) while making sustained
+        # drift low-probability (bounded stationary variance). α=0 ⇒ pure paper
+        # random walk. Anchor modes: 'init' (t=1 audio tempo), 'global' (learned
+        # head on the clip summary), 'ema' (slow EMA of the tempo trajectory).
+        self.tempo_anchor_mode = str(tempo_anchor_mode)
+        self.tempo_reversion_alpha = float(tempo_reversion_alpha)
+        self.tempo_anchor_ema_beta = float(tempo_anchor_ema_beta)
+        if self.tempo_anchor_mode == "global":
+            self.tempo_anchor_head = nn.Linear(hidden_dim, 1)
+            with torch.no_grad():
+                self.tempo_anchor_head.weight.mul_(0.01)
+                self.tempo_anchor_head.bias.fill_(_INIT_LOG_TEMPO)
         K = num_meter_classes
 
         # ---- Prior encoder (parallel; once per forward) ----
@@ -346,6 +366,16 @@ class SVTModel(nn.Module):
     # ---------------------------------------------------------------------
     # Encoders
     # ---------------------------------------------------------------------
+
+    def _tempo_anchor(self, h_global: Tensor, init_prior: dict[str, Tensor]) -> Tensor:
+        """Per-sequence OU anchor (log-tempo) for the mean-reverting tempo prior.
+
+        'global' is a learned head on the whole-clip summary; 'init' / 'ema' seed
+        from the audio-conditioned t=1 tempo mean ('ema' then drifts it in-loop).
+        Returns a [B] tensor (the anchor τ_anchor in log-space)."""
+        if self.tempo_anchor_mode == "global":
+            return self.tempo_anchor_head(h_global).squeeze(-1)
+        return init_prior["tempo_mu"]
 
     def encode_prior(self, activations: Tensor) -> Tensor:
         """Bidirectional prior Transformer over activations -> h_prior_{1:T}."""
@@ -507,6 +537,7 @@ class SVTModel(nn.Module):
         h_global = h_prior.mean(dim=1)  # [B, D]
         init_prior = self.init_prior_head(h_global)
         init_post = self.init_post_head(h_post[:, 0])
+        tempo_anchor = self._tempo_anchor(h_global, init_prior)  # [B] OU reference
 
         phase_t = von_mises_sample(init_post["phase_mu"], init_post["phase_kappa"])
         phase_t = torch.remainder(phase_t, TWO_PI)
@@ -575,12 +606,17 @@ class SVTModel(nn.Module):
                 phase_prev + tempo_prev_lin + prior_phase_corr_all[:, t], TWO_PI
             )
             prior_phase_kappa_t = prior_phase_kappa_all[:, t]
-            # Bound the prior tempo mean to a musical range so the free-running
-            # rollout cannot diverge (see LOG_TEMPO_MIN/MAX). The KL then pulls the
-            # posterior tempo toward this bounded prior.
-            prior_tempo_mu_t = (log_tempo_prev + prior_tempo_corr_all[:, t]).clamp(
-                LOG_TEMPO_MIN, LOG_TEMPO_MAX
-            )
+            # Tempo prior mean: random walk + weak OU reversion toward τ_anchor,
+            # then a wide musical clamp as backstop. Reversion makes sustained
+            # drift / free-running divergence low-probability while preserving
+            # within-bar fluctuation (α=0 ⇒ pure paper random walk).
+            if self.tempo_anchor_mode == "ema":
+                tempo_anchor = (1.0 - self.tempo_anchor_ema_beta) * tempo_anchor \
+                    + self.tempo_anchor_ema_beta * log_tempo_prev
+            tempo_reversion = self.tempo_reversion_alpha * (tempo_anchor - log_tempo_prev)
+            prior_tempo_mu_t = (
+                log_tempo_prev + tempo_reversion + prior_tempo_corr_all[:, t]
+            ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
             prior_tempo_sigma_t = prior_tempo_sigma_all[:, t]
 
             # Meter prior: PDF §3 — boundary based on PREDICTED PHASE MEAN
@@ -677,6 +713,8 @@ class SVTModel(nn.Module):
         # Initial state from prior
         h_global = h_prior.mean(dim=1)
         init_prior = self.init_prior_head(h_global)
+        tempo_anchor = self._tempo_anchor(h_global, init_prior)      # stochastic chain
+        tempo_anchor_mu = self._tempo_anchor(h_global, init_prior)   # mean chain (separate EMA state)
 
         phase_t = von_mises_sample(init_prior["phase_mu"], init_prior["phase_kappa"])
         phase_t = torch.remainder(phase_t, TWO_PI)
@@ -721,19 +759,29 @@ class SVTModel(nn.Module):
             phase_mu_t = torch.remainder(
                 phase_mu_t + tempo_mu_prev_lin + prior_phase_corr_all[:, t], TWO_PI
             )
-            log_tempo_mu_t = (log_tempo_mu_t + prior_tempo_corr_all[:, t]).clamp(
-                LOG_TEMPO_MIN, LOG_TEMPO_MAX
-            )
+            if self.tempo_anchor_mode == "ema":
+                tempo_anchor_mu = (1.0 - self.tempo_anchor_ema_beta) * tempo_anchor_mu \
+                    + self.tempo_anchor_ema_beta * log_tempo_mu_t
+            log_tempo_mu_t = (
+                log_tempo_mu_t
+                + self.tempo_reversion_alpha * (tempo_anchor_mu - log_tempo_mu_t)
+                + prior_tempo_corr_all[:, t]
+            ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
             sample_phase_mu.append(phase_mu_t)
 
             phase_t = von_mises_sample(prior_phase_mu_t, prior_phase_kappa_all[:, t])
             phase_t = torch.remainder(phase_t, TWO_PI)
             cos_t = torch.cos(phase_t)
             sin_t = torch.sin(phase_t)
+            if self.tempo_anchor_mode == "ema":
+                tempo_anchor = (1.0 - self.tempo_anchor_ema_beta) * tempo_anchor \
+                    + self.tempo_anchor_ema_beta * log_tempo_prev
             log_tempo_t = lognormal_sample_logspace(
-                (log_tempo_prev + prior_tempo_corr_all[:, t]).clamp(
-                    LOG_TEMPO_MIN, LOG_TEMPO_MAX
-                ),
+                (
+                    log_tempo_prev
+                    + self.tempo_reversion_alpha * (tempo_anchor - log_tempo_prev)
+                    + prior_tempo_corr_all[:, t]
+                ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX),
                 prior_tempo_sigma_all[:, t],
             ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
 

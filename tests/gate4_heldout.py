@@ -121,6 +121,10 @@ def main() -> int:
         # they MUST match the checkpoint or load_state_dict fails.
         decoder_use_h_prior=not saved.get("decoder_latent_only", False),
         posterior_phase_recursive=saved.get("posterior_phase_recursive", False),
+        # Mean-reverting tempo prior (must match ckpt: 'global' adds a head).
+        tempo_anchor_mode=saved.get("tempo_anchor_mode", "none"),
+        tempo_reversion_alpha=saved.get("tempo_reversion_alpha", 0.0),
+        tempo_anchor_ema_beta=saved.get("tempo_anchor_ema_beta", 0.02),
     ).to(device)
     model.load_state_dict(ckpt["svt_model"] if "svt_model" in ckpt else ckpt, strict=True)
     model.eval()
