@@ -10,6 +10,8 @@ Faithful to ELBO_for_DBN.pdf §5:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -30,6 +32,7 @@ def compute_elbo_loss(
     free_bits_phase: float | None = None,
     free_bits_tempo: float | None = None,
     downbeat_targets: Tensor | None = None,
+    tempo_density_weight: float = 0.0,
     # legacy kwargs (ignored, kept for API compatibility during transition)
     smooth_sigma: float | None = None,
     smooth_sigma_db: float | None = None,
@@ -98,12 +101,30 @@ def compute_elbo_loss(
         fb_tempo,
     )
 
-    total = bce + beta * (kl_m + kl_phi + kl_tempo)
+    # ---- Tempo-density regularizer (opt-in; weight 0 ⇒ pure ELBO) ----
+    # The free-running PRIOR tempo can lock to a wrong metrical level (double-time):
+    # the latent-only decoder is indifferent to wrap RATE, so nothing penalises 2×.
+    # A sequence with N beats over T frames should advance ~N phase cycles, i.e. the
+    # mean tempo ≈ 2π·N/T rad/frame. Pin the per-sequence MEAN prior log-tempo to
+    # that GT-derived target. Touches only the PRIOR tempo (not the already-correct
+    # posterior), so unlike a tighter KL it cannot drag the posterior down.
+    if tempo_density_weight > 0.0:
+        two_pi = 2.0 * math.pi
+        n_beats = beat_targets.sum(dim=1).clamp(min=1.0)            # [B]
+        T = beat_targets.shape[1]
+        target_log_tempo = torch.log(two_pi * n_beats / T)         # [B]
+        pred_log_tempo = prior["tempo_mu"].mean(dim=1)             # [B]
+        tempo_density = ((pred_log_tempo - target_log_tempo) ** 2).mean()
+    else:
+        tempo_density = torch.zeros((), device=beat_logits.device)
+
+    total = bce + beta * (kl_m + kl_phi + kl_tempo) + tempo_density_weight * tempo_density
 
     components = {
         "bce": bce.detach(),
         "kl_meter": kl_m.detach(),
         "kl_phase": kl_phi.detach(),
         "kl_tempo": kl_tempo.detach(),
+        "tempo_density": tempo_density.detach(),
     }
     return total, components

@@ -37,7 +37,10 @@ m = SVTModel(hidden_dim=128, nhead=4, num_layers=2,
     phase_corr_scale=saved.get("phase_corr_scale", math.pi),
     tempo_corr_scale=saved.get("tempo_corr_scale", 1.0),
     decoder_use_h_prior=not saved.get("decoder_latent_only", False),
-    posterior_phase_recursive=saved.get("posterior_phase_recursive", False)).to(dev)
+    posterior_phase_recursive=saved.get("posterior_phase_recursive", False),
+    tempo_anchor_mode=saved.get("tempo_anchor_mode", "none"),
+    tempo_reversion_alpha=saved.get("tempo_reversion_alpha", 0.0),
+    tempo_anchor_ema_beta=saved.get("tempo_anchor_ema_beta", 0.02)).to(dev)
 m.load_state_dict(ck["svt_model"] if "svt_model" in ck else ck, strict=True); m.eval()
 fps = 22050/256
 print(f"INIT_LOG_TEMPO ref = {math.log(120/60*TWO_PI/fps):.3f} (=120BPM, ~{TWO_PI/(120/60*TWO_PI/fps):.0f} frames/beat)")
