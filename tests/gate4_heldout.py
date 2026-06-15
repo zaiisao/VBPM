@@ -172,7 +172,10 @@ def main() -> int:
             ref_db = frames_to_beat_times(db[0].cpu().numpy(), fps)
 
             out = model.sample_from_prior(activations, temperature=cli.temperature)
-            phase = out["phase"][0].cpu().numpy()
+            # Phase-wrap read-out uses the DETERMINISTIC mean trajectory (clean
+            # sawtooth -> regular IBIs -> CMLt); falls back to the stochastic
+            # sample for checkpoints saved before phase_mu existed.
+            phase = out.get("phase_mu", out["phase"])[0].cpu().numpy()
             bprobs = torch.sigmoid(out["beat_logits"][0, :, 0]).cpu().numpy()
             dbprobs = torch.sigmoid(out["beat_logits"][0, :, 1]).cpu().numpy()
 
