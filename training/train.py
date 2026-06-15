@@ -708,7 +708,10 @@ def val_epoch_end_to_end(  # noqa: C901
         # validation reflects deployed behavior, not the teacher-informed
         # posterior. Beats: phase-wrap (dynamics) vs decoder read-out.
         prior_out = svt_model.sample_from_prior(activations, temperature=temperature)
-        prior_phase_np = prior_out["phase"].cpu().numpy()  # [B, T]
+        # Phase-wrap read-out uses the deterministic prior MEAN (clean sawtooth ->
+        # regular IBIs -> CMLt); the stochastic sample's per-frame noise makes wraps
+        # ragged. Falls back to the sample if phase_mu is absent (older model code).
+        prior_phase_np = prior_out.get("phase_mu", prior_out["phase"]).cpu().numpy()  # [B, T]
         prior_beat_probs = torch.sigmoid(prior_out["beat_logits"][:, :, 0]).cpu().numpy()
         prior_db_probs = torch.sigmoid(prior_out["beat_logits"][:, :, 1]).cpu().numpy()
 

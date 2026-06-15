@@ -50,6 +50,17 @@ TEMPO_CORR_SCALE = 1.0
 # initialisation only — the (unbounded) tempo head can represent any BPM.
 _INIT_LOG_TEMPO = math.log(120.0 / 60.0 * TWO_PI / 86.1328125)  # ≈ -1.93
 
+# Musical bounds on the prior log-tempo recursion. WITHOUT these the prior tempo
+# is an UNANCHORED random walk (μ^p_τ,t = log φ̇_{t-1} + corr) that diverges when
+# free-running at inference (sample_from_prior): it explodes to exp(+1000), the
+# phase advance becomes garbage, and the phase-wrap read-out degrades to noise.
+# During training the audio-conditioned posterior re-anchors tempo each frame so
+# divergence is hidden — a textbook exposure-bias gap. Clamping the carried prior
+# tempo state to a generous musical range (~35–290 BPM) keeps the free-running
+# rollout on a coherent sawtooth. Bounds are in log(rad/frame) at fps=86.13.
+LOG_TEMPO_MIN = math.log(35.0 / 60.0 * TWO_PI / 86.1328125)   # ≈ -3.16  (35 BPM)
+LOG_TEMPO_MAX = math.log(290.0 / 60.0 * TWO_PI / 86.1328125)  # ≈ -1.04  (290 BPM)
+
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding (batch-first)."""
@@ -564,7 +575,12 @@ class SVTModel(nn.Module):
                 phase_prev + tempo_prev_lin + prior_phase_corr_all[:, t], TWO_PI
             )
             prior_phase_kappa_t = prior_phase_kappa_all[:, t]
-            prior_tempo_mu_t = log_tempo_prev + prior_tempo_corr_all[:, t]
+            # Bound the prior tempo mean to a musical range so the free-running
+            # rollout cannot diverge (see LOG_TEMPO_MIN/MAX). The KL then pulls the
+            # posterior tempo toward this bounded prior.
+            prior_tempo_mu_t = (log_tempo_prev + prior_tempo_corr_all[:, t]).clamp(
+                LOG_TEMPO_MIN, LOG_TEMPO_MAX
+            )
             prior_tempo_sigma_t = prior_tempo_sigma_all[:, t]
 
             # Meter prior: PDF §3 — boundary based on PREDICTED PHASE MEAN
@@ -665,8 +681,9 @@ class SVTModel(nn.Module):
         phase_t = von_mises_sample(init_prior["phase_mu"], init_prior["phase_kappa"])
         phase_t = torch.remainder(phase_t, TWO_PI)
         log_tempo_t = lognormal_sample_logspace(
-            init_prior["tempo_mu"], init_prior["tempo_sigma"],
-        )
+            init_prior["tempo_mu"].clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX),
+            init_prior["tempo_sigma"],
+        ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
         meter_soft_t = gumbel_softmax_sample(
             init_prior["meter_logits"], temperature=temperature, hard=False,
         )
@@ -674,6 +691,16 @@ class SVTModel(nn.Module):
         sample_phase = [phase_t]
         sample_log_tempo = [log_tempo_t]
         sample_meter_soft = [meter_soft_t]
+
+        # Deterministic prior-MEAN chain (no per-frame noise) for the phase-wrap
+        # read-out. The stochastic `phase_traj` jitters the inter-beat intervals
+        # (von Mises + accumulating log-tempo random walk) so its wraps are ragged
+        # (low CMLt); the mean trajectory follows the bar-pointer recursion exactly
+        # -> clean sawtooth. Built from the previous MEAN (not the previous sample)
+        # so no jitter leaks in. Zero extra compute; decoder still reads the sample.
+        phase_mu_t = torch.remainder(init_prior["phase_mu"], TWO_PI)
+        log_tempo_mu_t = init_prior["tempo_mu"].clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
+        sample_phase_mu = [phase_mu_t]
 
         cos_t = torch.cos(phase_t)
         sin_t = torch.sin(phase_t)
@@ -689,13 +716,26 @@ class SVTModel(nn.Module):
                 phase_prev + tempo_prev_lin + prior_phase_corr_all[:, t], TWO_PI
             )
 
+            # Deterministic mean advance (uses the deterministic prev, not samples).
+            tempo_mu_prev_lin = torch.exp(log_tempo_mu_t.clamp(max=10.0))
+            phase_mu_t = torch.remainder(
+                phase_mu_t + tempo_mu_prev_lin + prior_phase_corr_all[:, t], TWO_PI
+            )
+            log_tempo_mu_t = (log_tempo_mu_t + prior_tempo_corr_all[:, t]).clamp(
+                LOG_TEMPO_MIN, LOG_TEMPO_MAX
+            )
+            sample_phase_mu.append(phase_mu_t)
+
             phase_t = von_mises_sample(prior_phase_mu_t, prior_phase_kappa_all[:, t])
             phase_t = torch.remainder(phase_t, TWO_PI)
             cos_t = torch.cos(phase_t)
             sin_t = torch.sin(phase_t)
             log_tempo_t = lognormal_sample_logspace(
-                log_tempo_prev + prior_tempo_corr_all[:, t], prior_tempo_sigma_all[:, t],
-            )
+                (log_tempo_prev + prior_tempo_corr_all[:, t]).clamp(
+                    LOG_TEMPO_MIN, LOG_TEMPO_MAX
+                ),
+                prior_tempo_sigma_all[:, t],
+            ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
 
             boundary = ((phase_prev + tempo_prev_lin) >= TWO_PI).float()
             meter_prior_input = torch.cat([
@@ -717,6 +757,7 @@ class SVTModel(nn.Module):
             sample_meter_soft.append(meter_soft_t)
 
         phase_traj = torch.stack(sample_phase, dim=1)
+        phase_mu_traj = torch.stack(sample_phase_mu, dim=1)
         log_tempo_traj = torch.stack(sample_log_tempo, dim=1)
         meter_soft_traj = torch.stack(sample_meter_soft, dim=1)
         # Hard one-hot: argmax of soft + lazy one-hot (no extra Gumbel sampling).
@@ -730,6 +771,7 @@ class SVTModel(nn.Module):
 
         return {
             "phase": phase_traj,
+            "phase_mu": phase_mu_traj,
             "log_tempo": log_tempo_traj,
             "meter_soft": meter_soft_traj,
             "meter_onehot": meter_hard_traj,

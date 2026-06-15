@@ -147,6 +147,10 @@ def run_inference(
     out = model.sample_from_prior(acoustic_activations, temperature=temperature)
 
     phase_traj = out["phase"]                                      # [B, T]
+    # Deterministic prior MEAN trajectory: clean sawtooth for the phase-wrap
+    # read-out (the stochastic sample's per-frame noise makes wraps ragged ->
+    # low CMLt). Falls back to the sample for checkpoints predating phase_mu.
+    phase_mu_traj = out.get("phase_mu", phase_traj)               # [B, T]
     log_tempo_traj = out["log_tempo"]                              # [B, T]
     meter_traj = out["meter_onehot"].argmax(dim=-1)                # [B, T]
     beat_logits = out["beat_logits"][:, :, 0]                      # [B, T]
@@ -154,12 +158,12 @@ def run_inference(
 
     # Extract beats two ways: phase wrap-arounds (dynamics) and the decoder
     # beat channel (also audio-driven). Downbeats: decoder downbeat channel.
-    phase_np = phase_traj.cpu().numpy()
+    phase_mu_np = phase_mu_traj.cpu().numpy()
     beat_probs_np = torch.sigmoid(beat_logits).cpu().numpy()
     db_probs_np = torch.sigmoid(db_logits).cpu().numpy()
     beat_times_list, beat_times_decoder_list, downbeat_times_list = [], [], []
     for b in range(B):
-        beat_times_list.append(extract_beats_from_phase_trajectory(phase_np[b], fps=fps))
+        beat_times_list.append(extract_beats_from_phase_trajectory(phase_mu_np[b], fps=fps))
         beat_times_decoder_list.append(extract_beat_timestamps(beat_probs_np[b], fps=fps))
         downbeat_times_list.append(extract_beat_timestamps(db_probs_np[b], fps=fps))
 
