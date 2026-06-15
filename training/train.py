@@ -415,6 +415,7 @@ def train_epoch_end_to_end(
     free_bits_meter: float | None = None,
     free_bits_phase: float | None = None,
     free_bits_tempo: float | None = None,
+    tempo_density_weight: float = 0.0,
     max_grad_norm: float = 1.0,
     extractor_loss_weight: float = 1.0,
     svt_loss_weight: float = 1.0,
@@ -497,6 +498,7 @@ def train_epoch_end_to_end(
             free_bits_meter=free_bits_meter,
             free_bits_phase=free_bits_phase,
             free_bits_tempo=free_bits_tempo,
+            tempo_density_weight=tempo_density_weight,
             downbeat_targets=downbeat_targets_cropped,
             smooth_sigma=smooth_sigma,
             smooth_sigma_db=smooth_sigma_db,
@@ -613,6 +615,7 @@ def val_epoch_end_to_end(  # noqa: C901
     free_bits_meter: float | None = None,
     free_bits_phase: float | None = None,
     free_bits_tempo: float | None = None,
+    tempo_density_weight: float = 0.0,
     extractor_loss_weight: float = 1.0,
     svt_loss_weight: float = 1.0,
     fps: float = 86.1328125,
@@ -682,6 +685,7 @@ def val_epoch_end_to_end(  # noqa: C901
             free_bits_meter=free_bits_meter,
             free_bits_phase=free_bits_phase,
             free_bits_tempo=free_bits_tempo,
+            tempo_density_weight=tempo_density_weight,
             downbeat_targets=downbeat_targets_cropped,
             smooth_sigma=smooth_sigma,
             smooth_sigma_db=smooth_sigma_db,
@@ -857,6 +861,10 @@ def _build_parser() -> argparse.ArgumentParser:
                              "stationary log-tempo variance ≈ σ²/(2α).")
     parser.add_argument("--tempo_anchor_ema_beta", type=float, default=0.02,
                         help="EMA rate for tempo_anchor_mode=ema (slow reference drift for accel/ritard).")
+    parser.add_argument("--tempo_density_weight", type=float, default=0.0,
+                        help="Opt-in (0=pure ELBO). Pins the per-sequence MEAN prior log-tempo to the "
+                             "GT beat density log(2*pi*N_beats/T), breaking the double-time metrical-level "
+                             "lock without touching the (correct) posterior tempo.")
 
     # End-to-end
     parser.add_argument("--extractor_ckpt", type=str, default=None)
@@ -1068,6 +1076,7 @@ def main() -> None:
             free_bits_meter=args.free_bits_meter,
             free_bits_phase=args.free_bits_phase,
             free_bits_tempo=args.free_bits_tempo,
+            tempo_density_weight=args.tempo_density_weight,
             max_grad_norm=args.max_grad_norm,
             extractor_loss_weight=args.extractor_loss_weight,
             svt_loss_weight=args.svt_loss_weight,
@@ -1132,6 +1141,7 @@ def main() -> None:
                 free_bits_meter=args.free_bits_meter,
                 free_bits_phase=args.free_bits_phase,
                 free_bits_tempo=args.free_bits_tempo,
+                tempo_density_weight=args.tempo_density_weight,
                 extractor_loss_weight=args.extractor_loss_weight,
                 svt_loss_weight=args.svt_loss_weight,
                 fps=val_fps,
