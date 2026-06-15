@@ -846,6 +846,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--posterior_phase_recursive", action="store_true",
                         help="Posterior phase mean = wrap(φ_{t-1} + (π/4)·tanh(·)) instead of a free "
                              "absolute angle -> smooth ramp by construction (less phase jitter).")
+    parser.add_argument("--tempo_anchor_mode", type=str, default="none",
+                        choices=["none", "init", "global", "ema"],
+                        help="Mean-reverting (OU) tempo prior anchor. 'none'=pure paper random walk; "
+                             "'init'=revert toward t=1 audio tempo; 'global'=learned head on clip "
+                             "summary; 'ema'=slow EMA of the tempo trajectory. Controls cumulative "
+                             "tempo drift without forbidding within-bar fluctuation (rubato).")
+    parser.add_argument("--tempo_reversion_alpha", type=float, default=0.0,
+                        help="OU reversion strength α (per frame). 0=off. ~0.02 reverts over ~1 beat; "
+                             "stationary log-tempo variance ≈ σ²/(2α).")
+    parser.add_argument("--tempo_anchor_ema_beta", type=float, default=0.02,
+                        help="EMA rate for tempo_anchor_mode=ema (slow reference drift for accel/ritard).")
 
     # End-to-end
     parser.add_argument("--extractor_ckpt", type=str, default=None)
@@ -1011,6 +1022,9 @@ def main() -> None:
         phase_corr_scale=args.phase_corr_scale, tempo_corr_scale=args.tempo_corr_scale,
         decoder_use_h_prior=not args.decoder_latent_only,
         posterior_phase_recursive=args.posterior_phase_recursive,
+        tempo_anchor_mode=args.tempo_anchor_mode,
+        tempo_reversion_alpha=args.tempo_reversion_alpha,
+        tempo_anchor_ema_beta=args.tempo_anchor_ema_beta,
     ).to(device)
 
     if is_distributed:
