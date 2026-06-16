@@ -33,6 +33,7 @@ def compute_elbo_loss(
     free_bits_tempo: float | None = None,
     downbeat_targets: Tensor | None = None,
     tempo_density_weight: float = 0.0,
+    tempo_bar: dict[str, Tensor] | None = None,
     # legacy kwargs (ignored, kept for API compatibility during transition)
     smooth_sigma: float | None = None,
     smooth_sigma_db: float | None = None,
@@ -101,6 +102,17 @@ def compute_elbo_loss(
         fb_tempo,
     )
 
+    # ---- KL: hierarchical global-tempo latent τ_bar (Log-Normal; exact ELBO term) ----
+    # A per-sequence tempo latent whose KL is a proper 4th ELBO term. NO free-bits: we
+    # WANT it informative (it must carry the clip's metrical level to break double-time).
+    if tempo_bar is not None:
+        kl_taubar = lognormal_kl(
+            tempo_bar["mu_q"], tempo_bar["sigma_q"],
+            tempo_bar["mu_p"], tempo_bar["sigma_p"],
+        ).mean()
+    else:
+        kl_taubar = torch.zeros((), device=beat_logits.device)
+
     # ---- Tempo-density regularizer (opt-in; weight 0 ⇒ pure ELBO) ----
     # The free-running PRIOR tempo can lock to a wrong metrical level (double-time):
     # the latent-only decoder is indifferent to wrap RATE, so nothing penalises 2×.
@@ -118,13 +130,18 @@ def compute_elbo_loss(
     else:
         tempo_density = torch.zeros((), device=beat_logits.device)
 
-    total = bce + beta * (kl_m + kl_phi + kl_tempo) + tempo_density_weight * tempo_density
+    total = (
+        bce
+        + beta * (kl_m + kl_phi + kl_tempo + kl_taubar)
+        + tempo_density_weight * tempo_density
+    )
 
     components = {
         "bce": bce.detach(),
         "kl_meter": kl_m.detach(),
         "kl_phase": kl_phi.detach(),
         "kl_tempo": kl_tempo.detach(),
+        "kl_taubar": kl_taubar.detach(),
         "tempo_density": tempo_density.detach(),
     }
     return total, components

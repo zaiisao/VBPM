@@ -59,6 +59,16 @@ def _kl_beta(epoch: int, anneal_epochs: int) -> float:
     return min(epoch / anneal_epochs, 1.0)
 
 
+def _ss_eps(epoch: int, anneal_epochs: int, max_eps: float) -> float:
+    """Scheduled-sampling probability ramp. Stays 0 until KL annealing finishes
+    (so the model first learns a good posterior-anchored prior), then ramps
+    linearly to ``max_eps`` over the next ``anneal_epochs`` epochs."""
+    if max_eps <= 0.0:
+        return 0.0
+    ramp_len = max(1, anneal_epochs)
+    return float(max_eps) * min(1.0, max(0.0, (epoch - anneal_epochs) / ramp_len))
+
+
 def _center_crop_seq_dim(x: Tensor, length: int) -> Tensor:
     if x.shape[1] == length:
         return x
@@ -370,6 +380,7 @@ def train_epoch(
             beta=beta,
             pos_weight=pos_weight,
             pos_weight_db=pos_weight_db,
+            tempo_bar=out.get("tempo_bar"),
         )
 
         total_loss.backward()
@@ -499,6 +510,7 @@ def train_epoch_end_to_end(
             free_bits_phase=free_bits_phase,
             free_bits_tempo=free_bits_tempo,
             tempo_density_weight=tempo_density_weight,
+            tempo_bar=out.get("tempo_bar"),
             downbeat_targets=downbeat_targets_cropped,
             smooth_sigma=smooth_sigma,
             smooth_sigma_db=smooth_sigma_db,
@@ -686,6 +698,7 @@ def val_epoch_end_to_end(  # noqa: C901
             free_bits_phase=free_bits_phase,
             free_bits_tempo=free_bits_tempo,
             tempo_density_weight=tempo_density_weight,
+            tempo_bar=out.get("tempo_bar"),
             downbeat_targets=downbeat_targets_cropped,
             smooth_sigma=smooth_sigma,
             smooth_sigma_db=smooth_sigma_db,
@@ -851,11 +864,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Posterior phase mean = wrap(φ_{t-1} + (π/4)·tanh(·)) instead of a free "
                              "absolute angle -> smooth ramp by construction (less phase jitter).")
     parser.add_argument("--tempo_anchor_mode", type=str, default="none",
-                        choices=["none", "init", "global", "ema"],
+                        choices=["none", "init", "global", "ema", "latent"],
                         help="Mean-reverting (OU) tempo prior anchor. 'none'=pure paper random walk; "
                              "'init'=revert toward t=1 audio tempo; 'global'=learned head on clip "
-                             "summary; 'ema'=slow EMA of the tempo trajectory. Controls cumulative "
-                             "tempo drift without forbidding within-bar fluctuation (rubato).")
+                             "summary; 'ema'=slow EMA of the tempo trajectory; 'latent'=hierarchical "
+                             "per-clip tempo latent τ_bar (q/p heads + exact 4th KL term). Controls "
+                             "cumulative tempo drift without forbidding within-bar fluctuation (rubato).")
+    parser.add_argument("--scheduled_sampling_max", type=float, default=0.0,
+                        help="Exposure-bias curriculum (0=off). Max fraction of sequences whose PRIOR "
+                             "recursion is trained on its OWN free-running predecessor (not the posterior "
+                             "sample). Ramps up after KL annealing finishes.")
     parser.add_argument("--tempo_reversion_alpha", type=float, default=0.0,
                         help="OU reversion strength α (per frame). 0=off. ~0.02 reverts over ~1 beat; "
                              "stationary log-tempo variance ≈ σ²/(2α).")
@@ -1060,6 +1078,10 @@ def main() -> None:
             epoch - 1, args.num_epochs, args.gumbel_temp_start, args.gumbel_temp_end,
         )
         beta = _kl_beta(epoch - 1, args.kl_anneal_epochs)
+        # Scheduled-sampling curriculum: ramp the prior's free-running fraction after
+        # KL annealing finishes. Set on the underlying SVTModel (unwrap DDP).
+        _ss = _ss_eps(epoch - 1, args.kl_anneal_epochs, args.scheduled_sampling_max)
+        (svt_model.module if hasattr(svt_model, "module") else svt_model).scheduled_sampling_eps = _ss
 
         avg_total, avg_ext, avg_svt, avg_comps = train_epoch_end_to_end(
             extractor_model=extractor_model,
