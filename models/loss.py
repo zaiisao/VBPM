@@ -34,6 +34,7 @@ def compute_elbo_loss(
     downbeat_targets: Tensor | None = None,
     tempo_density_weight: float = 0.0,
     tempo_bar: dict[str, Tensor] | None = None,
+    taubar_sup_weight: float = 0.0,
     # legacy kwargs (ignored, kept for API compatibility during transition)
     smooth_sigma: float | None = None,
     smooth_sigma_db: float | None = None,
@@ -113,6 +114,21 @@ def compute_elbo_loss(
     else:
         kl_taubar = torch.zeros((), device=beat_logits.device)
 
+    # ---- τ_bar supervision (opt-in auxiliary; weight 0 ⇒ pure ELBO) ----
+    # With a weak OU anchor the unsupervised τ_bar latent collapses (inert, kl≈0). Pin
+    # the POSTERIOR τ_bar mean to the GT clip log-tempo log(2π·N_beats/T) so τ_bar
+    # carries the CORRECT metrical level; the OU reversion (α) then holds the free-running
+    # tempo there, breaking double-time. One per-clip scalar — far milder than the failed
+    # per-frame tempo-density loss, and it targets the per-clip LEVEL (what CMLt needs).
+    if taubar_sup_weight > 0.0 and tempo_bar is not None:
+        two_pi = 2.0 * math.pi
+        n_beats = beat_targets.sum(dim=1).clamp(min=1.0)           # [B]
+        T_frames = beat_targets.shape[1]
+        target_log_tempo = torch.log(two_pi * n_beats / T_frames)  # [B]
+        taubar_sup = ((tempo_bar["mu_q"] - target_log_tempo) ** 2).mean()
+    else:
+        taubar_sup = torch.zeros((), device=beat_logits.device)
+
     # ---- Tempo-density regularizer (opt-in; weight 0 ⇒ pure ELBO) ----
     # The free-running PRIOR tempo can lock to a wrong metrical level (double-time):
     # the latent-only decoder is indifferent to wrap RATE, so nothing penalises 2×.
@@ -134,6 +150,7 @@ def compute_elbo_loss(
         bce
         + beta * (kl_m + kl_phi + kl_tempo + kl_taubar)
         + tempo_density_weight * tempo_density
+        + taubar_sup_weight * taubar_sup
     )
 
     components = {
@@ -142,6 +159,7 @@ def compute_elbo_loss(
         "kl_phase": kl_phi.detach(),
         "kl_tempo": kl_tempo.detach(),
         "kl_taubar": kl_taubar.detach(),
+        "taubar_sup": taubar_sup.detach(),
         "tempo_density": tempo_density.detach(),
     }
     return total, components
