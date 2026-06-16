@@ -267,6 +267,25 @@ class SVTModel(nn.Module):
             with torch.no_grad():
                 self.tempo_anchor_head.weight.mul_(0.01)
                 self.tempo_anchor_head.bias.fill_(_INIT_LOG_TEMPO)
+        # ---- Hierarchical per-sequence global-tempo latent τ_bar (anchor='latent') ----
+        # τ_bar ~ LogNormal is a SINGLE per-clip tempo latent: prior p(τ_bar|h) from the
+        # clip summary, posterior q(τ_bar|h,b) from the posterior-encoder summary. τ_bar
+        # is the OU anchor in BOTH the training recursion and the free-running rollout, so
+        # a correct-octave anchor halves the wrap rate in the exact tensor scored at
+        # inference — a clean, exact-ELBO attack on the double-time peg. Its KL is a 4th
+        # closed-form term (loss.py), β-annealed, no free-bits.
+        if self.tempo_anchor_mode == "latent":
+            self.tempo_bar_prior_head = nn.Linear(hidden_dim, 2)  # [mu_p, log_sigma_p]
+            self.tempo_bar_post_head = nn.Linear(hidden_dim, 2)   # [mu_q, log_sigma_q]
+            with torch.no_grad():
+                for _h in (self.tempo_bar_prior_head, self.tempo_bar_post_head):
+                    _h.weight.mul_(0.01)
+                    _h.bias.data[0] = _INIT_LOG_TEMPO
+                    _h.bias.data[1] = -1.0  # σ ≈ 0.37 in log-space at init
+        # Scheduled-sampling probability (exposure-bias curriculum). Set per-epoch from
+        # the training loop (0 = pure posterior-anchored prior, the original behaviour);
+        # >0 trains the prior partly on its OWN free-running predecessor.
+        self.scheduled_sampling_eps = 0.0
         K = num_meter_classes
 
         # ---- Prior encoder (parallel; once per forward) ----
@@ -539,6 +558,33 @@ class SVTModel(nn.Module):
         init_post = self.init_post_head(h_post[:, 0])
         tempo_anchor = self._tempo_anchor(h_global, init_prior)  # [B] OU reference
 
+        # Hierarchical global-tempo latent τ_bar (anchor='latent'): sample from the
+        # posterior q(τ_bar|h,b) (reparam) and use it as the OU anchor; its KL is added
+        # in the loss. A correct-octave per-clip tempo attacks the double-time peg.
+        tempo_bar_params = None
+        if self.tempo_anchor_mode == "latent":
+            _pri = self.tempo_bar_prior_head(h_global)            # [B, 2]
+            _pos = self.tempo_bar_post_head(h_post.mean(dim=1))   # [B, 2]
+            _mu_q, _sig_q = _pos[:, 0], _pos[:, 1].exp()
+            _mu_p, _sig_p = _pri[:, 0], _pri[:, 1].exp()
+            tau_bar = (_mu_q + _sig_q * torch.randn_like(_mu_q)).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
+            tempo_anchor = tau_bar                                # OU anchor = τ_bar sample
+            tempo_bar_params = {"mu_q": _mu_q, "sigma_q": _sig_q, "mu_p": _mu_p, "sigma_p": _sig_p}
+
+        # Scheduled-sampling state: the prior's OWN (detached) free-running predecessor,
+        # applied to an ε-fraction of sequences so the prior heads train on their own
+        # rollout (exposure-bias curriculum). ε=0 ⇒ original posterior-anchored behaviour.
+        ss_eps = float(self.scheduled_sampling_eps)
+        if ss_eps > 0.0:
+            ss_phase_prev = torch.remainder(
+                von_mises_sample(init_prior["phase_mu"], init_prior["phase_kappa"]), TWO_PI
+            ).detach()
+            ss_log_tempo_prev = lognormal_sample_logspace(
+                init_prior["tempo_mu"].clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX),
+                init_prior["tempo_sigma"],
+            ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX).detach()
+            ss_mask = torch.rand(B, device=device) < ss_eps      # [B] per-sequence
+
         phase_t = von_mises_sample(init_post["phase_mu"], init_post["phase_kappa"])
         phase_t = torch.remainder(phase_t, TWO_PI)
         log_tempo_t = lognormal_sample_logspace(
@@ -601,29 +647,44 @@ class SVTModel(nn.Module):
             # ---- Prior at t (uses sampled ẑ_{t-1} + audio correction g_ψ(h_t)) ----
             # μ^p_φ,t = wrap(φ_{t-1} + φ̇_{t-1} + g^φ_ψ(h_t))
             # μ^p_φ̇,t = log φ̇_{t-1} + g^φ̇_ψ(h_t)
-            tempo_prev_lin = torch.exp(log_tempo_prev.clamp(max=10.0))
+            # Scheduled sampling: for an ε-fraction of sequences (ss_mask) the recursion
+            # is based on the prior's OWN free-running predecessor (ss_*), not the
+            # posterior sample, so the prior heads see their inference-time inputs.
+            if ss_eps > 0.0:
+                base_phase = torch.where(ss_mask, ss_phase_prev, phase_prev)
+                base_log_tempo = torch.where(ss_mask, ss_log_tempo_prev, log_tempo_prev)
+            else:
+                base_phase = phase_prev
+                base_log_tempo = log_tempo_prev
+            base_tempo_lin = torch.exp(base_log_tempo.clamp(max=10.0))
             prior_phase_mu_t = torch.remainder(
-                phase_prev + tempo_prev_lin + prior_phase_corr_all[:, t], TWO_PI
+                base_phase + base_tempo_lin + prior_phase_corr_all[:, t], TWO_PI
             )
             prior_phase_kappa_t = prior_phase_kappa_all[:, t]
-            # Tempo prior mean: random walk + weak OU reversion toward τ_anchor,
-            # then a wide musical clamp as backstop. Reversion makes sustained
-            # drift / free-running divergence low-probability while preserving
-            # within-bar fluctuation (α=0 ⇒ pure paper random walk).
+            # Tempo prior mean: random walk + weak OU reversion toward τ_anchor (= τ_bar
+            # when anchor='latent'), then a wide musical clamp as backstop.
             if self.tempo_anchor_mode == "ema":
                 tempo_anchor = (1.0 - self.tempo_anchor_ema_beta) * tempo_anchor \
-                    + self.tempo_anchor_ema_beta * log_tempo_prev
-            tempo_reversion = self.tempo_reversion_alpha * (tempo_anchor - log_tempo_prev)
+                    + self.tempo_anchor_ema_beta * base_log_tempo
+            tempo_reversion = self.tempo_reversion_alpha * (tempo_anchor - base_log_tempo)
             prior_tempo_mu_t = (
-                log_tempo_prev + tempo_reversion + prior_tempo_corr_all[:, t]
+                base_log_tempo + tempo_reversion + prior_tempo_corr_all[:, t]
             ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
             prior_tempo_sigma_t = prior_tempo_sigma_all[:, t]
+            # Advance the prior's own free-running predecessor (detached; no BPTT).
+            if ss_eps > 0.0:
+                ss_phase_prev = torch.remainder(
+                    von_mises_sample(prior_phase_mu_t, prior_phase_kappa_t), TWO_PI
+                ).detach()
+                ss_log_tempo_prev = lognormal_sample_logspace(
+                    prior_tempo_mu_t, prior_tempo_sigma_t
+                ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX).detach()
 
             # Meter prior: PDF §3 — boundary based on PREDICTED PHASE MEAN
             # (φ̂_{t-1} + φ̇̂_{t-1}) ≥ 2π. Fed as a hard 0/1 indicator. The
             # bar-boundary test uses the deterministic advance (NOT the audio
             # correction or the noisy sample), per the PDF.
-            boundary = ((phase_prev + tempo_prev_lin) >= TWO_PI).float()  # [B]
+            boundary = ((base_phase + base_tempo_lin) >= TWO_PI).float()  # [B]
             meter_prior_input = torch.cat([
                 meter_soft_prev,                # K
                 cos_t.unsqueeze(-1),            # cos φ̂_t
@@ -683,6 +744,7 @@ class SVTModel(nn.Module):
             "posterior": posterior,
             "prior": prior,
             "samples": samples,
+            "tempo_bar": tempo_bar_params,
         }
 
     # ---------------------------------------------------------------------
@@ -715,6 +777,11 @@ class SVTModel(nn.Module):
         init_prior = self.init_prior_head(h_global)
         tempo_anchor = self._tempo_anchor(h_global, init_prior)      # stochastic chain
         tempo_anchor_mu = self._tempo_anchor(h_global, init_prior)   # mean chain (separate EMA state)
+        if self.tempo_anchor_mode == "latent":
+            # Free-running inference uses the PRIOR τ_bar mean as the OU anchor.
+            _taubar = self.tempo_bar_prior_head(h_global)[:, 0].clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
+            tempo_anchor = _taubar
+            tempo_anchor_mu = _taubar
 
         phase_t = von_mises_sample(init_prior["phase_mu"], init_prior["phase_kappa"])
         phase_t = torch.remainder(phase_t, TWO_PI)
