@@ -35,6 +35,8 @@ def compute_elbo_loss(
     tempo_density_weight: float = 0.0,
     tempo_bar: dict[str, Tensor] | None = None,
     taubar_sup_weight: float = 0.0,
+    meter_targets: Tensor | None = None,
+    meter_sup_weight: float = 0.0,
     # legacy kwargs (ignored, kept for API compatibility during transition)
     smooth_sigma: float | None = None,
     smooth_sigma_db: float | None = None,
@@ -129,6 +131,21 @@ def compute_elbo_loss(
     else:
         taubar_sup = torch.zeros((), device=beat_logits.device)
 
+    # ---- Meter supervision (Dir 3; opt-in auxiliary; weight 0 ⇒ pure ELBO) ----
+    # The meter latent (beats-per-bar, which DEFINES the metrical level) collapses to
+    # kl≈0 under the ELBO, leaving the model with no representation of the level → it
+    # double-times. Supervise the POSTERIOR meter logits to the GT meter_class so the
+    # latent carries the correct subdivision; pairs with --free_bits_meter to keep it
+    # alive. Cross-entropy over per-frame logits.
+    if meter_sup_weight > 0.0 and meter_targets is not None:
+        K = posterior["meter_logits"].shape[-1]
+        tgt_idx = meter_targets.argmax(dim=-1) if meter_targets.dim() == 3 else meter_targets.long()
+        meter_sup = F.cross_entropy(
+            posterior["meter_logits"].reshape(-1, K), tgt_idx.reshape(-1),
+        )
+    else:
+        meter_sup = torch.zeros((), device=beat_logits.device)
+
     # ---- Tempo-density regularizer (opt-in; weight 0 ⇒ pure ELBO) ----
     # The free-running PRIOR tempo can lock to a wrong metrical level (double-time):
     # the latent-only decoder is indifferent to wrap RATE, so nothing penalises 2×.
@@ -151,6 +168,7 @@ def compute_elbo_loss(
         + beta * (kl_m + kl_phi + kl_tempo + kl_taubar)
         + tempo_density_weight * tempo_density
         + taubar_sup_weight * taubar_sup
+        + meter_sup_weight * meter_sup
     )
 
     components = {
@@ -160,6 +178,7 @@ def compute_elbo_loss(
         "kl_tempo": kl_tempo.detach(),
         "kl_taubar": kl_taubar.detach(),
         "taubar_sup": taubar_sup.detach(),
+        "meter_sup": meter_sup.detach(),
         "tempo_density": tempo_density.detach(),
     }
     return total, components
