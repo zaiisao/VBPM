@@ -430,6 +430,7 @@ def train_epoch_end_to_end(
     taubar_sup_weight: float = 0.0,
     meter_sup_weight: float = 0.0,
     phase_sup_weight: float = 0.0,
+    audio_recon_weight: float = 0.0,
     max_grad_norm: float = 1.0,
     extractor_loss_weight: float = 1.0,
     svt_loss_weight: float = 1.0,
@@ -525,6 +526,13 @@ def train_epoch_end_to_end(
         )
 
         total_loss = extractor_loss_weight * extractor_loss + svt_loss_weight * svt_total
+
+        # Audio emission p(h|z) reconstruction (Dir 1): the latent must reproduce the
+        # observed activations, so the state explains the audio (enables PF inference).
+        if audio_recon_weight > 0.0 and out.get("audio_recon") is not None:
+            audio_recon_loss = ((out["audio_recon"] - activations) ** 2).mean()
+            total_loss = total_loss + audio_recon_weight * audio_recon_loss
+            components["audio_recon"] = audio_recon_loss.detach()
 
         # Guard against NaN/Inf — dump diagnostics on first occurrence, then skip
         if not torch.isfinite(total_loss):
@@ -639,6 +647,7 @@ def val_epoch_end_to_end(  # noqa: C901
     taubar_sup_weight: float = 0.0,
     meter_sup_weight: float = 0.0,
     phase_sup_weight: float = 0.0,
+    audio_recon_weight: float = 0.0,
     extractor_loss_weight: float = 1.0,
     svt_loss_weight: float = 1.0,
     fps: float = 86.1328125,
@@ -904,6 +913,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Opt-in (0=off). Circular loss 1-cos(prior_phase_mu - GT_beat_phase) aligning "
                              "the PRIOR phase to the GT beat-phase sawtooth so wraps land on beats (fixes "
                              "the diagnosed misalignment). Pairs with scheduled sampling for free-run transfer.")
+    parser.add_argument("--audio_emission", action="store_true",
+                        help="Dir 1: add an audio-emission head p(h_t|z_t) predicting the input activations "
+                             "from the latent alone (madmom-style observation model). Enables particle-filter "
+                             "inference that self-corrects the free-running rollout against the audio.")
+    parser.add_argument("--audio_recon_weight", type=float, default=0.0,
+                        help="Weight for the audio-emission MSE reconstruction loss (needs --audio_emission).")
     parser.add_argument("--tempo_density_weight", type=float, default=0.0,
                         help="Opt-in (0=pure ELBO). Pins the per-sequence MEAN prior log-tempo to the "
                              "GT beat density log(2*pi*N_beats/T), breaking the double-time metrical-level "
@@ -1076,6 +1091,7 @@ def main() -> None:
         tempo_anchor_mode=args.tempo_anchor_mode,
         tempo_reversion_alpha=args.tempo_reversion_alpha,
         tempo_anchor_ema_beta=args.tempo_anchor_ema_beta,
+        audio_emission=args.audio_emission,
     ).to(device)
 
     if is_distributed:
@@ -1127,6 +1143,7 @@ def main() -> None:
             taubar_sup_weight=args.taubar_sup_weight,
             meter_sup_weight=args.meter_sup_weight,
             phase_sup_weight=args.phase_sup_weight,
+            audio_recon_weight=args.audio_recon_weight,
             max_grad_norm=args.max_grad_norm,
             extractor_loss_weight=args.extractor_loss_weight,
             svt_loss_weight=args.svt_loss_weight,

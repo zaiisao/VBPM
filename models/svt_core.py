@@ -239,6 +239,7 @@ class SVTModel(nn.Module):
         tempo_anchor_mode: str = "none",
         tempo_reversion_alpha: float = 0.0,
         tempo_anchor_ema_beta: float = 0.02,
+        audio_emission: bool = False,
         **kwargs,  # absorb extras for backward compat
     ) -> None:
         super().__init__()
@@ -382,6 +383,19 @@ class SVTModel(nn.Module):
             nn.Linear(hidden_dim, 2),  # beat, downbeat
         )
 
+        # ---- Audio-emission head p(h_t | z_t) (Dir 1) ----
+        # Predict the input activations (the WaveBeat onset channels) from the LATENT
+        # ALONE, so the state must EXPLAIN the audio — madmom's observation model. At
+        # inference the particle filter weights trajectories by how well their predicted
+        # onsets match the observed ones, which selects the right phase/tempo/level and
+        # self-corrects the free-running rollout (closed-loop, sidesteps exposure bias).
+        self.audio_emission = bool(audio_emission)
+        if self.audio_emission:
+            self.audio_emission_head = nn.Sequential(
+                nn.Linear(3 + K, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, input_dim),
+            )
+
     # ---------------------------------------------------------------------
     # Encoders
     # ---------------------------------------------------------------------
@@ -468,6 +482,22 @@ class SVTModel(nn.Module):
                 h = self.h_prior_bottleneck_proj(h)
             feats.append(h)
         return self.emission_decoder(torch.cat(feats, dim=-1))
+
+    def _emit_audio(
+        self, phase: Tensor, log_tempo: Tensor, meter_soft: Tensor,
+    ) -> Tensor:
+        """Audio-emission p(h_t | z_t): predict input activations from the latent ALONE.
+
+        Returns ``[B, T, input_dim]``. Latent-only by construction (the state must
+        explain the audio); used by the particle filter to score trajectories.
+        """
+        feats = torch.cat([
+            torch.cos(phase).unsqueeze(-1),
+            torch.sin(phase).unsqueeze(-1),
+            log_tempo.unsqueeze(-1),
+            meter_soft,
+        ], dim=-1)
+        return self.audio_emission_head(feats)
 
     # ---------------------------------------------------------------------
     # Beat-distance feature (continuous interpolation between beats)
@@ -739,12 +769,20 @@ class SVTModel(nn.Module):
             samples["phase"], samples["log_tempo"], samples["meter_soft"], h_prior,
         )  # [B, T, 2]
 
+        # Audio emission p(h|z) (Dir 1): predicted activations from the latent.
+        audio_recon = None
+        if self.audio_emission:
+            audio_recon = self._emit_audio(
+                samples["phase"], samples["log_tempo"], samples["meter_soft"],
+            )
+
         return {
             "beat_logits": beat_logits,
             "posterior": posterior,
             "prior": prior,
             "samples": samples,
             "tempo_bar": tempo_bar_params,
+            "audio_recon": audio_recon,
         }
 
     # ---------------------------------------------------------------------
