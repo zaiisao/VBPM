@@ -126,6 +126,11 @@ def _readout(out, ref_beats, fps, acc, prefix):
         ref_beats, extract_beats_from_phase_trajectory(phase, fps=fps)))
     acc.add(prefix + "dec_", evaluate_beats(
         ref_beats, extract_beat_timestamps(bprobs, fps=fps)))
+    # Bayesian wrap read-out (PF only): weighted per-frame beat probability.
+    if "beat_activation" in out:
+        ba = out["beat_activation"][0].cpu().numpy()
+        acc.add(prefix + "wrap_", evaluate_beats(
+            ref_beats, extract_beat_timestamps(ba, fps=fps)))
 
 
 def main() -> int:
@@ -223,12 +228,16 @@ def main() -> int:
     for s in sigmas:
         row(f"PF s={s} phase", f"pf{s}.phase_")
         row(f"PF s={s} dec", f"pf{s}.dec_")
+        row(f"PF s={s} wrap", f"pf{s}.wrap_")
     row("baseline120", "base_")
     row("tempoOracle", "oracle_")
 
     # Headline: best PF CMLt vs open-loop CMLt
     ol = max(acc.get("openloop.phase_CMLt"), acc.get("openloop.dec_CMLt"))
-    pf = max(max(acc.get(f"pf{s}.phase_CMLt"), acc.get(f"pf{s}.dec_CMLt")) for s in sigmas)
+    pf = max(
+        max(acc.get(f"pf{s}.phase_CMLt"), acc.get(f"pf{s}.dec_CMLt"), acc.get(f"pf{s}.wrap_CMLt"))
+        for s in sigmas
+    )
     print(f"\n[PF] best CMLt: open-loop={ol:.3f}  particle-filter={pf:.3f}  "
           f"(Δ={pf - ol:+.3f})")
     return 0
