@@ -930,3 +930,189 @@ class SVTModel(nn.Module):
             "meter_onehot": meter_hard_traj,
             "beat_logits": beat_logits,
         }
+
+    # ---------------------------------------------------------------------
+    # Inference: particle filter weighted by the audio-emission model (Dir 1B)
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _systematic_resample(weights: Tensor) -> Tensor:
+        """Systematic resampling: normalized weights ``[N]`` -> ancestor idx ``[N]``.
+
+        One uniform offset, evenly spaced positions — low variance, O(N)."""
+        N = weights.shape[0]
+        device = weights.device
+        positions = (
+            torch.arange(N, device=device, dtype=weights.dtype)
+            + torch.rand((), device=device)
+        ) / N
+        cumsum = torch.cumsum(weights, dim=0)
+        cumsum = cumsum / cumsum[-1].clamp(min=1e-12)
+        cumsum[-1] = 1.0
+        return torch.searchsorted(cumsum, positions).clamp(max=N - 1)
+
+    @torch.no_grad()
+    def sample_from_prior_pf(
+        self,
+        activations: Tensor,
+        n_particles: int = 400,
+        obs_sigma: float = 0.3,
+        temperature: float = 0.1,
+        ess_frac: float = 0.5,
+    ) -> dict[str, Tensor]:
+        """Bootstrap particle filter inference (Dir 1B).
+
+        Free-runs the EXACT prior dynamics of ``sample_from_prior`` over ``N``
+        particles, but at every frame reweights them by the audio-emission
+        likelihood ``p(h_t | z_t) = N(h_t; emit(z_t), σ²I)`` and systematically
+        resamples when the effective sample size drops. This is a closed-loop
+        observation model (madmom-style): particles whose latent state fails to
+        EXPLAIN the observed onsets die, so the surviving trajectory locks onto the
+        right phase / tempo / metrical level — self-correcting at inference and
+        sidestepping the open-loop exposure bias that caps ``sample_from_prior``.
+
+        Returns the MAP (highest-weight) trajectory, drop-in compatible with the
+        gate4 read-out (``phase`` / ``phase_mu`` / ``beat_logits``). Requires
+        ``audio_emission=True`` and a single sequence (B=1).
+        """
+        assert self.audio_emission, "sample_from_prior_pf needs an audio_emission head"
+        B, T, _ = activations.shape
+        assert B == 1, "particle filter runs one sequence at a time (B=1)"
+        device = activations.device
+        N = int(n_particles)
+        inv_2sig2 = 1.0 / (2.0 * obs_sigma * obs_sigma)
+
+        # ---- Shared (audio-only) quantities: computed once, broadcast to particles ----
+        h_prior = self.encode_prior(activations)                                   # [1, T, D]
+        D = h_prior.shape[-1]
+        prior_phase_kappa_all = _softplus_pos(self.prior_phase_kappa_ffn(h_prior).squeeze(-1))  # [1, T]
+        prior_tempo_sigma_all = _softplus_pos(self.prior_tempo_sigma_ffn(h_prior).squeeze(-1))  # [1, T]
+        prior_phase_corr_all, prior_tempo_corr_all = self.prior_mean_corrections(h_prior)        # [1, T] each
+        obs = activations[0]                                                        # [T, input_dim]
+
+        h_global = h_prior.mean(dim=1)                                              # [1, D]
+        init_prior = self.init_prior_head(h_global)
+
+        # OU anchor (τ_bar prior mean when latent; else the configured anchor) -> [N].
+        if self.tempo_anchor_mode == "latent":
+            anchor = self.tempo_bar_prior_head(h_global)[:, 0].clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
+        else:
+            anchor = self._tempo_anchor(h_global, init_prior)
+        anchor = anchor.expand(N).contiguous()                                     # [N]
+
+        # ---- Initialise N particles from the initial prior ----
+        phase_t = torch.remainder(
+            von_mises_sample(init_prior["phase_mu"].expand(N), init_prior["phase_kappa"].expand(N)),
+            TWO_PI,
+        )                                                                          # [N]
+        log_tempo_t = lognormal_sample_logspace(
+            init_prior["tempo_mu"].clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX).expand(N),
+            init_prior["tempo_sigma"].expand(N),
+        ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)                                       # [N]
+        meter_soft_t = gumbel_softmax_sample(
+            init_prior["meter_logits"].expand(N, -1), temperature=temperature, hard=False,
+        )                                                                          # [N, K]
+
+        # Genealogical trajectory store (reindexed on every resample so the stored
+        # path of each particle is consistent with its ancestry).
+        traj_phase = torch.empty(N, T, device=device)
+        traj_log_tempo = torch.empty(N, T, device=device)
+        traj_meter = torch.empty(N, T, self.num_meter_classes, device=device)
+        traj_phase[:, 0] = phase_t
+        traj_log_tempo[:, 0] = log_tempo_t
+        traj_meter[:, 0] = meter_soft_t
+
+        # Accumulating log-weights, seeded by the t=0 emission.
+        pred0 = self._emit_audio(phase_t, log_tempo_t, meter_soft_t)               # [N, input_dim]
+        log_w = -inv_2sig2 * ((pred0 - obs[0]) ** 2).sum(dim=-1)                   # [N]
+
+        for t in range(1, T):
+            phase_prev = phase_t
+            log_tempo_prev = log_tempo_t
+            meter_soft_prev = meter_soft_t
+            cos_pp = torch.cos(phase_prev)
+            sin_pp = torch.sin(phase_prev)
+
+            kappa_t = prior_phase_kappa_all[0, t].expand(N)
+            sigma_t = prior_tempo_sigma_all[0, t].expand(N)
+            pcorr_t = prior_phase_corr_all[0, t]   # scalar, broadcasts over [N]
+            tcorr_t = prior_tempo_corr_all[0, t]   # scalar
+
+            # Phase: bar-pointer advance + audio nudge, then von Mises sample.
+            tempo_prev_lin = torch.exp(log_tempo_prev.clamp(max=10.0))
+            prior_phase_mu_t = torch.remainder(phase_prev + tempo_prev_lin + pcorr_t, TWO_PI)
+            phase_t = torch.remainder(von_mises_sample(prior_phase_mu_t, kappa_t), TWO_PI)
+            cos_t = torch.cos(phase_t)
+            sin_t = torch.sin(phase_t)
+
+            # Tempo: random walk + weak OU reversion toward the anchor (τ_bar).
+            if self.tempo_anchor_mode == "ema":
+                anchor = (1.0 - self.tempo_anchor_ema_beta) * anchor \
+                    + self.tempo_anchor_ema_beta * log_tempo_prev
+            prior_tempo_mu_t = (
+                log_tempo_prev
+                + self.tempo_reversion_alpha * (anchor - log_tempo_prev)
+                + tcorr_t
+            ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
+            log_tempo_t = lognormal_sample_logspace(prior_tempo_mu_t, sigma_t).clamp(
+                LOG_TEMPO_MIN, LOG_TEMPO_MAX
+            )
+
+            # Meter transition (PDF §3 boundary from the deterministic advance).
+            boundary = ((phase_prev + tempo_prev_lin) >= TWO_PI).float()
+            meter_in = torch.cat([
+                meter_soft_prev,
+                cos_t.unsqueeze(-1), sin_t.unsqueeze(-1),
+                cos_pp.unsqueeze(-1), sin_pp.unsqueeze(-1),
+                boundary.unsqueeze(-1),
+                h_prior[0, t].expand(N, D),
+            ], dim=-1)
+            meter_logits_t = self.prior_meter_trans_ffn(meter_in)
+            meter_soft_t = gumbel_softmax_sample(
+                meter_logits_t, temperature=temperature, hard=False,
+            )
+
+            traj_phase[:, t] = phase_t
+            traj_log_tempo[:, t] = log_tempo_t
+            traj_meter[:, t] = meter_soft_t
+
+            # ---- Reweight by the audio-emission likelihood p(h_t | z_t) ----
+            pred = self._emit_audio(phase_t, log_tempo_t, meter_soft_t)            # [N, input_dim]
+            log_w = log_w - inv_2sig2 * ((pred - obs[t]) ** 2).sum(dim=-1)
+
+            # ---- Resample when ESS drops (systematic; reindex the trajectories) ----
+            # Skip on the final frame so log_w carries a meaningful MAP signal.
+            w = torch.softmax(log_w, dim=0)
+            ess = 1.0 / (w * w).sum().clamp(min=1e-12)
+            if ess < ess_frac * N and t < T - 1:
+                idx = self._systematic_resample(w)
+                traj_phase = traj_phase[idx]
+                traj_log_tempo = traj_log_tempo[idx]
+                traj_meter = traj_meter[idx]
+                phase_t = phase_t[idx]
+                log_tempo_t = log_tempo_t[idx]
+                meter_soft_t = meter_soft_t[idx]
+                anchor = anchor[idx]
+                log_w = torch.zeros(N, device=device)
+
+        # ---- MAP trajectory = highest final-weight particle (genealogical path) ----
+        best = torch.argmax(log_w)
+        phase_map = traj_phase[best]                 # [T]
+        log_tempo_map = traj_log_tempo[best]         # [T]
+        meter_map = traj_meter[best]                 # [T, K]
+        meter_onehot = F.one_hot(
+            meter_map.argmax(dim=-1), self.num_meter_classes,
+        ).to(meter_map.dtype)
+
+        beat_logits = self._decode(
+            phase_map.unsqueeze(0), log_tempo_map.unsqueeze(0), meter_map.unsqueeze(0), h_prior,
+        )                                            # [1, T, 2]
+
+        return {
+            "phase": phase_map.unsqueeze(0),
+            "phase_mu": phase_map.unsqueeze(0),      # PF selection denoises; MAP path IS the read-out
+            "log_tempo": log_tempo_map.unsqueeze(0),
+            "meter_soft": meter_map.unsqueeze(0),
+            "meter_onehot": meter_onehot.unsqueeze(0),
+            "beat_logits": beat_logits,
+        }
