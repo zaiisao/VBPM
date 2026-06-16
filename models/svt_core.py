@@ -1026,6 +1026,12 @@ class SVTModel(nn.Module):
         pred0 = self._emit_audio(phase_t, log_tempo_t, meter_soft_t)               # [N, input_dim]
         log_w = -inv_2sig2 * ((pred0 - obs[0]) ** 2).sum(dim=-1)                   # [N]
 
+        # Bayesian beat read-out: per-frame weighted fraction of particles whose
+        # bar-pointer wrapped INTO this frame (a beat in the DBN). Smoother and
+        # better-aligned than wrap-detecting a single sampled trajectory, since it
+        # marginalises over the whole filtering posterior (madmom-style).
+        beat_activation = torch.zeros(T, device=device)
+
         for t in range(1, T):
             phase_prev = phase_t
             log_tempo_prev = log_tempo_t
@@ -1080,9 +1086,14 @@ class SVTModel(nn.Module):
             pred = self._emit_audio(phase_t, log_tempo_t, meter_soft_t)            # [N, input_dim]
             log_w = log_w - inv_2sig2 * ((pred - obs[t]) ** 2).sum(dim=-1)
 
+            # Filtering posterior at frame t (uses ALL evidence since last resample).
+            w = torch.softmax(log_w, dim=0)
+            # Weighted beat probability: particles wrapping into frame t (PDF §3
+            # boundary indicator), weighted by the current posterior.
+            beat_activation[t] = (w * boundary).sum()
+
             # ---- Resample when ESS drops (systematic; reindex the trajectories) ----
             # Skip on the final frame so log_w carries a meaningful MAP signal.
-            w = torch.softmax(log_w, dim=0)
             ess = 1.0 / (w * w).sum().clamp(min=1e-12)
             if ess < ess_frac * N and t < T - 1:
                 idx = self._systematic_resample(w)
@@ -1115,4 +1126,5 @@ class SVTModel(nn.Module):
             "meter_soft": meter_map.unsqueeze(0),
             "meter_onehot": meter_onehot.unsqueeze(0),
             "beat_logits": beat_logits,
+            "beat_activation": beat_activation.unsqueeze(0),  # [1, T] Bayesian wrap read-out
         }
