@@ -37,6 +37,8 @@ def compute_elbo_loss(
     taubar_sup_weight: float = 0.0,
     meter_targets: Tensor | None = None,
     meter_sup_weight: float = 0.0,
+    phase_targets: Tensor | None = None,
+    phase_sup_weight: float = 0.0,
     # legacy kwargs (ignored, kept for API compatibility during transition)
     smooth_sigma: float | None = None,
     smooth_sigma_db: float | None = None,
@@ -146,6 +148,18 @@ def compute_elbo_loss(
     else:
         meter_sup = torch.zeros((), device=beat_logits.device)
 
+    # ---- Phase supervision (Dir 2; opt-in auxiliary; weight 0 ⇒ pure ELBO) ----
+    # The diagnostic showed the free-running failure is phase MISALIGNMENT (AMLt≈CMLt),
+    # not a clean octave error. Directly align the PRIOR phase mean to the GT beat-phase
+    # sawtooth so wraps land on the beats. Circular loss 1−cos(Δ) (phase is an angle).
+    # Targets the prior (the free-running read-out source); pairs with scheduled sampling
+    # so the alignment transfers to the free-running rollout.
+    if phase_sup_weight > 0.0 and phase_targets is not None:
+        pt = phase_targets.squeeze(-1) if phase_targets.dim() == 3 else phase_targets
+        phase_sup = (1.0 - torch.cos(prior["phase_mu"] - pt)).mean()
+    else:
+        phase_sup = torch.zeros((), device=beat_logits.device)
+
     # ---- Tempo-density regularizer (opt-in; weight 0 ⇒ pure ELBO) ----
     # The free-running PRIOR tempo can lock to a wrong metrical level (double-time):
     # the latent-only decoder is indifferent to wrap RATE, so nothing penalises 2×.
@@ -169,6 +183,7 @@ def compute_elbo_loss(
         + tempo_density_weight * tempo_density
         + taubar_sup_weight * taubar_sup
         + meter_sup_weight * meter_sup
+        + phase_sup_weight * phase_sup
     )
 
     components = {
@@ -179,6 +194,7 @@ def compute_elbo_loss(
         "kl_taubar": kl_taubar.detach(),
         "taubar_sup": taubar_sup.detach(),
         "meter_sup": meter_sup.detach(),
+        "phase_sup": phase_sup.detach(),
         "tempo_density": tempo_density.detach(),
     }
     return total, components
