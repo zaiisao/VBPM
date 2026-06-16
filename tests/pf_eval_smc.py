@@ -1,19 +1,19 @@
-"""PF-eval — particle-filter inference vs the open-loop prior rollout on HELD-OUT audio.
+"""PF-eval on SMC — the hard, held-out "blind spot" set (beats only, NOT trained on).
 
-Loads a trained (audio_emission) checkpoint and, per held-out song, scores:
-  * sample_from_prior      — the OPEN-LOOP rollout (the exposure-biased baseline)
-  * sample_from_prior_pf   — the CLOSED-LOOP particle filter (weighted by p(h|z)),
-                             swept over a few obs_sigma values.
-Reports F / CMLt / AMLt for the phase-wrap and decoder read-outs of each, against
-the constant-120 and tempo-oracle baselines. The question: does closing the loop
-with the audio-emission likelihood beat the open-loop CMLt (diagnostic 0.28)?
+SMC_MIREX is expressive/rubato music where discriminative trackers octave-error and
+drift (Holzapfel et al. 2012; "the SMC blind spot"). It is NOT in CHART's training
+set (ballroom,beatles,hains,rwc_popular). This scores the closed-loop particle
+filter vs the open-loop prior rollout on full-length SMC excerpts, beats only.
+
+Audio is loaded via the WaveBeat DownbeatDataset (exact preprocessing); ground-truth
+beat times are read straight from the SMC annotation .txt (no frame round-trip).
 
 Run:
-    python tests/pf_eval.py \
-        --checkpoint checkpoints/ou5_dir1/chart.pt \
+    python tests/pf_eval_smc.py \
+        --checkpoint checkpoints/ou5_dir1/chart_ep001_f0.0000.pt \
         --extractor_ckpt wavebeat_epoch=98-step=24749.ckpt \
-        --dataset_root /home/sogang/mnt/db_1/jaehoon/beat-tracking/labeled_data \
-        --dataset_include ballroom --max_songs 30 --obs_sigma 0.2,0.4 --n_particles 300
+        --smc_root /home/sogang/jaehoon/Analyze-SMC/SMC_MIREX \
+        --max_songs 40 --obs_sigma 0.15,0.25 --n_particles 300
 """
 
 from __future__ import annotations
@@ -33,54 +33,31 @@ from evaluation.phase_converter import (
     extract_beat_timestamps,
     extract_beats_from_phase_trajectory,
 )
-from evaluation.score import evaluate_beats, frames_to_beat_times
+from evaluation.score import evaluate_beats
 from training.extractors import get_extractor_backend
 
 _BEAT_KEYS = ("F-measure", "CMLt", "AMLt")
 
 
-def _const_baseline(T, fps, bpm=120.0):
+def _const_baseline(dur_sec, bpm=120.0):
     period = 60.0 / bpm
-    n = int((T / fps) / period)
+    n = int(dur_sec / period)
     return np.arange(n, dtype=np.float64) * period
 
 
-def _tempo_oracle_baseline(ref_beats, T, fps):
+def _tempo_oracle_baseline(ref_beats, dur_sec):
     if len(ref_beats) < 2:
         return np.zeros(0, dtype=np.float64)
     period = float(np.median(np.diff(ref_beats)))
     if period <= 0:
         return np.zeros(0, dtype=np.float64)
     start = float(ref_beats[0])
-    n = int(((T / fps) - start) / period)
+    n = int((dur_sec - start) / period)
     return start + np.arange(max(n, 0), dtype=np.float64) * period
 
 
-def _build_args(cli):
-    a = argparse.Namespace()
-    a.wavebeat_root = "extractors/wavebeat"
-    a.dataset_root = cli.dataset_root
-    a.dataset_include = cli.dataset_include
-    a.phases_dir = None
-    a.audio_dir = a.annot_dir = None
-    a.wavebeat_dataset = "ballroom"
-    a.audio_sample_rate = 22050
-    a.target_factor = 256
-    a.train_length = 2097152
-    a.num_workers = cli.num_workers
-    a.examples_per_epoch = 1000
-    a.preload = False
-    a.augment = False
-    a.dry_run = False
-    a.batch_size = 1
-    a.extractor_ckpt = cli.extractor_ckpt
-    a.dist_rank = 0
-    a.dist_world_size = 1
-    return a
-
-
-def _build_model(cli, device):
-    ckpt = torch.load(cli.checkpoint, map_location=device, weights_only=False)
+def _build_model(ckpt_path, device):
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     K = saved.get("num_meter_classes", 8)
     model = SVTModel(
@@ -96,11 +73,11 @@ def _build_model(cli, device):
     ).to(device)
     model.load_state_dict(ckpt["svt_model"] if "svt_model" in ckpt else ckpt, strict=True)
     model.eval()
-    print(f"[PF] ckpt={cli.checkpoint} anchor={model.tempo_anchor_mode} "
+    print(f"[SMC] ckpt={ckpt_path} anchor={model.tempo_anchor_mode} "
           f"alpha={model.tempo_reversion_alpha} latent_only={not model.decoder_use_h_prior} "
           f"audio_emission={model.audio_emission}")
     if not model.audio_emission:
-        raise SystemExit("[PF] checkpoint has no audio_emission head — PF needs Dir 1A.")
+        raise SystemExit("[SMC] checkpoint has no audio_emission head — PF needs Dir 1A.")
     return model
 
 
@@ -111,9 +88,8 @@ class Acc:
 
     def add(self, prefix, scores, keys=_BEAT_KEYS):
         for k in keys:
-            key = prefix + k
-            self.sums[key] = self.sums.get(key, 0.0) + scores[k]
-            self.counts[key] = self.counts.get(key, 0) + 1
+            self.sums[prefix + k] = self.sums.get(prefix + k, 0.0) + scores[k]
+            self.counts[prefix + k] = self.counts.get(prefix + k, 0) + 1
 
     def get(self, key):
         return self.sums.get(key, 0.0) / max(self.counts.get(key, 1), 1)
@@ -126,10 +102,6 @@ def _readout(out, ref_beats, fps, acc, prefix):
         ref_beats, extract_beats_from_phase_trajectory(phase, fps=fps)))
     acc.add(prefix + "dec_", evaluate_beats(
         ref_beats, extract_beat_timestamps(bprobs, fps=fps)))
-    # Bayesian wrap read-out (PF only): weighted per-frame beat probability.
-    # Normalise to [0,1] — the raw weighted-wrap fraction peaks well below the
-    # peak-picker's 0.5 threshold (only ~tempo/2pi of particles sit at a boundary
-    # per frame), so without scaling no peak is ever selected.
     if "beat_activation" in out:
         ba = out["beat_activation"][0].cpu().numpy()
         ba = ba / (ba.max() + 1e-8)
@@ -137,90 +109,101 @@ def _readout(out, ref_beats, fps, acc, prefix):
             ref_beats, extract_beat_timestamps(ba, fps=fps)))
 
 
+def _load_ref_beats(annot_path):
+    arr = np.loadtxt(annot_path)
+    if arr.ndim == 2:          # (time, beat_idx) -> take the time column
+        arr = arr[:, 0]
+    return np.atleast_1d(arr).astype(np.float64)
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--extractor_ckpt", required=True)
-    p.add_argument("--dataset_root", required=True)
-    p.add_argument("--dataset_include", default="ballroom")
-    p.add_argument("--max_songs", type=int, default=30)
-    p.add_argument("--max_frames", type=int, default=2048)
+    p.add_argument("--smc_root", default="/home/sogang/jaehoon/Analyze-SMC/SMC_MIREX")
+    p.add_argument("--max_songs", type=int, default=40)
+    p.add_argument("--max_frames", type=int, default=6000)  # SMC excerpts ~40s ~3400 frames
     p.add_argument("--temperature", type=float, default=0.1)
-    p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--n_particles", type=int, default=300)
-    p.add_argument("--obs_sigma", default="0.2,0.4",
-                   help="comma-separated obs_sigma values to sweep")
+    p.add_argument("--obs_sigma", default="0.15,0.25")
     p.add_argument("--ess_frac", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--wavebeat_root", default="extractors/wavebeat")
     cli = p.parse_args()
 
     torch.manual_seed(cli.seed)
+    import random
+    random.seed(cli.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     fps = 22050 / 256
     sigmas = [float(s) for s in cli.obs_sigma.split(",") if s.strip()]
-    args = _build_args(cli)
 
+    smc_root = Path(cli.smc_root)
+    audio_dir = smc_root / "SMC_MIREX_Audio"
+    annot_dir = smc_root / "SMC_MIREX_Annotations"
+    assert audio_dir.is_dir() and annot_dir.is_dir(), f"SMC dirs missing under {smc_root}"
+
+    # ---- extractor backend (WaveBeat) ----
     backend = get_extractor_backend("wavebeat")
-    val_loader = backend.build_val_dataloader(args)
-    if val_loader is None:
-        print("[PF] no validation split available")
-        return 1
-    extractor = backend.build_model(args, device)
-    backend.load_checkpoint(extractor, args, device)
+    ext_args = argparse.Namespace(
+        wavebeat_root=cli.wavebeat_root, extractor_ckpt=cli.extractor_ckpt,
+    )
+    extractor = backend.build_model(ext_args, device)
+    backend.load_checkpoint(extractor, ext_args, device)
     extractor.eval()
-    model = _build_model(cli, device)
+
+    # ---- SMC dataset (raw WaveBeat loader; full-val = all files, no crop) ----
+    sys.path.insert(0, str(Path(cli.wavebeat_root).resolve()))
+    from wavebeat.data import DownbeatDataset  # type: ignore
+    ds = DownbeatDataset(
+        audio_dir=str(audio_dir), annot_dir=str(annot_dir), dataset="smc",
+        audio_sample_rate=22050, target_factor=256, subset="full-val",
+        length=2097152, preload=False, augment=False, examples_per_epoch=1000,
+        half=False, dry_run=False,
+    )
+    model = _build_model(cli.checkpoint, device)
 
     acc = Acc()
     n = 0
     with torch.no_grad():
-        for batch in val_loader:
+        for idx in range(len(ds)):
             if n >= cli.max_songs:
                 break
-            audio = batch["audio"].to(device)
-            ext_target = batch["extractor_target"].to(device)
-            beat_targets = batch["beat_targets"].to(device)
-
-            _, activations = backend.compute_loss_and_activations(
-                model=extractor, audio=audio, target=ext_target, frozen=True,
-            )
-            T_ext = activations.shape[1]
-
-            def crop(x, n_):
-                s = (x.shape[1] - n_) // 2
-                return x[:, s:s + n_]
-            bt = crop(beat_targets, T_ext) if beat_targets.shape[1] > T_ext else beat_targets
-
-            Tc = min(T_ext, cli.max_frames)
-            activations = activations[:, :Tc, :]
-            bt = bt[:, :Tc]
-
-            ref_beats = frames_to_beat_times(bt[0].cpu().numpy(), fps)
+            audio, target, _meta = ds[idx]
+            ref_beats = _load_ref_beats(ds.annot_files[idx])
             if len(ref_beats) < 2:
                 continue
+            audio = audio.float().unsqueeze(0).to(device)      # [1, 1, samples]
+            tgt = target.float().unsqueeze(0).to(device)
+            _, activations = backend.compute_loss_and_activations(
+                model=extractor, audio=audio, target=tgt, frozen=True,
+            )
+            Tc = min(activations.shape[1], cli.max_frames)
+            activations = activations[:, :Tc, :]
+            dur = Tc / fps
+            # clip refs to the evaluated window
+            ref = ref_beats[ref_beats < dur]
+            if len(ref) < 2:
+                continue
 
-            # Open-loop baseline
             _readout(model.sample_from_prior(activations, temperature=cli.temperature),
-                     ref_beats, fps, acc, "openloop.")
-            # Closed-loop PF, swept over obs_sigma
+                     ref, fps, acc, "openloop.")
             for s in sigmas:
                 out = model.sample_from_prior_pf(
                     activations, n_particles=cli.n_particles, obs_sigma=s,
                     temperature=cli.temperature, ess_frac=cli.ess_frac,
                 )
-                _readout(out, ref_beats, fps, acc, f"pf{s}.")
-
-            # Static baselines
-            acc.add("base_", evaluate_beats(ref_beats, _const_baseline(Tc, fps)))
-            acc.add("oracle_", evaluate_beats(ref_beats, _tempo_oracle_baseline(ref_beats, Tc, fps)))
+                _readout(out, ref, fps, acc, f"pf{s}.")
+            acc.add("base_", evaluate_beats(ref, _const_baseline(dur)))
+            acc.add("oracle_", evaluate_beats(ref, _tempo_oracle_baseline(ref, dur)))
             n += 1
             if n % 5 == 0:
                 print(f"  ...scored {n} songs")
 
     n = max(n, 1)
-    print(f"\n[PF] scored {n} held-out songs ({cli.dataset_include}), "
+    print(f"\n[SMC] scored {n} held-out SMC songs (beats only), "
           f"N={cli.n_particles} ess_frac={cli.ess_frac}\n")
-    hdr = "  {:<16s} {:>9s} {:>7s} {:>7s}".format("METHOD/readout", "F", "CMLt", "AMLt")
-    print(hdr)
+    print("  {:<16s} {:>9s} {:>7s} {:>7s}".format("METHOD/readout", "F", "CMLt", "AMLt"))
 
     def row(label, prefix):
         print("  {:<16s} {:>9.3f} {:>7.3f} {:>7.3f}".format(
@@ -236,14 +219,12 @@ def main() -> int:
     row("baseline120", "base_")
     row("tempoOracle", "oracle_")
 
-    # Headline: best PF CMLt vs open-loop CMLt
     ol = max(acc.get("openloop.phase_CMLt"), acc.get("openloop.dec_CMLt"))
     pf = max(
         max(acc.get(f"pf{s}.phase_CMLt"), acc.get(f"pf{s}.dec_CMLt"), acc.get(f"pf{s}.wrap_CMLt"))
         for s in sigmas
     )
-    print(f"\n[PF] best CMLt: open-loop={ol:.3f}  particle-filter={pf:.3f}  "
-          f"(Δ={pf - ol:+.3f})")
+    print(f"\n[SMC] best CMLt: open-loop={ol:.3f}  particle-filter={pf:.3f}  (Δ={pf - ol:+.3f})")
     return 0
 
 
