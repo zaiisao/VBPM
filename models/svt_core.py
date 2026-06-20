@@ -264,6 +264,7 @@ class SVTModel(nn.Module):
         meter_ste: bool = False,
         delta_vae: bool = False,
         delta_vae_rate: float = 0.1,
+        dvbf: bool = False,
         **kwargs,  # absorb extras for backward compat
     ) -> None:
         super().__init__()
@@ -386,8 +387,16 @@ class SVTModel(nn.Module):
         # a smooth ramp by construction (vs a free per-frame absolute angle that
         # jitters and drags the prior with it via the KL).
         self.posterior_phase_recursive = posterior_phase_recursive
+        # DVBF (Karl 2017, ported from paper -- the one repo is unlicensed + image/gym).
+        # The posterior emits a SMALL innovation around the prior TRANSITION mean (built
+        # in forward), forcing z_t to obey the bar-pointer dynamics so the free-run is
+        # faithful by construction and reconstruction must flow through g_phase (waking
+        # it). Reuses the recursive posterior head; the anchor (phi_prev) becomes the
+        # transition mean, and the innovation budget is tightened (pi/8 vs pi/4).
+        self.dvbf = bool(dvbf)
         self.trans_post_head = _TransPosteriorHead(
-            hidden_dim, K, recursive_phase=posterior_phase_recursive,
+            hidden_dim, K, recursive_phase=(posterior_phase_recursive or self.dvbf),
+            phase_delta_scale=(math.pi / 8 if self.dvbf else math.pi / 4),
         )
 
         # ---- Decoder p_theta(b_t | z_t, h) ----
@@ -777,7 +786,16 @@ class SVTModel(nn.Module):
                 meter_soft_prev,
             ], dim=-1)  # [B, K + 3]
 
-            post_t = self.trans_post_head(h_post[:, t], z_prev_feat, phi_prev=phase_prev)
+            # DVBF: anchor the recursive posterior to the FULL prior transition mean
+            # (phi_{t-1} + tempo advance + audio correction g_phi(h)), not just phi_{t-1},
+            # so the innovation is around the bar-pointer dynamics. Else anchor to phi_{t-1}.
+            if self.dvbf:
+                _tempo_adv = torch.exp(log_tempo_prev.clamp(max=10.0))
+                _post_anchor = torch.remainder(
+                    phase_prev + _tempo_adv + prior_phase_corr_all[:, t], TWO_PI)
+            else:
+                _post_anchor = phase_prev
+            post_t = self.trans_post_head(h_post[:, t], z_prev_feat, phi_prev=_post_anchor)
 
             # Sample phase first (needed by meter prior)
             phase_t = von_mises_sample(post_t["phase_mu"], post_t["phase_kappa"])
