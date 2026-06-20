@@ -92,6 +92,26 @@ def _softplus_pos(raw: Tensor) -> Tensor:
     return F.softplus(raw)
 
 
+def _delta_committed_ratio(delta: float) -> float:
+    """delta-VAE committed rate (Razavi 2019): the under-dispersed std ratio r in (0,1)
+    solving h(r) = -ln r + r^2/2 - 0.5 = delta. Forcing the posterior std to
+    sigma_q = r·sigma_p (r <= this root) makes the variance-only KL >= delta, so the
+    full Gaussian KL(q||p) = h(r) + (mu_q-mu_p)^2/(2 sigma_p^2) >= delta by construction.
+    h is strictly decreasing on (0,1) (h'(r) = r - 1/r < 0), so a Newton/bisection root
+    is unique. Solved once at init (no autograd needed)."""
+    if delta <= 0.0:
+        return 1.0
+    lo, hi = 1e-6, 1.0  # h(lo)->+inf, h(1)=0; root where h=delta lies in (lo, 1)
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        h = -math.log(mid) + 0.5 * mid * mid - 0.5
+        if h > delta:   # too concentrated -> move toward 1 (larger r, smaller h)
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 # ---------------------------------------------------------------------------
 # Per-step posterior head (transition: t >= 1)
 # ---------------------------------------------------------------------------
@@ -240,11 +260,20 @@ class SVTModel(nn.Module):
         tempo_reversion_alpha: float = 0.0,
         tempo_anchor_ema_beta: float = 0.02,
         audio_emission: bool = False,
+        bar_phase: bool = False,
+        meter_ste: bool = False,
+        delta_vae: bool = False,
+        delta_vae_rate: float = 0.1,
         **kwargs,  # absorb extras for backward compat
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_meter_classes = num_meter_classes
+        # Straight-Through Gumbel-Softmax for the meter latent: hard one-hot forward
+        # (crisp state to the decoder), soft gradient backward (STE). Tests whether the
+        # categorical collapse is a differentiability/blurriness problem (ST-GS fixes it)
+        # or an information/lazy-decoder problem (ST-GS won't).
+        self.meter_hard = bool(meter_ste)
         # Audio-driven prior-mean correction magnitudes. Defaults reproduce the
         # original behaviour; a smaller phase_corr_scale makes audio a *nudge*
         # on the bar-pointer recursion (cleaner sawtooth, more faithful dynamics)
@@ -370,6 +399,12 @@ class SVTModel(nn.Module):
         # the phase-wrap inference read-out.
         self.decoder_use_h_prior = decoder_use_h_prior
         self.h_prior_bottleneck_dim = h_prior_bottleneck
+        # Bar-phase latent (Mode-4 fix): a SECOND wrapped-phase variable tracking
+        # within-BAR position (wraps at downbeats) — the dense continuous analog of
+        # the categorical meter counter. cos/sin(φ^bar) are appended to the decoder
+        # so the downbeat channel reads them; with a latent-only decoder the downbeat
+        # MUST flow through φ^bar, forcing it to encode bar position.
+        self.bar_phase = bool(bar_phase)
         if not decoder_use_h_prior:
             h_dim_for_decoder = 0
         elif h_prior_bottleneck > 0:
@@ -377,7 +412,8 @@ class SVTModel(nn.Module):
             h_dim_for_decoder = h_prior_bottleneck
         else:
             h_dim_for_decoder = hidden_dim
-        decoder_input_dim = 3 + K + h_dim_for_decoder  # [cos φ, sin φ, log τ, m, (h)]
+        bar_dim = 2 if self.bar_phase else 0       # [cos φ^bar, sin φ^bar]
+        decoder_input_dim = 3 + K + bar_dim + h_dim_for_decoder  # [cos φ, sin φ, log τ, m, (bar), (h)]
         self.emission_decoder = nn.Sequential(
             nn.Linear(decoder_input_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 2),  # beat, downbeat
@@ -390,11 +426,45 @@ class SVTModel(nn.Module):
         # onsets match the observed ones, which selects the right phase/tempo/level and
         # self-corrects the free-running rollout (closed-loop, sidesteps exposure bias).
         self.audio_emission = bool(audio_emission)
+        # delta-VAE committed rate (Razavi 2019, ported from paper -- no official repo).
+        # sigma_q = r*·sigma_p with r* = under-dispersed root of h(r)=-ln r + r^2/2 - 0.5
+        # = delta guarantees KL(q||p) >= delta for the log-tempo Gaussian BY CONSTRUCTION
+        # (structural minimum rate, not a free-bits loss clamp). See _delta_tempo_sigma.
+        self.delta_vae = bool(delta_vae)
+        self._delta_rstar = _delta_committed_ratio(delta_vae_rate) if self.delta_vae else None
         if self.audio_emission:
             self.audio_emission_head = nn.Sequential(
                 nn.Linear(3 + K, hidden_dim), nn.ReLU(),
                 nn.Linear(hidden_dim, input_dim),
             )
+
+        # ---- Bar-phase latent heads (Mode-4 fix; mirror the beat-phase machinery) ----
+        # Posterior/init heads emit [cos μ, sin μ, log κ] (angle via atan2). The prior
+        # advances φ^bar by a learned, audio-modulated bar increment δ^bar (≈ beat-rate /
+        # beats-per-bar) plus an audio-driven mean correction — identical in spirit to the
+        # beat-phase recursion, just K× slower so it wraps once per bar.
+        if self.bar_phase:
+            self.bar_init_post_head = nn.Linear(hidden_dim, 3)
+            self.bar_init_prior_head = nn.Linear(hidden_dim, 3)
+            self.bar_post_head = nn.Linear(hidden_dim, 3)
+            self.prior_bar_incr_ffn = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1),
+            )
+            self.prior_bar_kappa_ffn = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1),
+            )
+            self.prior_bar_corr_ffn = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1),
+            )
+            with torch.no_grad():
+                # Bar increment ≈ 0.036 rad/frame (beat-rate exp(_INIT_LOG_TEMPO)≈0.145 ÷ 4):
+                # softplus(b)=0.036 ⇒ b≈-3.3. Wraps ≈ every 2π/0.036 ≈ 174 frames ≈ one
+                # 4/4 bar at ~120 BPM @ 86 fps.
+                self.prior_bar_incr_ffn[-1].weight.mul_(0.01)
+                self.prior_bar_incr_ffn[-1].bias.fill_(-3.3)
+                # Audio correction starts near zero (φ^bar begins as a clean recursion).
+                self.prior_bar_corr_ffn[-1].weight.mul_(0.01)
+                self.prior_bar_corr_ffn[-1].bias.zero_()
 
     # ---------------------------------------------------------------------
     # Encoders
@@ -457,12 +527,30 @@ class SVTModel(nn.Module):
     # Decoder p_theta(b_t | z_t, h)
     # ---------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_phase_head(out3: Tensor) -> tuple[Tensor, Tensor]:
+        """[..., 3] head -> (wrapped angle μ via atan2(sin, cos), κ via softplus)."""
+        mu = torch.remainder(torch.atan2(out3[..., 1], out3[..., 0]), TWO_PI)
+        kappa = _softplus_pos(out3[..., 2])
+        return mu, kappa
+
+    def _delta_tempo_sigma(self, post_sigma: Tensor, prior_sigma: Tensor) -> Tensor:
+        """delta-VAE committed rate for the log-tempo Gaussian: sigma_q = rho·sigma_p with
+        rho in (0, r*], guaranteeing KL(q||p) >= delta_vae_rate by construction (no
+        free-bits clamp). The posterior's own softplus sigma output is repurposed as the
+        committed-ratio control via the saturating map s/(1+s): (0,inf) -> (0,1), so the
+        encoder still freely chooses rho in (0, r*] but can never reach the prior (rho=1,
+        zero KL). r* is the under-dispersed root solved once at init (_delta_rstar)."""
+        rho = self._delta_rstar * (post_sigma / (1.0 + post_sigma))
+        return prior_sigma * rho
+
     def _decode(
         self,
         phase: Tensor,        # [B, T]
         log_tempo: Tensor,    # [B, T]
         meter_soft: Tensor,   # [B, T, K]
         h_prior: Tensor,      # [B, T, D]
+        bar_phase: Tensor | None = None,  # [B, T]
     ) -> Tensor:
         """Emit beat/downbeat logits [B, T, 2] from the latent (+ optional audio).
 
@@ -476,6 +564,10 @@ class SVTModel(nn.Module):
             log_tempo.unsqueeze(-1),
             meter_soft,
         ]
+        if self.bar_phase:
+            assert bar_phase is not None, "bar_phase decode needs the φ^bar trajectory"
+            feats.append(torch.cos(bar_phase).unsqueeze(-1))
+            feats.append(torch.sin(bar_phase).unsqueeze(-1))
         if self.decoder_use_h_prior:
             h = h_prior
             if self.h_prior_bottleneck_dim > 0:
@@ -582,6 +674,15 @@ class SVTModel(nn.Module):
         # Pre-compute per-frame audio-driven prior-mean corrections (P0 fix)
         prior_phase_corr_all, prior_tempo_corr_all = self.prior_mean_corrections(h_prior)  # [B, T] each
 
+        # Bar-phase prior per-frame: learned bar increment δ^bar, uncertainty κ^bar, and
+        # audio-driven mean correction (reuses phase_corr_scale).
+        if self.bar_phase:
+            prior_bar_incr_all = _softplus_pos(self.prior_bar_incr_ffn(h_prior).squeeze(-1))   # [B, T]
+            prior_bar_kappa_all = _softplus_pos(self.prior_bar_kappa_ffn(h_prior).squeeze(-1)) # [B, T]
+            prior_bar_corr_all = torch.tanh(
+                self.prior_bar_corr_ffn(h_prior).squeeze(-1)
+            ) * self.phase_corr_scale
+
         # ---- Initial state (t = 0) ----
         h_global = h_prior.mean(dim=1)  # [B, D]
         init_prior = self.init_prior_head(h_global)
@@ -617,18 +718,23 @@ class SVTModel(nn.Module):
 
         phase_t = von_mises_sample(init_post["phase_mu"], init_post["phase_kappa"])
         phase_t = torch.remainder(phase_t, TWO_PI)
+        # delta-VAE: commit the posterior tempo std to r*·sigma_p (>= delta rate).
+        init_post_tempo_sigma = (
+            self._delta_tempo_sigma(init_post["tempo_sigma"], init_prior["tempo_sigma"])
+            if self.delta_vae else init_post["tempo_sigma"]
+        )
         log_tempo_t = lognormal_sample_logspace(
-            init_post["tempo_mu"], init_post["tempo_sigma"],
+            init_post["tempo_mu"], init_post_tempo_sigma,
         )
         meter_soft_t = gumbel_softmax_sample(
-            init_post["meter_logits"], temperature=temperature, hard=False,
+            init_post["meter_logits"], temperature=temperature, hard=self.meter_hard,
         )
 
         post_meter_logits = [init_post["meter_logits"]]
         post_phase_mu = [init_post["phase_mu"]]
         post_phase_kappa = [init_post["phase_kappa"]]
         post_tempo_mu = [init_post["tempo_mu"]]
-        post_tempo_sigma = [init_post["tempo_sigma"]]
+        post_tempo_sigma = [init_post_tempo_sigma]
 
         prior_meter_logits = [init_prior["meter_logits"]]
         prior_phase_mu = [init_prior["phase_mu"]]
@@ -639,6 +745,17 @@ class SVTModel(nn.Module):
         sample_phase = [phase_t]
         sample_log_tempo = [log_tempo_t]
         sample_meter_soft = [meter_soft_t]
+
+        # ---- Bar-phase initial state (t = 0) ----
+        if self.bar_phase:
+            bar_mu_post0, bar_kappa_post0 = self._parse_phase_head(self.bar_init_post_head(h_post[:, 0]))
+            bar_mu_prior0, bar_kappa_prior0 = self._parse_phase_head(self.bar_init_prior_head(h_global))
+            bar_phase_t = torch.remainder(von_mises_sample(bar_mu_post0, bar_kappa_post0), TWO_PI)
+            post_bar_mu = [bar_mu_post0]
+            post_bar_kappa = [bar_kappa_post0]
+            prior_bar_mu = [bar_mu_prior0]
+            prior_bar_kappa = [bar_kappa_prior0]
+            sample_bar_phase = [bar_phase_t]
 
         # Cache trig of the most recent phase to avoid recomputing each iter.
         cos_t = torch.cos(phase_t)
@@ -667,11 +784,17 @@ class SVTModel(nn.Module):
             phase_t = torch.remainder(phase_t, TWO_PI)
             cos_t = torch.cos(phase_t)
             sin_t = torch.sin(phase_t)
+            # delta-VAE: commit posterior tempo std to r*·sigma_p (>= delta rate). The
+            # prior std is precomputed (prior_tempo_sigma_all[:, t]).
+            post_tempo_sigma_t = (
+                self._delta_tempo_sigma(post_t["tempo_sigma"], prior_tempo_sigma_all[:, t])
+                if self.delta_vae else post_t["tempo_sigma"]
+            )
             log_tempo_t = lognormal_sample_logspace(
-                post_t["tempo_mu"], post_t["tempo_sigma"],
+                post_t["tempo_mu"], post_tempo_sigma_t,
             )
             meter_soft_t = gumbel_softmax_sample(
-                post_t["meter_logits"], temperature=temperature, hard=False,
+                post_t["meter_logits"], temperature=temperature, hard=self.meter_hard,
             )
 
             # ---- Prior at t (uses sampled ẑ_{t-1} + audio correction g_ψ(h_t)) ----
@@ -726,12 +849,26 @@ class SVTModel(nn.Module):
             ], dim=-1)
             prior_meter_logits_t = self.prior_meter_trans_ffn(meter_prior_input)
 
+            # ---- Bar-phase transition (Mode-4): φ^bar advances K× slower, wraps on bars ----
+            if self.bar_phase:
+                bar_phase_prev = sample_bar_phase[-1]  # φ^bar_{t-1}
+                bar_mu_t, bar_kappa_t = self._parse_phase_head(self.bar_post_head(h_post[:, t]))
+                bar_phase_t = torch.remainder(von_mises_sample(bar_mu_t, bar_kappa_t), TWO_PI)
+                prior_bar_mu_t = torch.remainder(
+                    bar_phase_prev + prior_bar_incr_all[:, t] + prior_bar_corr_all[:, t], TWO_PI
+                )
+                post_bar_mu.append(bar_mu_t)
+                post_bar_kappa.append(bar_kappa_t)
+                prior_bar_mu.append(prior_bar_mu_t)
+                prior_bar_kappa.append(prior_bar_kappa_all[:, t])
+                sample_bar_phase.append(bar_phase_t)
+
             # Append
             post_meter_logits.append(post_t["meter_logits"])
             post_phase_mu.append(post_t["phase_mu"])
             post_phase_kappa.append(post_t["phase_kappa"])
             post_tempo_mu.append(post_t["tempo_mu"])
-            post_tempo_sigma.append(post_t["tempo_sigma"])
+            post_tempo_sigma.append(post_tempo_sigma_t)
 
             prior_meter_logits.append(prior_meter_logits_t)
             prior_phase_mu.append(prior_phase_mu_t)
@@ -764,9 +901,17 @@ class SVTModel(nn.Module):
             "meter_soft": torch.stack(sample_meter_soft, dim=1),     # [B, T, K]
         }
 
+        if self.bar_phase:
+            samples["bar_phase"] = torch.stack(sample_bar_phase, dim=1)        # [B, T]
+            posterior["barphase_mu"] = torch.stack(post_bar_mu, dim=1)         # [B, T]
+            posterior["barphase_log_kappa"] = torch.log(torch.stack(post_bar_kappa, dim=1) + 1e-8)
+            prior["barphase_mu"] = torch.stack(prior_bar_mu, dim=1)
+            prior["barphase_kappa"] = torch.stack(prior_bar_kappa, dim=1)
+
         # ---- Decode (parallel) ----
         beat_logits = self._decode(
             samples["phase"], samples["log_tempo"], samples["meter_soft"], h_prior,
+            bar_phase=samples.get("bar_phase"),
         )  # [B, T, 2]
 
         # Audio emission p(h|z) (Dir 1): predicted activations from the latent.
@@ -810,6 +955,13 @@ class SVTModel(nn.Module):
         # held-out audio to WHERE beats land during the inference rollout.
         prior_phase_corr_all, prior_tempo_corr_all = self.prior_mean_corrections(h_prior)
 
+        if self.bar_phase:
+            prior_bar_incr_all = _softplus_pos(self.prior_bar_incr_ffn(h_prior).squeeze(-1))
+            prior_bar_kappa_all = _softplus_pos(self.prior_bar_kappa_ffn(h_prior).squeeze(-1))
+            prior_bar_corr_all = torch.tanh(
+                self.prior_bar_corr_ffn(h_prior).squeeze(-1)
+            ) * self.phase_corr_scale
+
         # Initial state from prior
         h_global = h_prior.mean(dim=1)
         init_prior = self.init_prior_head(h_global)
@@ -828,7 +980,7 @@ class SVTModel(nn.Module):
             init_prior["tempo_sigma"],
         ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
         meter_soft_t = gumbel_softmax_sample(
-            init_prior["meter_logits"], temperature=temperature, hard=False,
+            init_prior["meter_logits"], temperature=temperature, hard=self.meter_hard,
         )
 
         sample_phase = [phase_t]
@@ -844,6 +996,14 @@ class SVTModel(nn.Module):
         phase_mu_t = torch.remainder(init_prior["phase_mu"], TWO_PI)
         log_tempo_mu_t = init_prior["tempo_mu"].clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)
         sample_phase_mu = [phase_mu_t]
+
+        # ---- Bar-phase free-run init (stochastic sample + deterministic mean chain) ----
+        if self.bar_phase:
+            bar_mu0, bar_kappa0 = self._parse_phase_head(self.bar_init_prior_head(h_global))
+            bar_phase_t = torch.remainder(von_mises_sample(bar_mu0, bar_kappa0), TWO_PI)
+            bar_phase_mu_t = bar_mu0
+            sample_bar_phase = [bar_phase_t]
+            sample_bar_phase_mu = [bar_phase_mu_t]
 
         cos_t = torch.cos(phase_t)
         sin_t = torch.sin(phase_t)
@@ -902,8 +1062,24 @@ class SVTModel(nn.Module):
             ], dim=-1)
             meter_logits_t = self.prior_meter_trans_ffn(meter_prior_input)
             meter_soft_t = gumbel_softmax_sample(
-                meter_logits_t, temperature=temperature, hard=False,
+                meter_logits_t, temperature=temperature, hard=self.meter_hard,
             )
+
+            # ---- Bar-phase advance (stochastic + deterministic mean chain) ----
+            if self.bar_phase:
+                bar_phase_prev = sample_bar_phase[-1]
+                prior_bar_mu_t = torch.remainder(
+                    bar_phase_prev + prior_bar_incr_all[:, t] + prior_bar_corr_all[:, t], TWO_PI
+                )
+                bar_phase_t = torch.remainder(
+                    von_mises_sample(prior_bar_mu_t, prior_bar_kappa_all[:, t]), TWO_PI
+                )
+                # Deterministic mean chain (clean sawtooth for the wrap read-out).
+                bar_phase_mu_t = torch.remainder(
+                    bar_phase_mu_t + prior_bar_incr_all[:, t] + prior_bar_corr_all[:, t], TWO_PI
+                )
+                sample_bar_phase.append(bar_phase_t)
+                sample_bar_phase_mu.append(bar_phase_mu_t)
 
             sample_phase.append(phase_t)
             sample_log_tempo.append(log_tempo_t)
@@ -913,6 +1089,8 @@ class SVTModel(nn.Module):
         phase_mu_traj = torch.stack(sample_phase_mu, dim=1)
         log_tempo_traj = torch.stack(sample_log_tempo, dim=1)
         meter_soft_traj = torch.stack(sample_meter_soft, dim=1)
+        bar_phase_traj = torch.stack(sample_bar_phase, dim=1) if self.bar_phase else None
+        bar_phase_mu_traj = torch.stack(sample_bar_phase_mu, dim=1) if self.bar_phase else None
         # Hard one-hot: argmax of soft + lazy one-hot (no extra Gumbel sampling).
         meter_hard_traj = F.one_hot(
             meter_soft_traj.argmax(dim=-1),
@@ -920,9 +1098,11 @@ class SVTModel(nn.Module):
         ).to(meter_soft_traj.dtype)
 
         # Decode (latent-only when decoder_use_h_prior=False)
-        beat_logits = self._decode(phase_traj, log_tempo_traj, meter_soft_traj, h_prior)
+        beat_logits = self._decode(
+            phase_traj, log_tempo_traj, meter_soft_traj, h_prior, bar_phase=bar_phase_traj,
+        )
 
-        return {
+        out = {
             "phase": phase_traj,
             "phase_mu": phase_mu_traj,
             "log_tempo": log_tempo_traj,
@@ -930,6 +1110,10 @@ class SVTModel(nn.Module):
             "meter_onehot": meter_hard_traj,
             "beat_logits": beat_logits,
         }
+        if self.bar_phase:
+            out["bar_phase"] = bar_phase_traj
+            out["bar_phase_mu"] = bar_phase_mu_traj
+        return out
 
     # ---------------------------------------------------------------------
     # Inference: particle filter weighted by the audio-emission model (Dir 1B)
@@ -988,6 +1172,10 @@ class SVTModel(nn.Module):
         prior_phase_kappa_all = _softplus_pos(self.prior_phase_kappa_ffn(h_prior).squeeze(-1))  # [1, T]
         prior_tempo_sigma_all = _softplus_pos(self.prior_tempo_sigma_ffn(h_prior).squeeze(-1))  # [1, T]
         prior_phase_corr_all, prior_tempo_corr_all = self.prior_mean_corrections(h_prior)        # [1, T] each
+        if self.bar_phase:
+            prior_bar_incr_all = _softplus_pos(self.prior_bar_incr_ffn(h_prior).squeeze(-1))     # [1, T]
+            prior_bar_kappa_all = _softplus_pos(self.prior_bar_kappa_ffn(h_prior).squeeze(-1))   # [1, T]
+            prior_bar_corr_all = torch.tanh(self.prior_bar_corr_ffn(h_prior).squeeze(-1)) * self.phase_corr_scale
         obs = activations[0]                                                        # [T, input_dim]
 
         h_global = h_prior.mean(dim=1)                                              # [1, D]
@@ -1010,8 +1198,11 @@ class SVTModel(nn.Module):
             init_prior["tempo_sigma"].expand(N),
         ).clamp(LOG_TEMPO_MIN, LOG_TEMPO_MAX)                                       # [N]
         meter_soft_t = gumbel_softmax_sample(
-            init_prior["meter_logits"].expand(N, -1), temperature=temperature, hard=False,
+            init_prior["meter_logits"].expand(N, -1), temperature=temperature, hard=self.meter_hard,
         )                                                                          # [N, K]
+        if self.bar_phase:
+            _bm0, _bk0 = self._parse_phase_head(self.bar_init_prior_head(h_global))
+            bar_phase_t = torch.remainder(von_mises_sample(_bm0.expand(N), _bk0.expand(N)), TWO_PI)  # [N]
 
         # Genealogical trajectory store (reindexed on every resample so the stored
         # path of each particle is consistent with its ancestry).
@@ -1021,6 +1212,9 @@ class SVTModel(nn.Module):
         traj_phase[:, 0] = phase_t
         traj_log_tempo[:, 0] = log_tempo_t
         traj_meter[:, 0] = meter_soft_t
+        if self.bar_phase:
+            traj_bar_phase = torch.empty(N, T, device=device)
+            traj_bar_phase[:, 0] = bar_phase_t
 
         # Accumulating log-weights, seeded by the t=0 emission.
         pred0 = self._emit_audio(phase_t, log_tempo_t, meter_soft_t)               # [N, input_dim]
@@ -1075,12 +1269,23 @@ class SVTModel(nn.Module):
             ], dim=-1)
             meter_logits_t = self.prior_meter_trans_ffn(meter_in)
             meter_soft_t = gumbel_softmax_sample(
-                meter_logits_t, temperature=temperature, hard=False,
+                meter_logits_t, temperature=temperature, hard=self.meter_hard,
             )
+
+            # Bar-phase: prior recursion (advance + audio nudge), von Mises sample.
+            if self.bar_phase:
+                prior_bar_mu_t = torch.remainder(
+                    bar_phase_t + prior_bar_incr_all[0, t] + prior_bar_corr_all[0, t], TWO_PI
+                )
+                bar_phase_t = torch.remainder(
+                    von_mises_sample(prior_bar_mu_t, prior_bar_kappa_all[0, t].expand(N)), TWO_PI
+                )
 
             traj_phase[:, t] = phase_t
             traj_log_tempo[:, t] = log_tempo_t
             traj_meter[:, t] = meter_soft_t
+            if self.bar_phase:
+                traj_bar_phase[:, t] = bar_phase_t
 
             # ---- Reweight by the audio-emission likelihood p(h_t | z_t) ----
             pred = self._emit_audio(phase_t, log_tempo_t, meter_soft_t)            # [N, input_dim]
@@ -1103,6 +1308,9 @@ class SVTModel(nn.Module):
                 phase_t = phase_t[idx]
                 log_tempo_t = log_tempo_t[idx]
                 meter_soft_t = meter_soft_t[idx]
+                if self.bar_phase:
+                    traj_bar_phase = traj_bar_phase[idx]
+                    bar_phase_t = bar_phase_t[idx]
                 anchor = anchor[idx]
                 log_w = torch.zeros(N, device=device)
 
@@ -1115,8 +1323,10 @@ class SVTModel(nn.Module):
             meter_map.argmax(dim=-1), self.num_meter_classes,
         ).to(meter_map.dtype)
 
+        bar_phase_map = traj_bar_phase[best] if self.bar_phase else None  # [T] or None
         beat_logits = self._decode(
             phase_map.unsqueeze(0), log_tempo_map.unsqueeze(0), meter_map.unsqueeze(0), h_prior,
+            bar_phase=(bar_phase_map.unsqueeze(0) if bar_phase_map is not None else None),
         )                                            # [1, T, 2]
 
         return {
@@ -1127,4 +1337,6 @@ class SVTModel(nn.Module):
             "meter_onehot": meter_onehot.unsqueeze(0),
             "beat_logits": beat_logits,
             "beat_activation": beat_activation.unsqueeze(0),  # [1, T] Bayesian wrap read-out
+            **({"bar_phase": bar_phase_map.unsqueeze(0),
+                "bar_phase_mu": bar_phase_map.unsqueeze(0)} if self.bar_phase else {}),
         }

@@ -262,6 +262,8 @@ def build_model(cli, device) -> SVTModel:
         audio_emission=cli.audio_emission,
         bar_phase=("bar_phase" in ideas),
         meter_ste=("meter_ste" in ideas),
+        delta_vae=("delta_vae" in ideas),
+        delta_vae_rate=cli.free_bits_tempo,   # reuse the tempo rate target as delta
     ).to(device)
     return m
 
@@ -352,6 +354,9 @@ def main() -> int:
         cli.audio_emission = True
     if "aggressive_encoder" in ideas:
         aggr_steps = 3
+    # delta_vae: handled in build_model (delta_vae_rate = cli.free_bits_tempo). The
+    # free-bits tempo floor is left ON but becomes INERT -- delta-VAE structurally makes
+    # KL_tempo >= the same delta, so max(kl, free_bits) never clamps. No double-counting.
     # bar_phase and meter_ste are wired in build_model (they change the architecture).
 
     train_recs = _load_cache(cli.train_cache, device)
@@ -536,6 +541,8 @@ def main() -> int:
             "audio_emission": cli.audio_emission,
             "bar_phase": "bar_phase" in ck_ideas,
             "meter_ste": "meter_ste" in ck_ideas,
+            "delta_vae": "delta_vae" in ck_ideas,
+            "delta_vae_rate": cli.free_bits_tempo,
         }
         _os.makedirs(_os.path.dirname(cli.save_ckpt) or ".", exist_ok=True)
         torch.save({"svt_model": model.state_dict(), "args": ck_args}, cli.save_ckpt)
