@@ -53,6 +53,7 @@ def build_from_ckpt(path, device):
         meter_ste=a["meter_ste"],
         delta_vae=a.get("delta_vae", False),
         delta_vae_rate=a.get("delta_vae_rate", 0.1),
+        dvbf=a.get("dvbf", False),
     ).to(device)
     m.load_state_dict(ck["svt_model"])
     m.eval()

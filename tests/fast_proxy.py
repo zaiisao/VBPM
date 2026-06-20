@@ -264,6 +264,7 @@ def build_model(cli, device) -> SVTModel:
         meter_ste=("meter_ste" in ideas),
         delta_vae=("delta_vae" in ideas),
         delta_vae_rate=cli.free_bits_tempo,   # reuse the tempo rate target as delta
+        dvbf=("dvbf" in ideas),
     ).to(device)
     return m
 
@@ -543,6 +544,7 @@ def main() -> int:
             "meter_ste": "meter_ste" in ck_ideas,
             "delta_vae": "delta_vae" in ck_ideas,
             "delta_vae_rate": cli.free_bits_tempo,
+            "dvbf": "dvbf" in ck_ideas,
         }
         _os.makedirs(_os.path.dirname(cli.save_ckpt) or ".", exist_ok=True)
         torch.save({"svt_model": model.state_dict(), "args": ck_args}, cli.save_ckpt)
