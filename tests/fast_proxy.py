@@ -71,22 +71,34 @@ def _load_cache(cache_dir: str, device: torch.device) -> list[dict]:
 
 
 def _make_train_batches(recs: list[dict], frames: int, batch_size: int):
-    """Center-crop each cached song to `frames` and stack into fixed batches."""
-    def crop(x, T):
-        s = max(0, (x.shape[0] - T) // 2)
+    """Crop each cached song to `frames` (centered on its BEAT region) and stack.
+
+    FIX (Fable/2026-06-21): the train cache's beat labels are concentrated in part of
+    each song (e.g. the last ~30%), so a naive CENTER crop yields windows with ZERO
+    beats -> the model trains on empty targets and never learns to fire. Center the
+    crop on the beat centroid so the window actually contains beats.
+    """
+    def crop_at(x, s, T):
         return x[s:s + T]
 
     cropped = []
     for r in recs:
-        T = min(r["activations"].shape[0], frames)
+        L = r["activations"].shape[0]
+        T = min(L, frames)
+        bi = torch.where(r["beat_targets"] > 0.5)[0]
+        if len(bi) > 0:
+            center = int(bi.float().mean().item())     # beat centroid
+            s = int(min(max(center - T // 2, 0), max(L - T, 0)))
+        else:
+            s = max(0, (L - T) // 2)
         item = {
-            "activations": crop(r["activations"], T),
-            "beat_targets": crop(r["beat_targets"], T),
-            "downbeat_targets": crop(r["downbeat_targets"], T),
+            "activations": crop_at(r["activations"], s, T),
+            "beat_targets": crop_at(r["beat_targets"], s, T),
+            "downbeat_targets": crop_at(r["downbeat_targets"], s, T),
         }
         for k in ("phase_prev", "log_tempo_prev", "meter_onehot_prev"):
             if k in r:
-                item[k] = crop(r[k], T)
+                item[k] = crop_at(r[k], s, T)
         # Only keep full-length crops so they stack cleanly.
         if item["activations"].shape[0] == frames:
             cropped.append(item)
@@ -355,6 +367,20 @@ def main() -> int:
         cli.audio_emission = True
     if "aggressive_encoder" in ideas:
         aggr_steps = 3
+    if "phasesup" in ideas:
+        # Dense BEAT-phase supervision -- the symmetric twin of bar_phase's barphase_sup
+        # (which is the ONE component that produces free-run signal). The faithful
+        # baseline strips phase_sup, so the beat-phase has no pressure to wrap on beats
+        # and collapses (TF phase-wrap=0.000). This forces phi to be the GT beat sawtooth,
+        # exactly as bar_phase is forced to the downbeat sawtooth.
+        cli.phase_sup_weight = 1.0
+    if "freerun" in ideas:
+        # Train under genuine free-running rollout: scheduled sampling high so the prior's
+        # audio-correction g_phase(h) is EXERCISED -- it gets gradient to re-anchor a
+        # drifting free-run phase, the ONLY training-time way to wake the dead head
+        # (teacher forcing never exercises it; the faithful baseline pins SS=0). This
+        # overrides the faithful baseline's scheduled_sampling_max=0.
+        cli.scheduled_sampling_max = 0.8
     # delta_vae: handled in build_model (delta_vae_rate = cli.free_bits_tempo). The
     # free-bits tempo floor is left ON but becomes INERT -- delta-VAE structurally makes
     # KL_tempo >= the same delta, so max(kl, free_bits) never clamps. No double-counting.
