@@ -85,24 +85,51 @@ def f_measure(ref_sec: np.ndarray, est_sec: np.ndarray) -> float:
     return float(mir_eval.beat.f_measure(ref, est))
 
 
+def _estimate_meter(ref_sec: np.ndarray, down_sec: np.ndarray) -> int:
+    """Meter m = median beats-per-bar from GT downbeats (same heuristic as the ablation probes)."""
+    if len(down_sec) >= 2:
+        bpb = np.median([np.sum((ref_sec >= down_sec[i]) & (ref_sec < down_sec[i + 1]))
+                         for i in range(len(down_sec) - 1)])
+        if bpb > 0:
+            return max(2, min(int(round(bpb)), 4))
+    return 4
+
+
 @torch.no_grad()
 def evaluate(model, logmel, songs, device, fps: float = 86.1328125,
              max_frames: int = 4000, temperature: float = 0.3):
-    """``songs`` is an iterable of (key, audio[N], beats[T], downbeats[T], meta)."""
+    """``songs`` is an iterable of (key, audio[N], beats[T], downbeats[T], meta).
+
+    Read-outs (phi is the BAR phase, paper section 5.2):
+      * ``beat_phase``     : beats = the m subdivisions of the bar (``beats_from_barphase``),
+                             scored against the BEAT reference. The correct beat-rate latent
+                             read-out (a known-answer test on ideal latents scores ~0.97).
+      * ``downbeat_phase`` : downbeats = bar-boundary 2*pi wraps (``downbeats_from_barphase``),
+                             scored against the DOWNBEAT reference.
+      * ``decoder``        : peak-picks of the Bernoulli decoder vs beats (rides the audio h).
+      * ``metronome``      : constant-120-BPM floor vs beats.
+
+    NOTE: a previous version scored bar-rate 2*pi wraps against the *beat* reference, which
+    caps a perfect bar-pointer at ~1/m -- fixed here by reading beats at the subdivision rate
+    and scoring wraps against downbeats.
+    """
     was_training = model.training
     model.eval()
-    accum = {"phase_wrap": [], "decoder": [], "metronome": []}
+    accum = {"beat_phase": [], "downbeat_phase": [], "decoder": [], "metronome": []}
     per_song = []
-    for key, audio, beats, _downbeats, _meta in songs:
+    for key, audio, beats, downbeats, _meta in songs:
         h = logmel(audio.to(device).unsqueeze(0))           # [1, T, n_mels]
         T = min(h.shape[1], max_frames)
         out = free_run(model, h[:, :T], temperature=temperature)
         phase_mu = out["phase_mu"][0, :T].cpu().numpy()
         dec = out["decoder_prob"][0, :T].cpu().numpy()
         ref = np.where(beats.numpy()[:T] > 0.5)[0] / fps
+        dref = np.where(downbeats.numpy()[:T] > 0.5)[0] / fps
+        m = _estimate_meter(ref, dref)
         row = {
-            "key": key, "n_ref": int(len(ref)),
-            "phase_wrap": f_measure(ref, beats_from_phase(phase_mu, fps)),
+            "key": key, "n_ref": int(len(ref)), "n_dref": int(len(dref)), "meter": m,
+            "beat_phase": f_measure(ref, beats_from_barphase(phase_mu, m, fps)),
+            "downbeat_phase": f_measure(dref, downbeats_from_barphase(phase_mu, fps)),
             "decoder": f_measure(ref, beats_from_activation(dec, fps)),
             "metronome": f_measure(ref, metronome(T, fps)),
         }
