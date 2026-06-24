@@ -69,6 +69,9 @@ def main() -> int:
     p.add_argument("--split", choices=["train", "val"], default="val")
     p.add_argument("--max_songs", type=int, default=60)
     p.add_argument("--max_frames", type=int, default=2048)
+    p.add_argument("--rich", action="store_true",
+                   help="cache the frontend's penultimate [T,D] features (D=512 for Beat This) "
+                        "instead of the collapsed [T,2] activations; keeps [T,2] as 'act2'.")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--out_dir", required=True)
     cli = p.parse_args()
@@ -104,9 +107,17 @@ def main() -> int:
             ext_target = batch["extractor_target"].to(device)
             beat_targets = batch["beat_targets"].to(device)
 
-            _, activations = backend.compute_loss_and_activations(
-                model=extractor, audio=audio, target=ext_target, frozen=True,
-            )
+            if cli.rich:
+                if cli.extractor != "beat_this":
+                    raise SystemExit("--rich is implemented for the beat_this backend only")
+                activations, act2 = backend.compute_hidden_and_activations(
+                    extractor, audio, ext_target,
+                )                                   # [1,T,D], [1,T,2]
+            else:
+                _, activations = backend.compute_loss_and_activations(
+                    model=extractor, audio=audio, target=ext_target, frozen=True,
+                )
+                act2 = None
             T_ext = activations.shape[1]
             bt = crop(beat_targets, T_ext) if beat_targets.shape[1] > T_ext else beat_targets
             db = ext_target[:, 1, :]
@@ -129,12 +140,17 @@ def main() -> int:
                     e = s + cli.max_frames
             else:
                 s, e = 0, min(T_ext, cli.max_frames)
+            acts_crop = activations[0, s:e].contiguous().cpu()           # [T, D]
+            if cli.rich:
+                acts_crop = acts_crop.half()                             # fp16: ~13GB/2000 songs
             rec = {
-                "activations": activations[0, s:e].contiguous().cpu(),   # [T, 2]
+                "activations": acts_crop,                                # [T, D] (D=2 or 512)
                 "beat_targets": bt[0, s:e].contiguous().cpu(),           # [T]
                 "downbeat_targets": db[0, s:e].contiguous().cpu(),       # [T]
                 "fps": fps,
             }
+            if act2 is not None:
+                rec["act2"] = act2[0, s:e].contiguous().cpu()            # [T, 2] for peak-pick ceiling
             # Structured GT latents (for the supervision-crutch baseline; the
             # AudioPhaseBridge provides these whenever phases_dir resolves).
             for key in ("phase_prev", "log_tempo_prev", "meter_onehot_prev"):

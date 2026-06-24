@@ -70,6 +70,8 @@ def _build_model(ckpt_path, device):
         tempo_reversion_alpha=saved.get("tempo_reversion_alpha", 0.0),
         tempo_anchor_ema_beta=saved.get("tempo_anchor_ema_beta", 0.02),
         audio_emission=saved.get("audio_emission", False),
+        bar_phase=saved.get("bar_phase", False),
+        meter_ste=saved.get("meter_ste", False),
     ).to(device)
     model.load_state_dict(ckpt["svt_model"] if "svt_model" in ckpt else ckpt, strict=True)
     model.eval()
@@ -119,7 +121,13 @@ def _load_ref_beats(annot_path):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--extractor_ckpt", required=True)
+    p.add_argument("--frontend", default="wavebeat", choices=["wavebeat", "beat_this"],
+                   help="acoustic frontend the CHART checkpoint was trained on")
+    p.add_argument("--extractor_ckpt", default=None,
+                   help="WaveBeat extractor ckpt (wavebeat frontend only)")
+    p.add_argument("--beat_this_checkpoint", default="final0",
+                   help="Beat This pretrained shortname/path (beat_this frontend only)")
+    p.add_argument("--extractor_fps_mode", default="resample", choices=["resample", "native"])
     p.add_argument("--smc_root", default="/home/sogang/jaehoon/Analyze-SMC/SMC_MIREX")
     p.add_argument("--max_songs", type=int, default=40)
     p.add_argument("--max_frames", type=int, default=6000)  # SMC excerpts ~40s ~3400 frames
@@ -143,14 +151,26 @@ def main() -> int:
     annot_dir = smc_root / "SMC_MIREX_Annotations"
     assert audio_dir.is_dir() and annot_dir.is_dir(), f"SMC dirs missing under {smc_root}"
 
-    # ---- extractor backend (WaveBeat) ----
-    backend = get_extractor_backend("wavebeat")
-    ext_args = argparse.Namespace(
-        wavebeat_root=cli.wavebeat_root, extractor_ckpt=cli.extractor_ckpt,
-    )
+    # ---- extractor backend (frontend the CHART ckpt was trained on) ----
+    backend = get_extractor_backend(cli.frontend)
+    if cli.frontend == "beat_this":
+        ext_args = argparse.Namespace(
+            beat_this_root=None, wavebeat_root=cli.wavebeat_root,
+            extractor_fps_mode=cli.extractor_fps_mode, target_factor=None,
+            audio_sample_rate=22050, beat_this_loss_tolerance=3,
+            extractor_ckpt=None, beat_this_checkpoint=cli.beat_this_checkpoint,
+        )
+    else:
+        if cli.extractor_ckpt is None:
+            raise SystemExit("--extractor_ckpt is required for the wavebeat frontend")
+        ext_args = argparse.Namespace(
+            wavebeat_root=cli.wavebeat_root, extractor_ckpt=cli.extractor_ckpt,
+        )
     extractor = backend.build_model(ext_args, device)
     backend.load_checkpoint(extractor, ext_args, device)
     extractor.eval()
+    print(f"[SMC] frontend={cli.frontend}"
+          + (f" ({cli.beat_this_checkpoint}, {cli.extractor_fps_mode})" if cli.frontend == "beat_this" else ""))
 
     # ---- SMC dataset (raw WaveBeat loader; full-val = all files, no crop) ----
     sys.path.insert(0, str(Path(cli.wavebeat_root).resolve()))
@@ -175,6 +195,15 @@ def main() -> int:
                 continue
             audio = audio.float().unsqueeze(0).to(device)      # [1, 1, samples]
             tgt = target.float().unsqueeze(0).to(device)
+            # Crop the AUDIO to the eval window before the extractor. Beat This is a
+            # transformer (cost grows with audio length), so feeding full ~80s SMC
+            # excerpts is the bottleneck. We only score the first max_frames frames
+            # anyway (ref beats are clipped to the window below), so this is exact.
+            max_samples = cli.max_frames * 256
+            if audio.shape[-1] > max_samples:
+                audio = audio[..., :max_samples]
+                if tgt.shape[-1] > cli.max_frames:
+                    tgt = tgt[..., :cli.max_frames]
             _, activations = backend.compute_loss_and_activations(
                 model=extractor, audio=audio, target=tgt, frozen=True,
             )
@@ -185,6 +214,12 @@ def main() -> int:
             ref = ref_beats[ref_beats < dur]
             if len(ref) < 2:
                 continue
+
+            # Raw WaveBeat baseline: peak-pick the frontend's beat-activation channel
+            # directly (no structured tracker). Isolates what CHART/PF ADDS over its
+            # own discriminative frontend on this out-of-distribution set.
+            rawwb = activations[0, :, 0].cpu().numpy()
+            acc.add("rawwb_", evaluate_beats(ref, extract_beat_timestamps(rawwb, fps=fps)))
 
             _readout(model.sample_from_prior(activations, temperature=cli.temperature),
                      ref, fps, acc, "openloop.")
@@ -210,6 +245,7 @@ def main() -> int:
             label, acc.get(prefix + "F-measure"), acc.get(prefix + "CMLt"),
             acc.get(prefix + "AMLt")))
 
+    row("rawWaveBeat", "rawwb_")
     row("openloop phase", "openloop.phase_")
     row("openloop dec", "openloop.dec_")
     for s in sigmas:
@@ -219,12 +255,17 @@ def main() -> int:
     row("baseline120", "base_")
     row("tempoOracle", "oracle_")
 
+    rawwb = acc.get("rawwb_CMLt")
     ol = max(acc.get("openloop.phase_CMLt"), acc.get("openloop.dec_CMLt"))
     pf = max(
         max(acc.get(f"pf{s}.phase_CMLt"), acc.get(f"pf{s}.dec_CMLt"), acc.get(f"pf{s}.wrap_CMLt"))
         for s in sigmas
     )
-    print(f"\n[SMC] best CMLt: open-loop={ol:.3f}  particle-filter={pf:.3f}  (Δ={pf - ol:+.3f})")
+    rawwb_f = acc.get("rawwb_F-measure")
+    pf_f = max(max(acc.get(f"pf{s}.phase_F-measure"), acc.get(f"pf{s}.dec_F-measure")) for s in sigmas)
+    print(f"\n[SMC] CMLt: rawWaveBeat={rawwb:.3f}  open-loop={ol:.3f}  particle-filter={pf:.3f}")
+    print(f"[SMC] F:    rawWaveBeat={rawwb_f:.3f}  particle-filter={pf_f:.3f}  "
+          f"(does the structured tracker beat its own frontend? ΔCMLt={pf - rawwb:+.3f})")
     return 0
 
 

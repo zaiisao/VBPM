@@ -208,19 +208,31 @@ class _VonMisesSampleFn(torch.autograd.Function):
 
         done = torch.zeros(shape, dtype=torch.bool, device=device)
         f_accepted = torch.zeros(shape, dtype=dtype, device=device)
+        # AMORTIZED sync: check the data-dependent stop only every SYNC_EVERY iters, not every
+        # iter. The original `if done.all(): break` forced a CPU<->GPU sync on EVERY rejection
+        # iteration AND every one of the T sequential rollout steps -> GPU ~17% util, 8.5s/rollout.
+        # This keeps the EXACT accepted-sample distribution (loop body unchanged; at most a few
+        # harmless extra iters past acceptance) while cutting syncs ~16x. Small kappa has low
+        # Best-Fisher acceptance and genuinely needs many iters, so we keep max_iter high.
         max_iter = 1000
+        SYNC_EVERY = 16
 
-        for _ in range(max_iter):
-            if done.all():
+        for _it in range(max_iter):
+            if _it > 0 and _it % SYNC_EVERY == 0 and done.all():
                 break
             u1 = torch.rand(shape, dtype=dtype, device=device)
             u2 = torch.rand(shape, dtype=dtype, device=device)
             c = torch.cos(math.pi * u1)
             f = (1.0 + r * c) / (r + c)
-            # Guard log(f) for f <= 0 (can happen when r is large / kappa small)
-            f_pos = f.clamp(min=1e-30)
-            accept = (kappa_safe * (r - f) + torch.log(f_pos) - torch.log(r)) >= torch.log(u2)
-            accept = accept & (f > 0)  # reject negative f
+            # Best-Fisher acceptance (Best & Fisher 1979). The previous test
+            #   kappa*(r - f) + log(f/r) >= log(u2)   was WRONG: accepted samples IGNORED kappa
+            # (empirical resultant length R ~ 0.8 for EVERY kappa; correct is R = I1(k)/I0(k),
+            # verified against numpy.random.vonmises). With c = kappa*(r - f):
+            #   accept iff  c*(2 - c) >= u2   (fast squeeze)  OR  log(c) - log(u2) + 1 - c >= 0.
+            c_acc = kappa_safe * (r - f)
+            accept = (c_acc * (2.0 - c_acc) - u2 > 0) | (
+                torch.log(c_acc.clamp(min=1e-30)) - torch.log(u2.clamp(min=1e-30)) + 1.0 - c_acc >= 0
+            )
             newly_accepted = accept & ~done
             f_accepted = torch.where(newly_accepted, f, f_accepted)
             done = done | accept
@@ -230,6 +242,7 @@ class _VonMisesSampleFn(torch.autograd.Function):
         uniform_f = 2.0 * torch.rand(shape, dtype=dtype, device=device) - 1.0
         f_accepted = torch.where(done, f_accepted, uniform_f)
         u3 = torch.rand(shape, dtype=dtype, device=device)
+        f_accepted = f_accepted.clamp(-1.0, 1.0)  # numerical safety for acos
         z = torch.where(u3 > 0.5, torch.acos(f_accepted), -torch.acos(f_accepted))
         sample = mu + z
 

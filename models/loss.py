@@ -31,6 +31,9 @@ def compute_elbo_loss(
     free_bits_meter: float | None = None,
     free_bits_phase: float | None = None,
     free_bits_tempo: float | None = None,
+    free_bits_barphase: float | None = None,
+    barphase_targets: Tensor | None = None,
+    barphase_sup_weight: float = 0.0,
     downbeat_targets: Tensor | None = None,
     tempo_density_weight: float = 0.0,
     tempo_bar: dict[str, Tensor] | None = None,
@@ -59,6 +62,7 @@ def compute_elbo_loss(
     fb_meter = free_bits_meter if free_bits_meter is not None else free_bits
     fb_phase = free_bits_phase if free_bits_phase is not None else free_bits
     fb_tempo = free_bits_tempo if free_bits_tempo is not None else free_bits
+    fb_barphase = free_bits_barphase if free_bits_barphase is not None else free_bits
 
     pw = torch.tensor(pos_weight, device=beat_logits.device) if pos_weight != 1.0 else None
     pw_db_val = pos_weight_db if pos_weight_db is not None else pos_weight
@@ -96,6 +100,19 @@ def compute_elbo_loss(
         ),
         fb_phase,
     )
+
+    # ---- KL: bar-phase (von Mises; Mode-4 fix) — present only when bar_phase is on ----
+    if "barphase_mu" in posterior and "barphase_mu" in prior:
+        kappa_qb = posterior["barphase_log_kappa"].exp()
+        kl_barphase = _kl_with_free_bits(
+            von_mises_kl(
+                posterior["barphase_mu"], kappa_qb,
+                prior["barphase_mu"], prior["barphase_kappa"],
+            ),
+            fb_barphase,
+        )
+    else:
+        kl_barphase = torch.zeros((), device=beat_logits.device)
 
     # ---- KL: tempo (Log-Normal in log-space) ----
     sigma_q = posterior["tempo_log_sigma"].exp()
@@ -160,6 +177,17 @@ def compute_elbo_loss(
     else:
         phase_sup = torch.zeros((), device=beat_logits.device)
 
+    # ---- Bar-phase supervision (Mode-4; the dense "downbeat-interval" signal) ----
+    # Align the PRIOR bar-phase mean to the GT bar-phase sawtooth (within-bar position,
+    # 0→2π, resetting at each downbeat). Dense circular loss 1−cos(Δ) — the same dense
+    # gradient that keeps the beat-phase alive, now applied to bar position. This is the
+    # generative analog of regressing distance-to-downbeat (object-detection interval).
+    if barphase_sup_weight > 0.0 and barphase_targets is not None and "barphase_mu" in prior:
+        bt_tgt = barphase_targets.squeeze(-1) if barphase_targets.dim() == 3 else barphase_targets
+        barphase_sup = (1.0 - torch.cos(prior["barphase_mu"] - bt_tgt)).mean()
+    else:
+        barphase_sup = torch.zeros((), device=beat_logits.device)
+
     # ---- Tempo-density regularizer (opt-in; weight 0 ⇒ pure ELBO) ----
     # The free-running PRIOR tempo can lock to a wrong metrical level (double-time):
     # the latent-only decoder is indifferent to wrap RATE, so nothing penalises 2×.
@@ -179,11 +207,12 @@ def compute_elbo_loss(
 
     total = (
         bce
-        + beta * (kl_m + kl_phi + kl_tempo + kl_taubar)
+        + beta * (kl_m + kl_phi + kl_tempo + kl_taubar + kl_barphase)
         + tempo_density_weight * tempo_density
         + taubar_sup_weight * taubar_sup
         + meter_sup_weight * meter_sup
         + phase_sup_weight * phase_sup
+        + barphase_sup_weight * barphase_sup
     )
 
     components = {
@@ -192,9 +221,11 @@ def compute_elbo_loss(
         "kl_phase": kl_phi.detach(),
         "kl_tempo": kl_tempo.detach(),
         "kl_taubar": kl_taubar.detach(),
+        "kl_barphase": kl_barphase.detach(),
         "taubar_sup": taubar_sup.detach(),
         "meter_sup": meter_sup.detach(),
         "phase_sup": phase_sup.detach(),
+        "barphase_sup": barphase_sup.detach(),
         "tempo_density": tempo_density.detach(),
     }
     return total, components

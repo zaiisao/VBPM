@@ -239,15 +239,18 @@ class Base(pl.LightningModule):
         #self.log('val_loss/(DBN) Beat F-measure', np.mean(dbn_beat_f1_scores))
         #self.log('val_loss/(DBN) Downbeat F-measure', np.mean(dbn_downbeat_f1_scores))
 
-        self.logger.experiment.add_text("perf", 
-                                        make_table(songs),
-                                        self.global_step)
-    
-        # log score histograms plots
-        self.logger.experiment.add_image(f"hist/F-measure",
-                                         plot_histogram(songs),
-                                         self.global_step)
- 
+        # TensorBoard-only diagnostics; no-op under PL 2.x CSVLogger.
+        _tb = hasattr(self.logger.experiment, "add_text")
+        if _tb:
+            self.logger.experiment.add_text("perf",
+                                            make_table(songs),
+                                            self.global_step)
+
+            # log score histograms plots
+            self.logger.experiment.add_image(f"hist/F-measure",
+                                             plot_histogram(songs),
+                                             self.global_step)
+
         for idx, rand_idx in enumerate(list(rand_indices)):
             i = outputs["input"][rand_idx].squeeze()
             t = outputs["target"][rand_idx].squeeze()
@@ -271,21 +274,22 @@ class Base(pl.LightningModule):
                                                                        beat_type="downbeat",
                                                                        sample_rate=self.hparams.target_sample_rate)
             # log audio examples
-            self.logger.experiment.add_audio(f"input/{idx}",  
-                                             i, self.global_step, 
-                                             sample_rate=self.hparams.audio_sample_rate)
+            if _tb:
+                self.logger.experiment.add_audio(f"input/{idx}",
+                                                 i, self.global_step,
+                                                 sample_rate=self.hparams.audio_sample_rate)
 
-            # log beats plots
-            self.logger.experiment.add_image(f"act/{idx}",
-                                             plot_activations(ref_beats, 
-                                                              est_beats, 
-                                                              est_sm,
-                                                              self.hparams.target_sample_rate,
-                                                              ref_downbeats=ref_downbeats,
-                                                              est_downbeats=est_downbeats,
-                                                              est_downbeats_sm=est_downbeat_sm,
-                                                              song_name=f),
-                                             self.global_step)
+                # log beats plots
+                self.logger.experiment.add_image(f"act/{idx}",
+                                                 plot_activations(ref_beats,
+                                                                  est_beats,
+                                                                  est_sm,
+                                                                  self.hparams.target_sample_rate,
+                                                                  ref_downbeats=ref_downbeats,
+                                                                  est_downbeats=est_downbeats,
+                                                                  est_downbeats_sm=est_downbeat_sm,
+                                                                  song_name=f),
+                                                 self.global_step)
 
             if self.hparams.save_dir is not None:
                 if not os.path.isdir(self.hparams.save_dir):

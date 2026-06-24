@@ -41,6 +41,7 @@ def build_from_ckpt(path, device):
     ck = torch.load(path, map_location=device)
     a = ck["args"]
     m = SVTModel(
+        input_dim=a.get("input_dim", 2),   # 512 for rich-feature checkpoints
         hidden_dim=128, nhead=4, num_layers=2,
         num_meter_classes=a["num_meter_classes"],
         phase_corr_scale=a["phase_corr_scale"],

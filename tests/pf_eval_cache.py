@@ -45,7 +45,7 @@ def main() -> int:
     with torch.no_grad():
         for f in fs:
             r = torch.load(f, map_location=dev)
-            act = r["activations"][:maxT].unsqueeze(0)
+            act = r["activations"][:maxT].unsqueeze(0).float()   # fp16 rich cache -> fp32
             fps = float(r["fps"])
             ref = frames_to_beat_times(r["beat_targets"][:maxT].cpu().numpy(), fps)
             ref_db = frames_to_beat_times(r["downbeat_targets"][:maxT].cpu().numpy(), fps)
