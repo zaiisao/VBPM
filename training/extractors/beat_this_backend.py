@@ -498,6 +498,42 @@ class BeatThisBackend:
             downbeat_target = _center_crop_last_dim(target[:, 1, :], T_aligned).float()
         return beat_logits, downbeat_logits, beat_target, downbeat_target
 
+    @torch.no_grad()
+    def compute_hidden_and_activations(self, model, audio, target):
+        """Rich-feature extraction (do NOT collapse to [T,2] -- see CHART feedback).
+
+        Returns ``(hidden [B,T,D], activations [B,T,2])`` on a common frame axis.
+        ``hidden = transformer_blocks(frontend(spect))`` is the 512-dim representation
+        fed to ``task_heads`` (beat_tracker.py forward = frontend->transformer_blocks->
+        task_heads), i.e. EVERYTHING Beat This computes BEFORE collapsing to the two
+        beat/downbeat logits. We keep the [T,2] probs too (targets / peak-pick ceiling).
+        The feature is brought onto the target's frame axis with the SAME interpolation
+        ``_align_to_target`` applies to the logits (Beat This runs at ~50 fps).
+        """
+        if audio.dim() == 3:
+            audio = audio.squeeze(1)
+        spect_device = next(self._spect.buffers()).device
+        if spect_device != audio.device:
+            self._spect = self._spect.to(audio.device)
+        core = getattr(model, "_orig_mod", model)   # unwrap torch.compile if present
+        spect = self._spect(audio)
+        feat = core.transformer_blocks(core.frontend(spect))   # [B, T_native, D]
+        out = core.task_heads(feat)                            # {"beat","downbeat"}
+        beat_logits, downbeat_logits, _, _ = self._align_to_target(
+            out["beat"], out["downbeat"], target,
+        )
+        activations = torch.stack(
+            [torch.sigmoid(beat_logits), torch.sigmoid(downbeat_logits)], dim=-1,
+        )  # [B, T, 2]
+        if self._fps_mode == "resample":
+            feat = F.interpolate(
+                feat.transpose(1, 2), size=target.shape[-1], mode="linear", align_corners=False,
+            ).transpose(1, 2)                                   # [B, T_target, D]
+        else:
+            T_aligned = min(feat.shape[1], target.shape[-1])
+            feat = _center_crop_last_dim(feat.transpose(1, 2), T_aligned).transpose(1, 2)
+        return feat, activations
+
     def compute_loss_and_activations(
         self,
         model: torch.nn.Module,

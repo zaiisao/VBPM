@@ -157,9 +157,10 @@ def _calc_mi_continuous(model, heldout, max_frames, n_cap=512):
     """
     was_training = model.training
     model.eval()
+    device = next(model.parameters()).device
     mu_ph, kap_ph, mu_t, lv_t = [], [], [], []
     for r in heldout:
-        act = r["activations"][:max_frames].unsqueeze(0)
+        act = r["activations"][:max_frames].unsqueeze(0).to(device).float()
         post = model(act)["posterior"]
         mu_ph.append(post["phase_mu"].reshape(-1))
         kap_ph.append(post["phase_log_kappa"].exp().reshape(-1))
@@ -204,6 +205,7 @@ def _calc_mi_continuous(model, heldout, max_frames, n_cap=512):
 def _heldout_freerun(model, heldout, fps, max_frames, temperature=0.1, diag=False):
     """Run the deployed free-running prior on every held-out song; average mir_eval."""
     model.eval()
+    device = next(model.parameters()).device
     sums, counts = {}, {}
 
     def acc(prefix, scores, keys):
@@ -213,7 +215,7 @@ def _heldout_freerun(model, heldout, fps, max_frames, temperature=0.1, diag=Fals
             counts[key] = counts.get(key, 0) + 1
 
     for r in heldout:
-        act = r["activations"][:max_frames].unsqueeze(0)
+        act = r["activations"][:max_frames].unsqueeze(0).to(device).float()
         bt = r["beat_targets"][:max_frames]
         db = r["downbeat_targets"][:max_frames]
         ref = frames_to_beat_times(bt.cpu().numpy(), fps)
@@ -260,11 +262,13 @@ def _parse_ideas(s: str) -> set:
     return {x for x in s.replace("+", ",").split(",") if x and x != "none"}
 
 
-def build_model(cli, device) -> SVTModel:
+def build_model(cli, device, input_dim: int = 2) -> SVTModel:
     # dir1-replica defaults; --baseline core/faithful strip crutches. Ideas compose:
     # multiple features (bar_phase, z_forcing, meter_ste, aggressive_encoder) can be on.
+    # input_dim = obs dim of the cache (2 = legacy [T,2] collapse; 512 = Beat This rich features).
     ideas = _parse_ideas(cli.idea)
     m = SVTModel(
+        input_dim=input_dim,
         hidden_dim=128, nhead=4, num_layers=2, num_meter_classes=cli.num_meter_classes,
         phase_corr_scale=cli.phase_corr_scale,
         tempo_corr_scale=cli.tempo_corr_scale,
@@ -330,6 +334,10 @@ def main() -> int:
                    help="downbeat mechanism diagnostics: meter-ablation + db CMLt/AMLt")
     p.add_argument("--save_ckpt", default="",
                    help="if set, save {svt_model, args} to this path (loadable by pf_eval_smc)")
+    p.add_argument("--save_best", default="",
+                   help="if set, save the BEST-heldout-beatF checkpoint here. These runs "
+                        "OVERFIT past a peak and the FINAL ckpt is degraded; the gate eval "
+                        "must use the peak, so persist it as soon as beatF improves.")
     cli = p.parse_args()
 
     torch.manual_seed(cli.seed)
@@ -386,19 +394,25 @@ def main() -> int:
     # KL_tempo >= the same delta, so max(kl, free_bits) never clamps. No double-counting.
     # bar_phase and meter_ste are wired in build_model (they change the architecture).
 
-    train_recs = _load_cache(cli.train_cache, device)
-    heldout = _load_cache(cli.heldout_cache, device)
+    # Rich [T,512] features are too big to keep GPU-resident (~24GB for 2000 songs); load to
+    # CPU and move each batch to the GPU on the fly (legacy [T,2] caches are unaffected).
+    cache_dev = torch.device("cpu")
+    train_recs = _load_cache(cli.train_cache, cache_dev)
+    heldout = _load_cache(cli.heldout_cache, cache_dev)
     if cli.max_train > 0:
         train_recs = train_recs[:cli.max_train]
     if cli.max_heldout > 0:
         heldout = heldout[:cli.max_heldout]
     fps = train_recs[0]["fps"] if train_recs else 86.1328125
+    obs_dim = int(train_recs[0]["activations"].shape[-1]) if train_recs else 2
+    n_train = len(train_recs)
     batches = _make_train_batches(train_recs, cli.frames, cli.batch_size)
-    print(f"[proxy:{cli.tag}] train={len(train_recs)} songs -> {len(batches)} batches | "
+    del train_recs  # batches hold the crops now; free the full-length train songs
+    print(f"[proxy:{cli.tag}] train={n_train} songs -> {len(batches)} batches | obs_dim={obs_dim} | "
           f"heldout={len(heldout)} songs | baseline={cli.baseline} idea={cli.idea} | "
           f"steps={cli.steps} frames={cli.frames} bs={cli.batch_size}")
 
-    model = build_model(cli, device)
+    model = build_model(cli, device, obs_dim)
     # He-2019 (third_party/vae-lagging-encoder): SEPARATE inference-net (encoder) and
     # generative (prior+decoder) optimizers. In aggressive mode we burn the encoder to
     # convergence, then take a decoder-only step; in vanilla mode we step both each
@@ -456,9 +470,45 @@ def main() -> int:
                 f"FREE-RUN beatF={bF:.3f} CMLt={bC:.3f} | downbeatF={_dbF(metrics):.3f} "
                 f"(dec={metrics.get('dec_db_F-measure',0):.3f} barwrap={metrics.get('barwrap_db_F-measure',0):.3f})")
 
+    # Build the checkpoint payload ONCE; used by --save_best (peak) and --save_ckpt (final).
+    ck_ideas = _parse_ideas(cli.idea)
+    ck_args = {
+        "input_dim": obs_dim,
+        "num_meter_classes": cli.num_meter_classes,
+        "phase_corr_scale": cli.phase_corr_scale,
+        "tempo_corr_scale": cli.tempo_corr_scale,
+        "decoder_latent_only": cli.decoder_latent_only,
+        "tempo_anchor_mode": cli.tempo_anchor_mode,
+        "tempo_reversion_alpha": cli.tempo_reversion_alpha,
+        "audio_emission": cli.audio_emission,
+        "bar_phase": "bar_phase" in ck_ideas,
+        "meter_ste": "meter_ste" in ck_ideas,
+        "delta_vae": "delta_vae" in ck_ideas,
+        "delta_vae_rate": cli.free_bits_tempo,
+        "dvbf": "dvbf" in ck_ideas,
+    }
+
+    def _save_model(path):
+        import os as _os
+        _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+        torch.save({"svt_model": model.state_dict(), "args": ck_args}, path)
+
+    best = {"beatF": -1.0, "step": 0, "downbeatF": 0.0}
+
+    def _to_dev(b):
+        out = {}
+        for k, v in b.items():
+            if torch.is_tensor(v):
+                v = v.to(device)
+                if v.is_floating_point():
+                    v = v.float()    # fp16 rich cache -> fp32 for the model
+            out[k] = v
+        return out
+
     bi = 0
+    nf_streak = 0   # consecutive non-finite (NaN/Inf) losses -> divergence guard (DVBF NaNs ~step 100)
     for step in range(1, cli.steps + 1):
-        batch = batches[bi % len(batches)]
+        batch = _to_dev(batches[bi % len(batches)])
         bi += 1
         temp = _temp_at(step, cli.steps, cli.gumbel_temp_start, cli.gumbel_temp_end)
         beta = _beta_at(step, cli.steps, cli.kl_anneal_frac)
@@ -495,7 +545,7 @@ def main() -> int:
                 inner_total.backward()
                 torch.nn.utils.clip_grad_norm_(enc_params, cli.max_grad_norm)
                 enc_opt.step()
-                enc_batch = batches[int(torch.randint(len(batches), ()).item())]  # fresh random batch
+                enc_batch = _to_dev(batches[int(torch.randint(len(batches), ()).item())])  # fresh random batch
                 sub_iter += 1
                 if sub_iter % BURN_WINDOW == 0:
                     burn_cur /= max(burn_n, 1)
@@ -508,8 +558,15 @@ def main() -> int:
         dec_opt.zero_grad(set_to_none=True)
         total, comps, out = forward_loss(act, bt, db, meter_tgt, phase_tgt, temp, beta)
         if not torch.isfinite(total):
-            print(f"[proxy:{cli.tag}] non-finite loss at step {step}, skipping")
+            nf_streak += 1
+            if nf_streak <= 3 or nf_streak % 25 == 0:
+                print(f"[proxy:{cli.tag}] non-finite loss at step {step} (streak {nf_streak}), skipping", flush=True)
+            if nf_streak >= 30:   # diverged -- stop wasting compute, finalize with best-so-far
+                print(f"[proxy:{cli.tag}] DIVERGED: {nf_streak} consecutive non-finite losses, "
+                      f"aborting training at step {step}", flush=True)
+                break
             continue
+        nf_streak = 0
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cli.max_grad_norm)
         if not aggressive_flag:
@@ -533,6 +590,13 @@ def main() -> int:
         if step % cli.eval_every == 0 or step == cli.steps:
             metrics = _heldout_freerun(model, heldout, fps, cli.eval_frames, diag=cli.diag)
             print(fmt_eval(step, run_comps, metrics), flush=True)
+            bF_now = max(metrics.get("phase_F-measure", 0), metrics.get("dec_F-measure", 0))
+            if bF_now > best["beatF"]:
+                best = {"beatF": bF_now, "step": step, "downbeatF": _dbF(metrics)}
+                if cli.save_best:
+                    _save_model(cli.save_best)
+                    print(f"[proxy:{cli.tag}] saved BEST (beatF={bF_now:.4f} @step {step}) "
+                          f"-> {cli.save_best}", flush=True)
             if cli.diag:
                 print(f"[proxy:{cli.tag}] DIAG step {step:04d} | "
                       f"db_dec F={metrics.get('dec_db_F-measure',0):.3f} "
@@ -554,27 +618,13 @@ def main() -> int:
     final = history[-1] if history else {}
     print(f"\n[proxy:{cli.tag}] RESULT " + json.dumps({"tag": cli.tag, "idea": cli.idea,
           "baseline": cli.baseline, **final}))
+    print(f"[proxy:{cli.tag}] BEST " + json.dumps({"tag": cli.tag, "idea": cli.idea,
+          "baseline": cli.baseline, "best_beatF": round(best["beatF"], 4),
+          "best_step": best["step"], "best_downbeatF": round(best["downbeatF"], 4)}))
 
     if cli.save_ckpt:
-        import os as _os
-        ck_ideas = _parse_ideas(cli.idea)
-        ck_args = {
-            "num_meter_classes": cli.num_meter_classes,
-            "phase_corr_scale": cli.phase_corr_scale,
-            "tempo_corr_scale": cli.tempo_corr_scale,
-            "decoder_latent_only": cli.decoder_latent_only,
-            "tempo_anchor_mode": cli.tempo_anchor_mode,
-            "tempo_reversion_alpha": cli.tempo_reversion_alpha,
-            "audio_emission": cli.audio_emission,
-            "bar_phase": "bar_phase" in ck_ideas,
-            "meter_ste": "meter_ste" in ck_ideas,
-            "delta_vae": "delta_vae" in ck_ideas,
-            "delta_vae_rate": cli.free_bits_tempo,
-            "dvbf": "dvbf" in ck_ideas,
-        }
-        _os.makedirs(_os.path.dirname(cli.save_ckpt) or ".", exist_ok=True)
-        torch.save({"svt_model": model.state_dict(), "args": ck_args}, cli.save_ckpt)
-        print(f"[proxy:{cli.tag}] saved checkpoint -> {cli.save_ckpt}")
+        _save_model(cli.save_ckpt)
+        print(f"[proxy:{cli.tag}] saved checkpoint (FINAL) -> {cli.save_ckpt}")
     return 0
 
 

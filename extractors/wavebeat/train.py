@@ -53,6 +53,7 @@ parser.add_argument('--max_epochs', type=int, default=100)
 parser.add_argument('--accelerator', type=str, default='gpu')
 parser.add_argument('--devices', type=int, default=1)
 parser.add_argument('--precision', type=int, default=32)
+parser.add_argument('--gradient_clip_val', type=float, default=0.0)
 parser.add_argument('--default_root_dir', type=str, default=os.path.join("lightning_logs", "full"))
 
 # THIS LINE IS KEY TO PULL THE MODEL NAME
@@ -87,6 +88,7 @@ trainer = pl.Trainer(
     accelerator=args.accelerator,
     devices=args.devices,
     precision=args.precision,
+    gradient_clip_val=args.gradient_clip_val,
     default_root_dir=args.default_root_dir,
     callbacks=[checkpoint_callback],
 )

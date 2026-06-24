@@ -431,6 +431,10 @@ def train_epoch_end_to_end(
     meter_sup_weight: float = 0.0,
     phase_sup_weight: float = 0.0,
     audio_recon_weight: float = 0.0,
+    free_bits_barphase: float | None = None,
+    barphase_sup_weight: float = 0.0,
+    z_forcing_weight: float = 0.0,
+    z_forcing_offset: int = 8,
     max_grad_norm: float = 1.0,
     extractor_loss_weight: float = 1.0,
     svt_loss_weight: float = 1.0,
@@ -501,6 +505,11 @@ def train_epoch_end_to_end(
         out = svt_model(activations, temperature=temperature,
                         beat_targets=beat_targets_cropped,
                         downbeat_targets=downbeat_targets_cropped)
+        # Dense bar-phase target = within-bar position sawtooth (0->2pi, resets at each
+        # downbeat), derived from the GT downbeats (no extra data needed).
+        barphase_targets = None
+        if "barphase_mu" in out["prior"]:
+            barphase_targets = SVTModel._beat_targets_to_distance(downbeat_targets_cropped) * (2.0 * math.pi)
         svt_total, components = compute_elbo_loss(
             beat_logits=out["beat_logits"],
             beat_targets=beat_targets_cropped,
@@ -513,6 +522,9 @@ def train_epoch_end_to_end(
             free_bits_meter=free_bits_meter,
             free_bits_phase=free_bits_phase,
             free_bits_tempo=free_bits_tempo,
+            free_bits_barphase=free_bits_barphase,
+            barphase_targets=barphase_targets,
+            barphase_sup_weight=barphase_sup_weight,
             tempo_density_weight=tempo_density_weight,
             tempo_bar=out.get("tempo_bar"),
             taubar_sup_weight=taubar_sup_weight,
@@ -533,6 +545,15 @@ def train_epoch_end_to_end(
             audio_recon_loss = ((out["audio_recon"] - activations) ** 2).mean()
             total_loss = total_loss + audio_recon_weight * audio_recon_loss
             components["audio_recon"] = audio_recon_loss.detach()
+
+        # Z-Forcing aux: force z_t to PREDICT activations z_forcing_offset frames ahead
+        # (via the emission head) so the latent is forward-predictive -> better free-run beats.
+        if z_forcing_weight > 0.0 and out.get("audio_recon") is not None:
+            kf = max(1, int(z_forcing_offset))
+            if activations.shape[1] > kf:
+                zf_loss = ((out["audio_recon"][:, :-kf] - activations[:, kf:]) ** 2).mean()
+                total_loss = total_loss + z_forcing_weight * zf_loss
+                components["z_forcing"] = zf_loss.detach()
 
         # Guard against NaN/Inf — dump diagnostics on first occurrence, then skip
         if not torch.isfinite(total_loss):
@@ -924,6 +945,24 @@ def _build_parser() -> argparse.ArgumentParser:
                              "GT beat density log(2*pi*N_beats/T), breaking the double-time metrical-level "
                              "lock without touching the (correct) posterior tempo.")
 
+    # ---- Bar-phase latent (Mode-4 / downbeats) + Z-Forcing + ST-GS meter ----
+    parser.add_argument("--bar_phase", action="store_true",
+                        help="Add a 4th continuous von-Mises bar-phase latent psi_t (within-bar position, "
+                             "wraps at downbeats); revives downbeats where the categorical meter collapses.")
+    parser.add_argument("--barphase_sup_weight", type=float, default=1.0,
+                        help="Dense circular supervision of the prior bar-phase mean to the GT downbeat-interval "
+                             "sawtooth (1-cos(delta)). Load-bearing for bar_phase (needs --bar_phase).")
+    parser.add_argument("--free_bits_barphase", type=float, default=0.2,
+                        help="Per-latent free-bits floor for the bar-phase KL (nats).")
+    parser.add_argument("--z_forcing_weight", type=float, default=0.0,
+                        help="Z-Forcing aux cost: force z_t to predict input activations a few frames ahead "
+                             "via the emission head (needs --audio_emission). Boosts free-run beats.")
+    parser.add_argument("--z_forcing_offset", type=int, default=8,
+                        help="Future-prediction offset (frames) for --z_forcing_weight.")
+    parser.add_argument("--meter_ste", action="store_true",
+                        help="Straight-Through Gumbel-Softmax for the meter latent (hard one-hot forward). "
+                             "NOTE: ablation showed this does NOT revive the meter and can hurt beats.")
+
     # End-to-end
     parser.add_argument("--extractor_ckpt", type=str, default=None)
     parser.add_argument("--freeze_extractor", action="store_true")
@@ -1092,6 +1131,8 @@ def main() -> None:
         tempo_reversion_alpha=args.tempo_reversion_alpha,
         tempo_anchor_ema_beta=args.tempo_anchor_ema_beta,
         audio_emission=args.audio_emission,
+        bar_phase=args.bar_phase,
+        meter_ste=args.meter_ste,
     ).to(device)
 
     if is_distributed:
@@ -1144,6 +1185,10 @@ def main() -> None:
             meter_sup_weight=args.meter_sup_weight,
             phase_sup_weight=args.phase_sup_weight,
             audio_recon_weight=args.audio_recon_weight,
+            free_bits_barphase=args.free_bits_barphase,
+            barphase_sup_weight=args.barphase_sup_weight,
+            z_forcing_weight=args.z_forcing_weight,
+            z_forcing_offset=args.z_forcing_offset,
             max_grad_norm=args.max_grad_norm,
             extractor_loss_weight=args.extractor_loss_weight,
             svt_loss_weight=args.svt_loss_weight,

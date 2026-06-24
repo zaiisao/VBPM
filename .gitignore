@@ -181,6 +181,9 @@ pyrightconfig.json
 /wandb/
 /logs/
 
+# Cached frontend activations + diagnostic checkpoints (~18GB; regenerable, do NOT push)
+/cache/
+
 # Claude Code
 .claude/
 
