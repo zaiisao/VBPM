@@ -104,3 +104,26 @@ This is the scientifically clean baseline the project needed: the collapse is a 
 
 **Artifacts:** checkpoints `runs/strict_elbo/{best,final}.pt`; controls `runs/control_freebits/`,
 `runs/control_latentonly/`; figure `faithful/collapse.png`.
+
+---
+
+## 7. CORRECTION — measured with the paper's official bar-pointer read-out (§5.2)
+
+The paper defines φ as the **BAR** phase: one 2π cycle = one bar, a 2π wrap is a **downbeat**, and
+**beats are the m subdivisions φ = 2πk/m** (m = meter). Beats are read geometrically (official
+inference), not off φ-wraps. The earlier numbers in this doc used a beat-phase read-out (φ-wrap =
+beat), which conflated the two. Re-measured correctly (`faithful/evaluate.py:beats_from_barphase`,
+read-out self-tested to beat-F≈0.98 on synthetic ground truth):
+
+| official read-out | strict | latent-only |
+|---|---|---|
+| downbeat-F (φ wraps) | 0.125 | 0.125 |
+| beat-F, **oracle meter** (true m) | 0.329 | 0.362 |
+| beat-F, best m∈{2,3,4} | 0.369 | 0.391 |
+| tempo Acc1/Acc2 (BPM = 60·fps·m·φ̇/2π) | 0.00/0.00 | 0.00/0.00 |
+
+**Decisive:** even given the *true* meter, beat-F is only ~0.33 — so the failure is the **bar-phase
+itself** (a static init-tempo grid, not per-song) and the **diverging tempo**, NOT merely an
+ungrounded meter. The earlier "~0.38 beat-F" was the best-fit generic grid (the `best m` column);
+read the paper's way it is downbeat-F = 0.125. Conclusion unchanged: tempo, meter, and bar position
+do not work in the faithful (collapsed) model — now confirmed under the correct read-out.
