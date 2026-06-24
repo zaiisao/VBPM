@@ -9,7 +9,8 @@ WEIGHTS (no frozen Beat This frontend, no pretrained anything).
 Faithfulness contract (see ``faithful/README.md`` for the full mapping to the paper):
   * objective = strict ELBO:  L = sum_t BCE(b_t) + sum_t [KL_meter + KL_phase + KL_tempo]
   * beta = 1 from step 0, NO free-bits, NO KL annealing
-  * latent-only decoder  p_theta(b_t | z_t)  -- the decoder never reads the audio h
+  * decoder p_theta(b_t | z_t, h) reads the audio h (paper §5.4); the optional
+    ``--latent_only`` flag drops h from the decoder as a DOCUMENTED DEVIATION
   * prior means are the deterministic bar-pointer dynamics (phi_{t-1}+phidot_{t-1},
     log-tempo random walk) with NO audio-driven correction
   * three latents only: meter m (Categorical), phase phi (von Mises), log-tempo (Log-Normal)
