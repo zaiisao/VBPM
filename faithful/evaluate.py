@@ -51,6 +51,30 @@ def metronome(n_frames: int, fps: float, bpm: float = 120.0) -> np.ndarray:
     return np.arange(0.0, n_frames / fps, 60.0 / bpm)
 
 
+# --- OFFICIAL bar-pointer read-out (paper §5.2): phi is the BAR phase, [0,2pi) per bar. ---
+# A 2pi wrap is a DOWNBEAT (bar boundary). Beats are the m equal subdivisions of the bar:
+# phi crosses 2*pi*k/m, k=0..m-1. Equivalently beats = wraps of beat-phase psi = (m*phi) mod 2pi.
+# m = meter (beats per bar). Use the deterministic phase_mu chain (clean, monotone).
+_TWO_PI = 2.0 * math.pi
+
+
+def downbeats_from_barphase(phase: np.ndarray, fps: float, min_dist_sec: float = 0.30) -> np.ndarray:
+    """Downbeats = bar-boundary wraps (2pi -> 0) of the bar phase phi."""
+    return beats_from_phase(phase, fps, min_dist_sec)
+
+
+def beats_from_barphase(phase: np.ndarray, m: int, fps: float, min_dist_sec: float = 0.10) -> np.ndarray:
+    """Beats = the m subdivisions of the bar (phi crossing 2*pi*k/m), via wraps of (m*phi)."""
+    psi = (int(m) * np.asarray(phase, dtype=float)) % _TWO_PI
+    w = np.where(np.diff(psi) < -math.pi)[0] + 1
+    return _min_dist_filter(w.astype(float), min_dist_sec * fps) / fps
+
+
+def bpm_from_logtempo(log_tempo: float, m: int, fps: float) -> float:
+    """phi-dot is the BAR advance rate (rad/frame); beat-BPM = 60*fps*m*exp(log_tempo)/(2pi)."""
+    return 60.0 * fps * int(m) * math.exp(float(log_tempo)) / _TWO_PI
+
+
 def f_measure(ref_sec: np.ndarray, est_sec: np.ndarray) -> float:
     ref = np.asarray(ref_sec, dtype=float)
     est = np.asarray(est_sec, dtype=float)
