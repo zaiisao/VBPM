@@ -184,6 +184,9 @@ pyrightconfig.json
 # Cached frontend activations + diagnostic checkpoints (~18GB; regenerable, do NOT push)
 /cache/
 
+# Training run outputs (checkpoints + metrics; regenerable)
+/runs/
+
 # Claude Code
 .claude/
 
