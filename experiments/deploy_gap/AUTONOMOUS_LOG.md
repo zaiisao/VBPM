@@ -310,3 +310,16 @@ the breakdown really is prior audio->tempo (mean-pooled periodicity). SHARPENS i
 (search over BOTH tempo AND phase, audio eliminates wrong ones = the DBN), not just an estimator. Free-run
 searches neither -> commits to one feed-forward guess each. Pure classic [tempo est + phase search]=0.66
 (no VAE). The VAE's value must come from elsewhere if a 10-line classic method already gets 0.66.
+
+## [~20:xx] ROUTE 1 WORKS: corrected SMC (AESMC-referenced) + MAP readout BEATS free-run
+Deep analysis refuted my 3 PF hypotheses (readout/degeneracy/tempo-found) and revealed ESS=0.999 ->
+the filter was NEVER reweighting (per-frame-softmax bug, no accumulation). Cloned official AESMC
+(third_party/aesmc, tuananhle7) -> correct recursion: per-step weight=emission logp (bootstrap),
+ACCUMULATE across frames, adaptive resample on ESS<K/2, RESET after. Corrected SMC (pf_analyze2.py):
+  ESS/K 0.999->0.780 (12 resamples/song) -> filter now actually filters
+  F1 MAP-trajectory=0.475 >> circular-mean=0.319 -> H1 (readout matters) CONFIRMED once filter works
+  DEPLOY-by-inference (MAP)=0.475 BEATS free-run 0.40 (first real-VAE deployment off the ~0.40 wall!)
+  toward classic 0.66 (not there: weak emission vs trained activation, 800 steps, K=800, m fixed = knobs)
+Weighted-mean BPM still 91% off = multimodal-average artifact; the MAP PARTICLE carries the good traj.
+LESSON: "feeling good" was premature (filter silently broken, ESS=0.999); deep analysis + official code
++ verify-not-declare is what worked. Route #1 (trainable bar-pointer SSM-VAE deployed by SMC) VALIDATED.
