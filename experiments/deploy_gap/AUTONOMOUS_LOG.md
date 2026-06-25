@@ -283,3 +283,18 @@ free-run. => SS/free-run improve the posterior side but it can't reach deploymen
 audio-conditioned prior mean (Tier B). NEXT (evidence-backed): warm-start this healthy model (tcorr .93)
 + Tier B g_tau trained to DISTILL the accurate posterior tempo (STOP-GRAD on posterior) into the prior
 mean -> the one config that connects the accurate tempo to the deployment path. Not yet run.
+
+## [~18:40] ROUTE 2: FIVO (filtering variational objective, a REAL VAE) — floor, clean negative
+K=1 FIVO == ELBO verified; bound tightens with K (153->142->130 for K=4/8/16). Training:
+  fivo_k4 fr_lat .383 lat .000 dec0 | fivo_k8 .369 lat .039 dec0 | fivo_k16 .380 lat .057 dec0 |
+  fivo_ws_k8 (warm-start) fr_lat .371 lat .000 dec .537
+VERDICT: FIVO does NOT lift free-run deployment (all ~0.37 = floor). From-scratch FIVO collapses the
+decoder (dec0); warm-start keeps decoder but latent unused. The filtering objective improves TRAINING-time
+inference (tighter bound) but deployment is OPEN-LOOP free-run with NO observation to filter against, so it
+doesn't transfer. DEEP REASON (now very robust): at deployment the only signal is audio; the faithful
+generative model's latent dynamics are audio-blind, so NO inference method (FIVO, He-2019, SMC) can help the
+open-loop rollout. To exceed ~0.4 you must EITHER leave the VAE (discriminative frontend peak-pick = 0.64,
+not a VAE) OR leave faithfulness (audio-conditioned prior mean Tier B = ~0.40 and corrupts tempo / departs
+from the DBN). Within the faithful VAE/ELBO_for_DBN paradigm, free-run deployment is structurally capped ~0.4.
+Also non-VAE route-2 MVP (pf_deploy.py: BCE activation + particle filter) = 0.351 (my crude PF) vs raw
+peak-pick 0.642 -> a plain frontend beats our crude DBN; that route is the [NN+DBN] pipeline CHART replaces.
