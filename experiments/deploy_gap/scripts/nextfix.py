@@ -19,7 +19,63 @@ import torch.nn.functional as F
 from faithful.data import FPS, N_MELS, LogMel, build_train_loader, iter_val_songs
 from faithful.model import BarPointerVAE
 from faithful.distributions import (TWO_PI, gumbel_softmax, sample_von_mises,
-                                    kl_categorical, kl_von_mises, kl_log_normal)
+                                    kl_categorical, kl_von_mises, kl_log_normal, log_i0)
+
+
+# --- pointwise log-densities for FIVO importance weights ---
+def vm_logp(phi, mu, kappa):      # von Mises log-density at phi
+    return kappa * torch.cos(phi - mu) - math.log(TWO_PI) - log_i0(kappa)
+
+def logn_logp(x, mu, sig):        # Gaussian log-density (x = log-tempo, Gaussian in log-space)
+    return -0.5 * ((x - mu) / sig) ** 2 - torch.log(sig) - 0.5 * math.log(TWO_PI)
+
+def cat_logp(soft, logits):       # E_soft[log Cat] (soft assignment approx for the relaxed meter)
+    return (soft * F.log_softmax(logits, -1)).sum(-1)
+
+
+def fivo(model, h, b_enc, b_tgt, temp, K):
+    """FIVO / SMC-ELBO: K particles per sequence, resample every step by the per-step importance weight
+    w = p(b_t|z_t) p(z_t|z_{t-1}) / q(z_t|.). Objective = sum_t [logsumexp_K(log w) - log K] (a tighter
+    ELBO than one-step). Uses the LEARNED generative model (prior dynamics + decoder) and the encoder as
+    proposal -> a real VAE; the filter does sequential inference that should identify tempo (pure latent).
+    K=1 reduces exactly to the standard single-sample ELBO (known-answer test)."""
+    B, T, _ = h.shape
+    hK = h.repeat_interleave(K, 0); beK = b_enc.repeat_interleave(K, 0); btK = b_tgt.repeat_interleave(K, 0)
+    N = B * K
+    pc = model.encode_prior(hK); qc = model.encode_posterior(hK, beK)
+    logZ = h.new_zeros(B)
+    z0 = model.z0.unsqueeze(0).expand(N, -1)
+    qm, qpm, qpk, qtm, qts = model.unpack(model.post_head(torch.cat([qc[:, 0], z0], -1)))
+    pm, ppm, ppk, ptm, pts = model.unpack(model.prior_init_head(pc.mean(1)))
+    meter = gumbel_softmax(qm, temp); phi = sample_von_mises(qpm, qpk) % TWO_PI
+    lt = qtm + qts * torch.randn_like(qtm)
+    mp, pp, lp = meter, phi, lt
+    for t in range(T):
+        if t > 0:
+            qm, qpm, qpk, qtm, qts = model.unpack(model.post_head(
+                torch.cat([qc[:, t], model.z_features(mp, pp, lp)], -1)))
+            ppm = (pp + torch.exp(lp)) % TWO_PI
+            ppk = F.softplus(model.prior_phase_kappa(pc[:, t]).squeeze(-1)) + 0.01
+            ptm = lp; pts = F.softplus(model.prior_tempo_sigma(pc[:, t]).squeeze(-1)) + 1e-3
+            meter = gumbel_softmax(qm, temp); phi = sample_von_mises(qpm, qpk) % TWO_PI
+            lt = qtm + qts * torch.randn_like(qtm)
+            logpm = model.meter_prior_logp(mp, phi, pp, pc[:, t])
+        else:
+            logpm = F.log_softmax(pm, -1)
+        zf = model.z_features(meter, phi, lt)
+        dec_logit = model.decode(zf, pc[:, t])
+        logp_dec = -F.binary_cross_entropy_with_logits(dec_logit, btK[:, t], reduction="none")
+        logp_z = vm_logp(phi, ppm, ppk) + logn_logp(lt, ptm, pts) + cat_logp(meter, logpm)
+        logq_z = vm_logp(phi, qpm, qpk) + logn_logp(lt, qtm, qts) + cat_logp(meter, F.log_softmax(qm, -1))
+        lw = (logp_dec + logp_z - logq_z).view(B, K)               # per-step importance weight
+        logZ = logZ + torch.logsumexp(lw, 1) - math.log(K)
+        if K > 1:                                                  # resample (stop-grad indices)
+            w = F.softmax(lw, 1)
+            idx = torch.multinomial(w, K, replacement=True) + (torch.arange(B, device=h.device) * K).unsqueeze(1)
+            idx = idx.view(-1)
+            phi, lt, meter = phi[idx], lt[idx], meter[idx]
+        mp, pp, lp = meter, phi, lt
+    return -logZ.mean()                                            # negative FIVO bound (minimize)
 from faithful.evaluate import beats_from_barphase, beats_from_activation, f_measure
 from faithful.elbo import free_run
 
@@ -256,6 +312,9 @@ def main():
     ap.add_argument("--h_dropout", type=float, default=0.0, help="decoder audio-frame dropout (word-dropout) to force latent use")
     ap.add_argument("--init_from", default="", help="warm-start: load model (+gtau) state from this checkpoint before training")
     ap.add_argument("--distill_weight", type=float, default=0.0, help="stop-grad distillation: train g_tau to reproduce the (accurate) posterior tempo")
+    ap.add_argument("--fivo", action="store_true", help="train with the FIVO/SMC-ELBO objective (particle filter; K=1 == standard ELBO)")
+    ap.add_argument("--n_particles", type=int, default=8, help="FIVO particle count")
+    ap.add_argument("--selftest", action="store_true", help="run K=1 FIVO == ELBO known-answer test and exit")
     args = ap.parse_args()
     torch.manual_seed(42); dev = "cuda"
     keys = [k.strip() for k in args.datasets.split(",") if k.strip()]
@@ -282,7 +341,18 @@ def main():
     opt = torch.optim.AdamW(params, lr=args.lr)
     loader = build_train_loader(args.data_root, keys, args.frames, args.batch_size,
                                 examples_per_epoch=1000, num_workers=4, seed=42)
-    di = iter(loader); step = 0; t0 = time.time()
+    di = iter(loader)
+    if args.selftest:   # KNOWN-ANSWER: K=1 FIVO is a valid single-sample ELBO; K>1 is a TIGHTER bound (lower loss)
+        audio, beats, _ = next(di)
+        h = logmel(audio.to(dev))[:, :args.frames]; bt = beats[:, :args.frames].to(dev)
+        Tm = min(h.shape[1], bt.shape[1]); h, bt = h[:, :Tm], bt[:, :Tm]; b_tgt = widen_target(bt, args.widen)
+        torch.manual_seed(1); l_cf, _ = rollout(model, h, bt, b_tgt, 1.0, 0.0)        # closed-form-KL ELBO
+        torch.manual_seed(1); f1v = float(fivo(model, h, bt, b_tgt, 1.0, 1))           # FIVO K=1
+        torch.manual_seed(1); f8v = float(fivo(model, h, bt, b_tgt, 1.0, 8))           # FIVO K=8 (tighter)
+        print(f"[selftest] closed-form ELBO={float(l_cf):.1f}  FIVO(K=1)={f1v:.1f}  FIVO(K=8)={f8v:.1f}")
+        print(f"[selftest] K=1~ELBO ballpark: {abs(f1v-float(l_cf))/abs(float(l_cf))<0.3} | K=8 tighter (<K=1): {f8v<f1v}")
+        return
+    step = 0; t0 = time.time()
     while step < args.steps:
         try:
             audio, beats, _ = next(di)
@@ -296,11 +366,18 @@ def main():
         sw = args.survival_weight * min(1.0, step / (0.5 * args.steps))   # ramp over first half
         opt.zero_grad()
         ssp = args.ss_prob * min(1.0, step / (0.5 * args.steps))   # ramp scheduled-sampling prob
+        fr = 0.0
+        if args.fivo:                          # FIVO/SMC-ELBO objective (real VAE, filtering inference)
+            loss = fivo(model, h, bt, b_tgt, temp, args.n_particles)
+            info = {"recon": float(loss), "kl_m": 0.0, "kl_p": 0.0, "kl_t": 0.0, "os": 0.0, "surv": 0.0, "distill": 0.0}
+            loss.backward(); torch.nn.utils.clip_grad_norm_(params, 5.0); opt.step()
+            if step % 50 == 0 or step == 1:
+                print(f"[{args.cell}] s{step} FIVO={info['recon']:.1f} K={args.n_particles} {step/(time.time()-t0):.2f}it/s", flush=True)
+            continue
         loss, info = rollout(model, h, bt, b_tgt, temp, args.ou,
                              overshoot=args.overshoot, os_fn=args.os_free_nats, os_w=args.os_weight,
                              survival_w=sw, gtau=gtau, tierb_a=args.tierb_anchor,
                              ss_prob=ssp, h_dropout=args.h_dropout, distill_w=args.distill_weight)
-        fr = 0.0
         if args.freerun_weight > 0:
             frw = args.freerun_weight * min(1.0, step / (0.5 * args.steps))   # ramp over first half
             fr_loss = freerun_recon(model, h, b_tgt, temp, gtau=gtau, tierb_a=args.tierb_anchor)

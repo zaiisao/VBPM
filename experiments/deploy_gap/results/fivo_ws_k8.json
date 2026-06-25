@@ -1,0 +1,28 @@
+{
+ "cell": "fivo_ws_k8",
+ "widen": 6,
+ "ou": 0.0,
+ "latent_only": true,
+ "overshoot": 1,
+ "survival_weight": 0.0,
+ "tierb": false,
+ "tierb_anchor": 0.0,
+ "freerun_weight": 0.0,
+ "ss_prob": 0.0,
+ "h_dropout": 0.0,
+ "distill_weight": 0.0,
+ "final_train": {
+  "recon": -508.5364685058594,
+  "kl_m": 0.0,
+  "kl_p": 0.0,
+  "kl_t": 0.0,
+  "os": 0.0,
+  "surv": 0.0,
+  "distill": 0.0
+ },
+ "tf_post_dec": 0.5369856112709734,
+ "tf_post_lat": 0.0,
+ "fr_lat": 0.37053650328935767,
+ "tf_tempo_Acc1": 0.0,
+ "tf_tempo_corr": 0.1734585751981075
+}
