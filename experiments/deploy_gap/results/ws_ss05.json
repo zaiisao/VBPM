@@ -1,0 +1,26 @@
+{
+ "cell": "ws_ss05",
+ "widen": 6,
+ "ou": 0.05,
+ "latent_only": true,
+ "overshoot": 1,
+ "survival_weight": 0.0,
+ "tierb": false,
+ "tierb_anchor": 0.0,
+ "freerun_weight": 0.0,
+ "ss_prob": 0.5,
+ "h_dropout": 0.0,
+ "final_train": {
+  "recon": 67.1705322265625,
+  "kl_m": 0.024439331144094467,
+  "kl_p": 28.40671157836914,
+  "kl_t": 8.256845474243164,
+  "os": 0.0,
+  "surv": 0.0
+ },
+ "tf_post_dec": 0.9907557691617699,
+ "tf_post_lat": 0.5571668644564906,
+ "fr_lat": 0.3695310384579072,
+ "tf_tempo_Acc1": 0.0,
+ "tf_tempo_corr": 0.710629886611715
+}

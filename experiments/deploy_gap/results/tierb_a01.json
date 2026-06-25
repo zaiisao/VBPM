@@ -1,0 +1,23 @@
+{
+ "cell": "tierb_a01",
+ "widen": 6,
+ "ou": 0.0,
+ "latent_only": true,
+ "overshoot": 1,
+ "survival_weight": 0.0,
+ "tierb": true,
+ "tierb_anchor": 0.1,
+ "final_train": {
+  "recon": 21.881011962890625,
+  "kl_m": 0.014886448159813881,
+  "kl_p": 3.370347023010254,
+  "kl_t": 0.5988290309906006,
+  "os": 0.0,
+  "surv": 0.0
+ },
+ "tf_post_dec": 0.9982142857142857,
+ "tf_post_lat": 0.3369264627205759,
+ "fr_lat": 0.40585445259342484,
+ "tf_tempo_Acc1": 0.0,
+ "tf_tempo_corr": 0.04145436961974125
+}

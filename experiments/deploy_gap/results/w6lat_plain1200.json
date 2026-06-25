@@ -1,0 +1,20 @@
+{
+ "cell": "w6lat_plain1200",
+ "widen": 6,
+ "ou": 0.0,
+ "latent_only": true,
+ "overshoot": 1,
+ "survival_weight": 0.0,
+ "final_train": {
+  "recon": 7.5507659912109375,
+  "kl_m": 0.010215255431830883,
+  "kl_p": 3.2291479110717773,
+  "kl_t": 1.0959663391113281,
+  "os": 0.0,
+  "surv": 0.0
+ },
+ "tf_post_dec": 0.9986702127659575,
+ "tf_post_lat": 0.11187947728857722,
+ "fr_lat": 0.33717780556242927,
+ "tempo_Acc1": 0.0
+}

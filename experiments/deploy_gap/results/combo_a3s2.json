@@ -1,0 +1,23 @@
+{
+ "cell": "combo_a3s2",
+ "widen": 6,
+ "ou": 0.0,
+ "latent_only": true,
+ "overshoot": 1,
+ "survival_weight": 0.2,
+ "tierb": true,
+ "tierb_anchor": 0.3,
+ "final_train": {
+  "recon": 30.240097045898438,
+  "kl_m": 0.02370217815041542,
+  "kl_p": 13.817684173583984,
+  "kl_t": 0.3544478416442871,
+  "os": 0.0,
+  "surv": 14.570377349853516
+ },
+ "tf_post_dec": 0.9868958341677013,
+ "tf_post_lat": 0.642951145129845,
+ "fr_lat": 0.3630295980468523,
+ "tf_tempo_Acc1": 0.0,
+ "tf_tempo_corr": 0.0933292079175633
+}

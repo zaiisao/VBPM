@@ -1,0 +1,17 @@
+{
+ "cell": "w6lat_os4ou",
+ "widen": 6,
+ "ou": 0.05,
+ "latent_only": true,
+ "overshoot": 4,
+ "final_train": {
+  "recon": 72.55023956298828,
+  "kl_m": 0.07429686188697815,
+  "kl_p": 0.06308247148990631,
+  "kl_t": 28.02972984313965,
+  "os": 44.7157096862793
+ },
+ "tf_post_dec": 0.0,
+ "tf_post_lat": 0.0,
+ "fr_lat": 0.0
+}
