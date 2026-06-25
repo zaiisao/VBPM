@@ -298,3 +298,15 @@ not a VAE) OR leave faithfulness (audio-conditioned prior mean Tier B = ~0.40 an
 from the DBN). Within the faithful VAE/ELBO_for_DBN paradigm, free-run deployment is structurally capped ~0.4.
 Also non-VAE route-2 MVP (pf_deploy.py: BCE activation + particle filter) = 0.351 (my crude PF) vs raw
 peak-pick 0.642 -> a plain frontend beats our crude DBN; that route is the [NN+DBN] pipeline CHART replaces.
+
+## [~19:xx] SIMPLE TEMPO ESTIMATOR (autocorr, no learning) — validates deep-dive + sharpens it
+Classic onset-envelope autocorrelation tempo estimator (tempo_estimator.py):
+  estimator Acc2 (octave-tolerant)=0.75, Acc1(+-4%)=0.375  vs VAE prior_init tempo 0% octave / 852% err.
+  (2) metronome @ estimated tempo, BEST-of-8 phase = F1 0.663
+  (3) oulong VAE free-run, tempo FROZEN @ estimate = F1 0.401  (model 0.356, GT-frozen 0.510)
+CONFIRMS deep-dive: a TRIVIAL autocorr estimator gets tempo 75% octave-right; the VAE prior gets 0% ->
+the breakdown really is prior audio->tempo (mean-pooled periodicity). SHARPENS it: tempo alone in free-run
+=0.40 (phase becomes the limiter); metronome+phase-search=0.66. So the missing ingredient is INFERENCE
+(search over BOTH tempo AND phase, audio eliminates wrong ones = the DBN), not just an estimator. Free-run
+searches neither -> commits to one feed-forward guess each. Pure classic [tempo est + phase search]=0.66
+(no VAE). The VAE's value must come from elsewhere if a 10-line classic method already gets 0.66.
