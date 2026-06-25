@@ -1,0 +1,26 @@
+{
+ "cell": "ws_frec05",
+ "widen": 6,
+ "ou": 0.05,
+ "latent_only": true,
+ "overshoot": 1,
+ "survival_weight": 0.0,
+ "tierb": false,
+ "tierb_anchor": 0.0,
+ "freerun_weight": 0.5,
+ "ss_prob": 0.0,
+ "h_dropout": 0.0,
+ "final_train": {
+  "recon": 34.077659606933594,
+  "kl_m": 0.056318655610084534,
+  "kl_p": 38.72556686401367,
+  "kl_t": 45.599327087402344,
+  "os": 0.0,
+  "surv": 0.0
+ },
+ "tf_post_dec": 0.9925940044558876,
+ "tf_post_lat": 0.6101229592698098,
+ "fr_lat": 0.3316676569002853,
+ "tf_tempo_Acc1": 0.0,
+ "tf_tempo_corr": 0.9275189800693547
+}

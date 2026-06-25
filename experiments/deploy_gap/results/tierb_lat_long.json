@@ -1,0 +1,22 @@
+{
+ "cell": "tierb_lat_long",
+ "widen": 6,
+ "ou": 0.0,
+ "latent_only": true,
+ "overshoot": 1,
+ "survival_weight": 0.0,
+ "tierb": true,
+ "final_train": {
+  "recon": 7.749368667602539,
+  "kl_m": 0.008954161778092384,
+  "kl_p": 3.709132194519043,
+  "kl_t": 1.921166181564331,
+  "os": 0.0,
+  "surv": 0.0
+ },
+ "tf_post_dec": 1.0,
+ "tf_post_lat": 0.17717866246919994,
+ "fr_lat": 0.20003760127326833,
+ "tf_tempo_Acc1": 0.0,
+ "tf_tempo_corr": 0.7840065342760644
+}
