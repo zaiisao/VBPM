@@ -191,4 +191,4 @@ pyrightconfig.json
 .claude/
 
 # Pre-trained extractor checkpoints (downloadable from Zenodo)
-/wavebeat_epoch=*.ckpt
+/wavebeat_epoch=*.ckptthird_party/aesmc/
