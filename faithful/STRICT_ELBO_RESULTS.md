@@ -1,129 +1,114 @@
-# Strict-ELBO collapse experiment — results
+# Strict-ELBO collapse experiment — results (corrected von Mises sampler)
 
-**Date:** 2026-06-24 · **Branch:** `faithful/strict-elbo` · **Model:** `faithful/` (186K params)
+**Date:** 2026-06-26 (re-run) · **Branch:** `faithful/strict-elbo` · **Model:** `faithful/` (186K params)
 **Setup:** strict ELBO (β=1, no bandages), end-to-end from random weights on a fixed log-mel
-front-end, 4 datasets (ballroom/beatles/hains/rwc_popular), frames=256, batch=16, lr=1e-3.
-Run stopped at step ~800/1600 (the eval curve had been dead-flat for 600 steps; nothing left to learn).
+front-end, 4 datasets (ballroom/beatles/hains/rwc_popular), frames=256, batch=16, lr=1e-3, 800 steps,
+46 held-out val songs. Free-run F-measure @70 ms (`mir_eval`); read-outs are the official
+bar-pointer ones (beats = m subdivisions of φ; downbeats = 2π wraps).
 
-> Provenance note: the multi-agent analysis workflow produced the figure and the
-> characterization, but one adversarial confound agent got stuck re-launching a full
-> learning-rate sweep, so this synthesis was written by hand from the metrics + the two
-> controls + the faithfulness audit. Where a confound check did not finish, it is marked
-> **partial** below rather than overstated.
+---
 
-Figure: [`faithful/collapse.png`](collapse.png) — KL trajectories (top) and eval F (bottom).
+## 0. CORRECTION — the von Mises sampler was buggy in the earlier version of this doc
+
+The previous numbers in this file (beat-F ≈ 0.33, phase-wrap ≈ 0.42) were produced with a **broken
+von Mises sampler**. `best_fisher_rejection` in `faithful/distributions.py` used a wrong acceptance
+test, so the sampled phase had an essentially **constant concentration (E[cos] ≈ 0.8) regardless of
+κ** instead of the correct `A(κ)=I1(κ)/I0(κ)`. The earlier audit only checked the sample *mean*
+direction (which was fine), never the spread, so it slipped through.
+
+The sampler is now **fixed and verified exact against `scipy.stats.vonmises`** across κ=0.2…20
+(E[cos] matches A(κ) to <0.01). The numbers below are the **re-run with the corrected sampler**.
+**The collapse conclusion is unchanged** — it was always objective/identifiability-driven, not a
+sampler artifact — but the specific read-out values are now trustworthy (and, if anything, *cleaner*:
+the strict-model latent read-out is ≈0.01, far below the metronome floor, rather than the spurious
+0.33–0.42 the broken sampler produced). The main checkpoint of the broken run is superseded.
 
 ---
 
 ## 1. Headline
 
 The strict ELBO, trained from random init, **posterior-collapses** — every latent's KL decays
-toward ~0 while reconstruction flatlines — **and** the faithful per-frame BCE on sparse beats
-yields a **dead decoder** (`decoder_F = 0.000`). Both outcomes are exactly what the thesis
-predicted, and both controls behave as theory requires. This is a clean, honest negative result.
+toward ~0 while reconstruction plateaus — **and** the faithful per-frame BCE on sparse beats yields
+a **dead decoder** (`decoder_F = 0.000`). With the correct sampler the latent read-outs sit **below a
+120-BPM metronome**. This is the clean, honest negative result.
 
-## 2. Posterior collapse (main run)
+## 2. Posterior collapse (main run, decoder reads h)
 
-| latent KL | step 1 | step 800 | ratio |
+| term | step 1 | step 800 | ratio |
 |---|---:|---:|---:|
-| meter (Categorical) | 2.69 | **0.004** | ÷670 |
-| phase (von Mises) | 42.0 | **0.016** | ÷2600 |
-| tempo (Log-Normal) | 368.3 | **1.53** | ÷240 |
-| reconstruction (BCE) | 160.0 | 22.7 (flat from ~step 100) | — |
+| meter KL (Categorical) | 3.06 | **0.010** | ÷306 |
+| phase KL (von Mises) | 50.80 | **0.044** | ÷1155 |
+| tempo KL (Log-Normal) | 355.72 | **1.609** | ÷221 |
+| reconstruction (BCE) | 159.7 | 21.9 (flat from ~step 100) | — |
 
-The latents go dead within ~100 steps; recon drops then plateaus (the decoder reaches its
-sparse-BCE floor and stops improving). Eval is **flat across all checkpoints**:
+Eval is **flat across all checkpoints** (free-run F-measure):
 
-| eval step | phase_wrap_F | decoder_F | metronome_F |
-|---:|---:|---:|---:|
-| 200 | 0.423 | **0.000** | 0.280 |
-| 400 | 0.415 | **0.000** | 0.280 |
-| 600 | 0.411 | **0.000** | 0.280 |
+| eval step | beat-phase | downbeat-phase | decoder | metronome |
+|---:|---:|---:|---:|---:|
+| 200 | 0.011 | 0.122 | 0.000 | 0.273 |
+| 400 | 0.012 | 0.128 | 0.000 | 0.273 |
+| 600 | 0.012 | 0.127 | 0.000 | 0.273 |
+| 800 | **0.011** | **0.125** | **0.000** | 0.273 |
+
+The latent read-outs (beat 0.011, downbeat 0.125) are **below the metronome (0.273)**: the collapsed
+tempo never finds a musical scale, so the free-running pointer lays down no usable beat grid.
 
 ## 3. Two phenomena, two mechanisms
 
-**(a) `decoder_F = 0` — sparse-positive BCE, not (only) collapse.** Beats are ~1.5 % of frames.
-Faithful BCE with **no `pos_weight` and no shift-tolerance** is minimised by predicting ≈0
-everywhere → the decoder output never peaks above threshold → zero recovered beats. This is the
-concrete cost of dropping Beat This's peak-pickability loss, demonstrated end-to-end. (Confirmed
-by the latent-only control, §4b.)
+**(a) `decoder_F = 0` — sparse-positive BCE.** Beats are ~1.5% of frames. Faithful BCE with no
+`pos_weight` and no shift-tolerance is minimized by predicting ≈0 everywhere → the decoder output
+never peaks above threshold → zero recovered beats. (Confirmed by the latent-only control, §4.)
 
-**(b) phase_wrap_F ≈ 0.42 is a static grid, not learning.** The read-out ordering is
-`phase_wrap (0.42) > metronome (0.28) > decoder (0.00)`. The only thing beating the metronome is
-the prior's **deterministic constant-tempo sawtooth** seeded at init — and KL_phase ≈ 0.016 means
-the phase latent encodes ~nothing per song. The 0.42 is flat (even slightly **decreasing**:
-0.423 → 0.411), consistent with a fixed grid rather than learned per-song structure.
+**(b) The latent itself is dead (KL ≈ 0).** The bar-pointer dynamics encode ~nothing per song; the
+beat read-out is not a learned per-song grid (it is below even a fixed metronome).
 
-## 4. Controls (each behaves exactly as theory predicts)
+## 4. Latent-only control (corrected sampler) — collapse is deeper than the h-shortcut
 
-### (a) Free-bits control — collapse is the OBJECTIVE, not a bug
-Same model + lr, with a per-step KL floor (meter 0.2 / phase 0.2 / tempo 0.1).
-
-- KL pinned **exactly at floor×T**: meter 32.0, phase 32.0, tempo 16.1 (=0.2·160, 0.2·160, 0.1·160).
-- Eval barely moves: phase_wrap 0.42 (unchanged), decoder_F 0.000 → 0.027.
-
-**Reading:** the standard anti-collapse knob responds *mechanically as designed* (KL can no longer
-go to 0), which rules out a broken-KL bug — yet the latent **parks at the floor and carries no
-useful information** (read-outs don't improve). This is the textbook *rate-without-relevance*
-critique of free-bits, and it matches the project's earlier `kl_tempo ≈ floor` finding. So the
-collapse is a property of the **strict objective on this data**, not a coding error.
-
-### (b) Latent-only control — collapse is deeper than the h-shortcut
 Same strict ELBO with `h` removed from the decoder.
 
-- KL still collapses: meter 0.010, phase 0.050, tempo 2.46 (latents still ~dead).
-- But `decoder_F` jumps **0.000 → 0.25** (phase_wrap 0.367 → 0.391).
+| term | step 1 | step 800 |
+|---|---:|---:|
+| meter / phase / tempo KL | 2.58 / 50.24 / 399.9 | **0.004 / 0.038 / 2.78** |
 
-**Reading:** removing the shortcut does **not** revive the latent KL (so the latent collapse is
-not caused by the decoder shortcut alone — it's optimization/identifiability-driven). But denied
-`h`, the decoder is **forced to express beats through the deterministic phase grid**, so it finally
-emits beats. This pins `decoder_F = 0` in the faithful run on the **h-shortcut × sparse-BCE**
-interaction, distinct from the latent collapse.
+| eval step | beat-phase | downbeat | decoder | metronome |
+|---:|---:|---:|---:|---:|
+| 200 | 0.355 | 0.123 | 0.257 | 0.273 |
+| 800 | **0.352** | 0.119 | **0.170** | 0.273 |
+
+**Reading:** removing the shortcut does **not** revive the latent KL (still ~0 — so the latent
+collapse is optimization/identifiability-driven, not caused by the decoder shortcut). But denied `h`,
+the decoder is **forced to express beats through the deterministic phase grid**, so it finally emits
+beats (`decoder_F` 0.000 → 0.170) and the beat-phase read-out rises (0.011 → 0.352, now ≈ metronome).
+This pins `decoder_F = 0` in the faithful run on the **h-shortcut × sparse-BCE** interaction, distinct
+from the latent collapse.
 
 ## 5. Confounds
 
 | alternative explanation | verdict | basis |
 |---|---|---|
-| It's a learning-rate artifact (divergence/underfit) | **refuted** | loss fell monotonically 573→24, no divergence/NaN; the free-bits control at the *same* lr keeps KL up → lr isn't what kills KL |
-| It's a code/gradient bug | **refuted** | faithfulness audit: all param groups get non-zero gradients, loss==recon+KL exactly; free-bits floor responds correctly → KL machinery intact |
-| `decoder_F=0` is just a 0.5-threshold artifact | **strongly supported, partial** | latent-only control proves a properly-incentivised decoder *does* emit beats (0.25); the h-decoder chose flat. (Full multi-threshold sweep did not finish.) |
-| phase_wrap 0.42 means the latent learned | **refuted** | flat/slightly-decreasing across checkpoints + KL_phase≈0.016 ⇒ static grid, not per-song. (Per-song true-vs-pred BPM correlation check did not finish.) |
+| It's the von Mises sampler bug | **refuted** | re-run with the corrected, scipy-verified sampler reproduces the same collapse |
+| It's a learning-rate artifact | **refuted** | loss falls monotonically (≈570 → 22), no divergence/NaN |
+| It's a code/gradient bug | **refuted** | faithfulness audit: all param groups get non-zero gradients; loss == recon + KL exactly |
+| `decoder_F=0` is a threshold artifact | **supported** | the latent-only control proves a properly-incentivised decoder *does* emit beats (0.170); the h-decoder chose flat |
+| the latent learned a useful grid | **refuted** | beat-phase 0.011 < metronome 0.273 and KL_phase ≈ 0.044 ⇒ no per-song structure |
 
 ## 6. Conclusion
 
 The faithful strict-ELBO bar-pointer VAE, trained end-to-end from random weights with no frozen
-frontend, reproduces **both** predicted failures: (1) **posterior collapse** intrinsic to the
-strict objective (free-bits floors the KL but buys no useful rate; collapse persists even without
-the decoder shortcut → it is optimization/identifiability-driven, not a bug and not the shortcut);
-and (2) an **unusable decoder** from faithful BCE on sparse beats (no `pos_weight`, no
-shift-tolerance) — the concrete price of discarding Beat This's peak-pickability loss. The only
-beats that beat the metronome come from the prior's static constant-tempo grid, not the latent.
+frontend and the **corrected** von Mises sampler, reproduces **both** predicted failures:
+(1) **posterior collapse** intrinsic to the strict objective (KL of all three latents → ~0; the
+latent read-outs fall below a fixed metronome); and (2) an **unusable decoder** from faithful BCE on
+sparse beats (no `pos_weight`, no shift-tolerance) — revived only when `h` is removed, isolating the
+cause to the h-shortcut × sparse-BCE interaction. The collapse is a property of the **objective and
+the data**, demonstrated without any frozen discriminative frontend to blame, and now on numbers free
+of the sampler bug.
 
-This is the scientifically clean baseline the project needed: the collapse is a property of the
-**objective and the data**, demonstrated without any frozen discriminative frontend to blame.
+**Artifacts:** `runs/strict_elbo_fixed/{final,best}.pt`, `runs/control_latentonly_fixed/`;
+metrics `runs/strict_elbo_fixed/metrics.jsonl`. Candidate remedies (for review) are listed in
+`notebooks/CANDIDATE_DEVIATIONS.md`; the clean, self-contained reference implementation (corrected
+sampler, trained on ballroom) is `notebooks/ELBO_for_DBN.ipynb`.
 
-**Artifacts:** checkpoints `runs/strict_elbo/{best,final}.pt`; controls `runs/control_freebits/`,
-`runs/control_latentonly/`; figure `faithful/collapse.png`.
-
----
-
-## 7. CORRECTION — measured with the paper's official bar-pointer read-out (§5.2)
-
-The paper defines φ as the **BAR** phase: one 2π cycle = one bar, a 2π wrap is a **downbeat**, and
-**beats are the m subdivisions φ = 2πk/m** (m = meter). Beats are read geometrically (official
-inference), not off φ-wraps. The earlier numbers in this doc used a beat-phase read-out (φ-wrap =
-beat), which conflated the two. Re-measured correctly (`faithful/evaluate.py:beats_from_barphase`,
-read-out self-tested to beat-F≈0.98 on synthetic ground truth):
-
-| official read-out | strict | latent-only |
-|---|---|---|
-| downbeat-F (φ wraps) | 0.125 | 0.125 |
-| beat-F, **oracle meter** (true m) | 0.329 | 0.362 |
-| beat-F, best m∈{2,3,4} | 0.369 | 0.391 |
-| tempo Acc1/Acc2 (BPM = 60·fps·m·φ̇/2π) | 0.00/0.00 | 0.00/0.00 |
-
-**Decisive:** even given the *true* meter, beat-F is only ~0.33 — so the failure is the **bar-phase
-itself** (a static init-tempo grid, not per-song) and the **diverging tempo**, NOT merely an
-ungrounded meter. The earlier "~0.38 beat-F" was the best-fit generic grid (the `best m` column);
-read the paper's way it is downbeat-F = 0.125. Conclusion unchanged: tempo, meter, and bar position
-do not work in the faithful (collapsed) model — now confirmed under the correct read-out.
+> **Not re-run:** the earlier *free-bits* control was not repeated with the corrected sampler (the
+> faithful `train.py` intentionally has no free-bits flag). Its qualitative conclusion — free-bits
+> floors the KL at the rate target without buying useful read-out (rate-without-relevance) — is a
+> general result and is left as previously characterized, flagged here rather than re-measured.

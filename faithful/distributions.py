@@ -74,9 +74,15 @@ def best_fisher_rejection(kappa: torch.Tensor, max_iter: int = 100) -> torch.Ten
         u1 = torch.rand_like(k)
         u2 = torch.rand_like(k)
         u3 = torch.rand_like(k)
-        c = torch.cos(math.pi * u1)                  # line 6
-        f = (1.0 + r * c) / (r + c)                  # line 7
-        accept = (k * (r - f) + torch.log(f) - torch.log(r)) >= torch.log(u2)   # line 9
+        w = torch.cos(math.pi * u1)                  # line 6
+        f = (1.0 + r * w) / (r + w)                  # line 7
+        # Best-Fisher acceptance (Best & Fisher 1979) with c = kappa*(r - f). The earlier test
+        #   k*(r - f) + log(f) - log(r) >= log(u2)   was WRONG: accepted samples IGNORED kappa
+        # (empirical resultant length R ~ 0.8 for EVERY kappa; correct is R = A(kappa) = I1/I0,
+        # verified against scipy.stats.vonmises). Canonical form (line 9):
+        c = k * (r - f)
+        accept = (c * (2.0 - c) - u2 > 0) | (
+            torch.log(c.clamp(min=1e-30)) - torch.log(u2.clamp(min=1e-30)) + 1.0 - c >= 0)
         sign = torch.where(u3 > 0.5, 1.0, -1.0)      # lines 11-15
         angle = sign * torch.acos(torch.clamp(f, -1.0, 1.0))
         newly = accept & (~accepted)

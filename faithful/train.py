@@ -125,16 +125,16 @@ def main():
         if step % args.eval_every == 0 or step == args.steps:
             summary, _ = evaluate(model, logmel, val_songs, device, fps=FPS,
                                   max_frames=args.max_eval_frames)
-            print(f"  [eval @ {step}] phase_wrap_F={summary['phase_wrap']:.3f} "
-                  f"decoder_F={summary['decoder']:.3f} metronome_F={summary['metronome']:.3f} "
-                  f"(n={summary['n_songs']})", flush=True)
+            print(f"  [eval @ {step}] beat_phase_F={summary['beat_phase']:.3f} "
+                  f"downbeat_F={summary['downbeat_phase']:.3f} decoder_F={summary['decoder']:.3f} "
+                  f"metronome_F={summary['metronome']:.3f} (n={summary['n_songs']})", flush=True)
             mf.write(json.dumps({"step": step, "phase": "eval", **summary}) + "\n"); mf.flush()
             torch.save({"model": model.state_dict(), "args": vars(args), "step": step},
                        out / "final.pt")
-            if summary["phase_wrap"] == summary["phase_wrap"] and summary["phase_wrap"] > best_pw:
-                best_pw = summary["phase_wrap"]
+            if summary["beat_phase"] == summary["beat_phase"] and summary["beat_phase"] > best_pw:
+                best_pw = summary["beat_phase"]
                 torch.save({"model": model.state_dict(), "args": vars(args), "step": step,
-                            "phase_wrap_F": best_pw}, out / "best.pt")
+                            "beat_phase_F": best_pw}, out / "best.pt")
 
     mf.close()
     print(f"DONE. best phase_wrap_F={best_pw:.3f} | metrics -> {metrics_path}", flush=True)
