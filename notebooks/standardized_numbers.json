@@ -1,0 +1,23 @@
+{
+  "easy": {
+    "pf_F": 0.943,
+    "pf_AMLt": 0.943,
+    "freerun_F": 0.197,
+    "n": 118
+  },
+  "smc": {
+    "pf_F": 0.572,
+    "pf_AMLt": 0.564,
+    "freerun_F": 0.17,
+    "n": 217
+  },
+  "oracle_smc": {
+    "pf_F": 0.995
+  },
+  "sota_smc": {
+    "beat_this_noDBN": 0.626,
+    "beat_this_DBN": 0.575,
+    "madmom": 0.57,
+    "madmom_tcn": 0.587
+  }
+}

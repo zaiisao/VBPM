@@ -6,6 +6,14 @@
 **References:** `notebooks/build_elbo_notebook.py` (the verified reference) and `faithful/README.md` (the faithfulness contract).
 **Note on the paper:** the original `ELBO_for_DBN.pdf` is **not on disk**. Closed-form formulas were verified against (a) the reference notebook line-by-line, (b) standard textbook expressions, and (c) numerical properties (q==p ⇒ KL=0). Items that can only be settled by the PDF are flagged UNCERTAIN in §5.
 
+> **CORRECTION (2026-06-26):** this audit's verdict on the von Mises sampler was **wrong**.
+> `best_fisher_rejection` had an incorrect acceptance test, so sampled phase had a near-constant
+> concentration (E[cos] ≈ 0.8) for *every* κ instead of the correct `A(κ)`. Empirical test #2 below
+> only checked the sample **mean direction** (correct) and **never the spread**, so the bug was
+> missed. The sampler has since been fixed and verified exact against `scipy.stats.vonmises`
+> (κ=0.2…20). See `STRICT_ELBO_RESULTS.md` §0 for details and the corrected re-run. The other audit
+> findings (closed-form KLs, ELBO assembly, gradient flow, bandage absence) stand.
+
 ---
 
 ## 1. Overall verdict
