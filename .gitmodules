@@ -1,9 +1,0 @@
-[submodule "third_party/vae-lagging-encoder"]
-	path = third_party/vae-lagging-encoder
-	url = https://github.com/jxhe/vae-lagging-encoder
-[submodule "third_party/kvae"]
-	path = third_party/kvae
-	url = https://github.com/simonkamronn/kvae
-[submodule "third_party/kalman-vae"]
-	path = third_party/kalman-vae
-	url = https://github.com/nkiyohara/kalman-vae
