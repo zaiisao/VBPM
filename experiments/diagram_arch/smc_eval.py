@@ -1,120 +1,76 @@
-"""SMC-MIREX evaluation of the trained diagram models (hard cross-dataset generalization test).
-
-  A (pretrained-frozen Beat-This + VAE): eval on cached SMC Beat-This features.
-     CAVEAT: those features are 50 fps; the VAE was trained at 86 fps -> an fps/domain shift.
-  B (from-scratch TCN + VAE): eval on SMC raw audio -> log-mel at 86 fps -> TCN -> VAE.
-     CLEAN: same log-mel pipeline as training; only the audio differs (true generalization).
-
-SMC-MIREX is beats-only (no downbeats). Reports beat-F and AMLt (octave/level-tolerant).
-ref: Beat-This no-DBN 0.626 | Beat-This+DBN 0.575 | madmom 0.570  (all beat-F on SMC-MIREX).
+"""OOD eval on SMC MIREX (beats-only, hard; Beat-This published F=0.62). Train the bar+beat sawtooth
+model on bt_train_rich (86fps), then deploy the POSTERIOR phi geometric read-out on SMC held-out
+features. SMC cache is native 50fps -> resample features to 86fps to match training. GT beats from
+SMC_MIREX_Annotations by tid. Reports mean beat F + leak (shuffle) to confirm audio-locked OOD.
 """
-import sys, glob, os, math, argparse, importlib.util
-import numpy as np
-import torch, torchaudio
-import mir_eval
-
-sys.path.insert(0, "/home/sogang/jaehoon/CHART")
-def _load(name, path):
-    s = importlib.util.spec_from_file_location(name, path); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
-da = _load("da", "/home/sogang/jaehoon/CHART/experiments/diagram_arch/run.py")
-e2e = _load("e2e_mod", "/home/sogang/jaehoon/CHART/experiments/diagram_arch/e2e.py")
-from faithful.data import LogMel, N_MELS
-DEV = da.DEV
-
-ANN = "/home/sogang/jaehoon/Analyze-SMC/smc_metadata/annotations"
-SMC_FEAT = "/home/sogang/jaehoon/CHART/cache/acts/smc_rich_heldout"
-SMC_AUDIO = "/home/sogang/jaehoon/Analyze-SMC/SMC_MIREX/SMC_MIREX_Audio"
-SR = 22050
+import sys, math, glob, importlib.util, random, argparse
+import numpy as np, torch, torch.nn.functional as F
+ROOT="/home/sogang/jaehoon/CHART"; sys.path.insert(0,ROOT)
+s2=importlib.util.spec_from_file_location("sa2",f"{ROOT}/experiments/diagram_arch/sawtooth_aux2.py")
+sa2=importlib.util.module_from_spec(s2); s2.loader.exec_module(sa2)
+da=sa2.da; BPVAE=da.BPVAE; rollout=da.rollout; load_pool=da.load_pool; sample_batch=da.sample_batch
+phase_beats=da.phase_beats; fmeas=da.fmeas
+DEV=da.DEV; FPS=86.1328125; SMC_FPS=50.0; M=4; TWO_PI=2*math.pi
+ANNOT="/home/sogang/jaehoon/Analyze-SMC/SMC_MIREX/SMC_MIREX_Annotations"
 
 
-def gt_beats(num):
-    g = glob.glob(f"{ANN}/SMC_{num}_*.txt")
-    if not g: return None
-    a = np.loadtxt(g[0]); a = a[:, 0] if (a.ndim > 1) else a
-    a = np.sort(np.atleast_1d(a)[np.isfinite(np.atleast_1d(a))])
-    return a if len(a) >= 2 else None
+def gt_beats(tid):
+    num=tid.split("_")[1]
+    fs=glob.glob(f"{ANNOT}/SMC_{num}_*.txt")
+    if not fs: return None
+    return np.loadtxt(fs[0]).reshape(-1)
 
 
-def peaks_fps(prob, fps, thr=0.5, min_dist=0.10):
-    p = np.asarray(prob); md = int(min_dist * fps)
-    cand = [t for t in range(1, len(p) - 1) if p[t] >= thr and p[t] >= p[t - 1] and p[t] >= p[t + 1]]
-    out, last = [], -10 ** 9
-    for t in cand:
-        if t - last >= md: out.append(t); last = t
-    return np.array(out, float) / fps
-
-
-def amlt(ref, est):
-    if len(ref) < 2 or len(est) < 2: return 0.0
-    try: return float(mir_eval.beat.continuity(ref, est)[3])
-    except Exception: return 0.0
+def resample_feat(feat):                     # [T,512] @50fps -> [T',512] @86fps (linear interp on time)
+    T=feat.shape[0]; Tn=int(round(T*FPS/SMC_FPS))
+    x=feat.t().unsqueeze(0).float()          # [1,512,T]
+    y=F.interpolate(x,size=Tn,mode="linear",align_corners=False)
+    return y[0].t().contiguous()             # [Tn,512]
 
 
 @torch.no_grad()
-def eval_A(ckpt, n):
-    d = torch.load(ckpt, map_location=DEV)
-    vae = da.BPVAE(h_dim=d["h_dim"], hidden=64).to(DEV); vae.load_state_dict(d["vae"]); vae.eval()
-    Fb, Fp, A = [], [], []
-    for f in sorted(glob.glob(f"{SMC_FEAT}/*.pt"))[:n]:
-        dd = torch.load(f, map_location="cpu"); num = dd["tid"].split("_")[1]
-        ref = gt_beats(num)
-        if ref is None: continue
-        h = dd["feat"].float().unsqueeze(0).to(DEV); T = h.shape[1]
-        z0 = torch.zeros(1, T, device=DEV)
-        _, pm, logits = da.rollout(vae, h, z0, z0, sample=False, compute_kl=False)
-        prob = torch.sigmoid(logits)[0].cpu().numpy(); pmn = pm[0].cpu().numpy()
-        est = peaks_fps(prob[:, 0], 50.0)
-        phe = da.phase_beats(pmn, 4)              # phase_beats divides by da.FPS(86) -> approx; report as secondary
-        Fb.append(da.fmeas(ref, est)); Fp.append(da.fmeas(ref, phe)); A.append(amlt(ref, est))
-    m = lambda x: float(np.nanmean(x)) if x else float("nan")
-    return m(Fb), m(Fp), m(A), len(Fb)
-
-
-@torch.no_grad()
-def eval_B(ckpt, n, max_frames=3600):
-    d = torch.load(ckpt, map_location=DEV)
-    tcn = e2e.TCNFrontend(N_MELS, d["ch"]).to(DEV); tcn.load_state_dict(d["tcn"]); tcn.eval()
-    vae = da.BPVAE(h_dim=d["ch"], hidden=64).to(DEV); vae.load_state_dict(d["vae"]); vae.eval()
-    lm = LogMel().to(DEV); fps = SR / 256.0
-    Fb, Fp, A = [], [], []
-    for wav in sorted(glob.glob(f"{SMC_AUDIO}/*.wav"))[:n]:
-        num = os.path.basename(wav).split("_")[1].split(".")[0]
-        ref = gt_beats(num)
-        if ref is None: continue
-        wave, sr = torchaudio.load(wav); wave = wave.mean(0)
-        if sr != SR: wave = torchaudio.functional.resample(wave, sr, SR)
-        logmel = lm(wave.unsqueeze(0).to(DEV)); T = min(logmel.shape[1], max_frames)
-        h = tcn(logmel[:, :T]); z0 = torch.zeros(1, T, device=DEV)
-        _, pm, logits = da.rollout(vae, h, z0, z0, sample=False, compute_kl=False)
-        prob = torch.sigmoid(logits)[0].cpu().numpy(); pmn = pm[0].cpu().numpy()
-        est = peaks_fps(prob[:, 0], fps)
-        phe = peaks_fps(((4 * np.asarray(pmn)) % (2 * math.pi)), fps)  # not exact; decoder read-out is primary
-        Fb.append(da.fmeas(ref, est)); Fp.append(da.fmeas(ref, da.phase_beats(pmn, 4))); A.append(amlt(ref, est))
-    m = lambda x: float(np.nanmean(x)) if x else float("nan")
-    return m(Fb), m(Fp), m(A), len(Fb)
+def eval_smc(model, files, shuffle=False, frames=2600):
+    model.eval(); Fs=[]; n=len(files)
+    feats=[resample_feat(torch.load(f,map_location="cpu")["feat"]) for f in files]
+    tids=[torch.load(f,map_location="cpu")["tid"] for f in files]
+    for i,f in enumerate(files):
+        ref=gt_beats(tids[i])
+        if ref is None or len(ref)<2: continue
+        feat=feats[(i+1)%n] if shuffle else feats[i]
+        T=min(feat.shape[0],frames)
+        h_in=feat[:T].unsqueeze(0).to(DEV); z=torch.zeros(1,T,device=DEV)
+        _,phase_mu,_=rollout(model,h_in,z,z,sample=False,compute_kl=False)
+        phi=phase_mu[0].cpu().numpy()
+        est=phase_beats(phi,M)               # beat times in seconds (uses run.py FPS=86.13)
+        Fs.append(fmeas(ref,est))
+    model.train(); return float(np.nanmean(Fs)), len(Fs)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt_A", default="checkpoints/diagram_A.pt")
-    ap.add_argument("--ckpt_B", default="checkpoints/diagram_B.pt")
-    ap.add_argument("--n", type=int, default=217)
-    a = ap.parse_args()
-    print("==== SMC-MIREX EVAL (beats-only; ref: Beat-This noDBN 0.626 / +DBN 0.575 / madmom 0.570) ====", flush=True)
-    if os.path.exists(a.ckpt_A):
-        fb, fp, am, n = eval_A(a.ckpt_A, a.n)
-        print(f"A  pretrained-frozen Beat-This+VAE (50fps cached feats; FPS-SHIFT CAVEAT), n={n}:", flush=True)
-        print(f"     beat-F(decoder)={fb:.3f}  AMLt={am:.3f}  | phase-readout(approx)={fp:.3f}", flush=True)
-    else:
-        print(f"A  ckpt missing: {a.ckpt_A}", flush=True)
-    if os.path.exists(a.ckpt_B):
-        fb, fp, am, n = eval_B(a.ckpt_B, a.n)
-        print(f"B  from-scratch TCN+VAE (SMC audio->log-mel 86fps; CLEAN cross-dataset), n={n}:", flush=True)
-        print(f"     beat-F(decoder)={fb:.3f}  AMLt={am:.3f}  | phase-readout={fp:.3f}", flush=True)
-    else:
-        print(f"B  ckpt missing: {a.ckpt_B}", flush=True)
-    print("SMC_EVAL_DONE", flush=True)
+    ap=argparse.ArgumentParser(); ap.add_argument("--steps",type=int,default=1000)
+    ap.add_argument("--lam_bar",type=float,default=0.5); ap.add_argument("--lam_beat",type=float,default=0.5)
+    ap.add_argument("--max_smc",type=int,default=999)
+    a=ap.parse_args()
+    torch.manual_seed(0); np.random.seed(0); random.seed(0)
+    train=load_pool("cache/acts/bt_train_rich",400,seed=1)
+    print(f"SMC OOD eval | training bar+beat (lam_bar={a.lam_bar} lam_beat={a.lam_beat}) on {len(train)} songs @86fps\n",flush=True)
+    model=BPVAE(h_dim=512,hidden=64).to(DEV); opt=torch.optim.Adam(model.parameters(),lr=1e-3)
+    for step in range(1,a.steps+1):
+        temp=1.0+(0.3-1.0)*min(step/a.steps,1.0)
+        h,b,db=sample_batch(train,256,16)
+        loss,info=sa2.elbo_aux2(model,h,b,db,temp,a.lam_bar,a.lam_beat)
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),5.0); opt.step()
+        if step%250==0: print(f"  step {step} recon {info['recon']:.0f} Lbar {info['Lbar']:.3f} Lbeat {info['Lbeat']:.3f}",flush=True)
+    torch.save({"vae":model.state_dict(),"h_dim":512},"experiments/diagram_arch/smc_model.pt")
+    files=sorted(glob.glob("cache/acts/smc_rich_heldout/*.pt"))[:a.max_smc]
+    print(f"\nevaluating on {len(files)} SMC files (resampled 50->86fps)...",flush=True)
+    Freal,nr=eval_smc(model,files,shuffle=False)
+    Fshuf,_=eval_smc(model,files,shuffle=True)
+    print(f"\n==== SMC MIREX (OOD, beats-only) ====")
+    print(f"  ours (posterior phi geom read-out): F = {Freal:.3f}  over {nr} songs")
+    print(f"  leak (shuffled audio)             : F = {Fshuf:.3f}  (must be << real => audio-locked)")
+    print(f"  reference: Beat-This published SMC F = 0.62 ; madmom DBN ~0.52")
+    print("DONE")
 
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
