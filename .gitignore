@@ -191,4 +191,11 @@ pyrightconfig.json
 .claude/
 
 # Pre-trained extractor checkpoints (downloadable from Zenodo)
-/wavebeat_epoch=*.ckptthird_party/aesmc/
+/wavebeat_epoch=*.ckpt
+
+# Model checkpoints (regenerable; do NOT push)
+*.pt
+
+# Vendored reference clones with their own .git (kept local, not committed as embedded repos)
+/third_party/aesmc/
+/third_party/joint_bd/

@@ -245,11 +245,13 @@ class BarPointerDBN(nn.Module):
         from audio features, and the DBN structure does the rest."""
         return class_logp[:, self.obs_ptr]
 
-    def forward_backward(self, obs_logp: Tensor) -> Tensor:
+    def forward_backward(self, obs_logp: Tensor, elp: Tensor | None = None) -> Tensor:
         """Differentiable forward-backward. obs_logp [T,S] -> per-frame per-CLASS log
         posterior marginal [T, C]. The structured posterior given the fixed DBN prior;
-        train the emission through this so q(z|x) refines p_DBN(z)."""
-        elp = self._edge_logp()
+        train the emission through this so q(z|x) refines p_DBN(z).
+        `elp` (per-song edge log-probs from _edge_logp(log_lambda)) lets the transition
+        lambda vary per song (matches the _viterbi/decode_emission `elp` path)."""
+        elp = self._edge_logp() if elp is None else elp
         T, S = obs_logp.shape
         # forward
         a = [obs_logp[0] - np.log(S)]
