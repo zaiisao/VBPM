@@ -1,0 +1,3 @@
+[submodule "external/beat_this"]
+	path = external/beat_this
+	url = https://github.com/CPJKU/beat_this.git
