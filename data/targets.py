@@ -3,6 +3,16 @@
 All of these are built from the SAME beat/downbeat annotations the decoder already reconstructs -- the
 sawtooth target is just those labels reshaped into a dense, rate-informative phase ramp. It is used only
 when the sawtooth-supervision divergence is enabled.
+
+Provenance of the sawtooth-supervision idea (supervise *phase* via a dense GT ramp, not sparse beats):
+  - Oyama, Ishizuka & Yoshii, "Phase-Aware Joint Beat and Downbeat Estimation Based on Periodicity of
+    Metrical Structure," ISMIR 2021 -- a per-beat 0->2*pi sawtooth, trained as K-class classification.
+  - Chen & Su, "Toward Postprocessing-Free Neural Networks for Joint Beat and Downbeat Estimation,"
+    ISMIR 2022 -- a triangular "distance-to-nearest-beat" target (their `label2period`, used for a
+    label-embedding / structural regularization). Their (TensorFlow) code is not callable from this
+    PyTorch pipeline; it lives in the archived tree (see external/README.md).
+`build_sawtooth_phase_target` below is OUR variant: a single UNIFIED bar-phase ramp encoding beats AND
+downbeats together (it differs from both papers' targets; chosen to avoid a bar-vs-beat loss conflict).
 """
 from __future__ import annotations
 
