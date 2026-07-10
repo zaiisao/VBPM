@@ -1,0 +1,8 @@
+name: beat_this
+feature_dim: 512               # penultimate width (transformer_blocks output)
+native_fps: 50.0
+cache_fps: 86.1328125          # 22050/256 -- the grid every cache/target uses
+sample_rate: 22050
+checkpoint: final0
+submodule: external/beat_this
+provides_activations: true     # act2 beat/downbeat probs -> filter evidence

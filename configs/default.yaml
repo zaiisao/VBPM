@@ -1,0 +1,35 @@
+# VBPM default experiment config (post-2026-07-10 recipe: the NOSAW configuration --
+# pure ELBO on the conditional deep Markov model; every auxiliary term is an emission).
+seed: 0
+frontend: beat_this            # configs/frontends/<name>.yaml
+
+model:
+  hidden_size: 64
+  num_meters: 4                # meter latent classes (k -> k+1 beats/bar); pinned recipe value
+  emission: parametric         # parametric | mlp_full | mlp_no_tempo | mlp_phase_only
+  transition_correction_scale: 0.5   # g-prior (pending minimality-ladder verdict)
+  fixed_prior_scales: null     # or [sigma, concentration] (L4)
+
+objective:
+  free_bits_nats_per_frame: 0.3
+  prior_preserving_free_bits: true
+  sawtooth_weight: 0.0         # NOSAW verdict 2026-07-10: unnecessary; targets still built for slope
+  tempo_slope_weight: 0.5      # pending minimality-ladder verdict
+  meter_ce_weight: 0.1
+
+training:
+  steps: 2000
+  batch_size: 32
+  crop_frames: 1024
+  learning_rate: 1.0e-3        # verify against harness default before Phase 2
+  train_songs: 9999
+  extra_train_dirs: []         # tempo-aug pool directories
+  aug_songs_per_dir: 200
+
+filter:                        # fixed deployment (2026-07-10)
+  num_particles: 800
+  observation_temperature: 3.0
+  proposal_tempo_sigma_scale: 0.01
+  proposal_phase_concentration_scale: 50.0
+  downbeat_evidence_weight: 3.0
+  stratified_gauge_init: true

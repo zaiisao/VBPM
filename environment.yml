@@ -12,6 +12,7 @@ dependencies:
   - pytorch=2.6.*          # the model + all tensor ops (CUDA build)
   - numpy
   - scipy                  # scipy.signal.find_peaks for peak-picking the read-out
+  - pyyaml                 # YAML config loader (config.py)
   - pip
   - pip:
       - mir_eval           # beat/downbeat F-measure

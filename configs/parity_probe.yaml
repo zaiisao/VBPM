@@ -1,0 +1,10 @@
+# Score-parity gate config: the winning recipe at probe scale (200 songs / 700 steps).
+# PASS = filter Bayesian beat F within noise of ~0.80 on the 16-song val.
+seed: 0
+frontend: beat_this
+model:
+  num_meters: 4
+training:
+  steps: 700
+  train_songs: 200
+  save_path: checkpoints/parity_probe_s0.pt

@@ -182,7 +182,7 @@ pyrightconfig.json
 /logs/
 
 # Cached frontend activations + diagnostic checkpoints (~18GB; regenerable, do NOT push)
-/cache/
+/cache
 
 # Training run outputs (checkpoints + metrics; regenerable)
 /runs/
@@ -199,3 +199,6 @@ pyrightconfig.json
 # Vendored reference clones with their own .git (kept local, not committed as embedded repos)
 /third_party/aesmc/
 /third_party/joint_bd/
+
+# Dataset symlink (761GB external store)
+/dataset_store

@@ -1,235 +1,407 @@
-"""The VBPM bar-pointer Dynamical VAE (and the switch-points for its ablations).
+"""The Variational Bar Pointer Model: a conditional Deep Markov Model (Krishnan, Shalit & Sontag
+2017; Girin et al. 2021 taxonomy) over three per-frame latents -- meter (Categorical), bar phase
+(wrapped Cauchy), log-tempo (Laplace) -- conditioned on frozen frontend features, per the ELBO
+derived in docs/ELBO_for_DBN.md and notebooks/vbpm_from_first_principles.ipynb.
 
-Generative story (the prior), per frame t:
-    meter      m_t        ~ Categorical(transition from m_{t-1})
-    log tempo  s_t        ~ Normal(s_{t-1}, sigma)                 # random walk on log tempo
-    bar phase  phi_t      ~ vonMises(phi_{t-1} + exp(s_{t-1}), kappa)  # phase advances by the tempo
-    decoder    b_t,db_t   ~ Bernoulli( decode(z_t) )
+The generative ancestry is the bar-pointer model (Whiteley, Cemgil & Godsill 2006): the emission
+depends on pointer POSITION only; tempo parameterizes the transition. The default emission is the
+madmom-style parametric cosine bump (side-channel fix, docs/emission_sidechannel_report.md); the
+MLP emission modes are kept only as the documented diagnosis-ladder axis.
 
-Inference (the posterior) reads the audio features h to propose the latents each frame. The VBPM
-posterior reads the phase directly from h ("free"); the KL to the dynamics prior is what (softly) ties
-the phase to the tempo. The divergence switches replace pieces of this with computed/filtered variants.
-
-At deployment we discard the decoder and read beats/downbeats geometrically from the phase (readout.py).
+Deployment inference lives in model/particle_filter.py (bootstrap filter with the fixed 2026-07-10
+settings); ``VariationalBarPointerModel.filter_deploy`` delegates to it.
 """
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Laplace
 
-from config import Config
-from .latents import (
-    sample_von_mises, kl_von_mises,
-    sample_normal, kl_normal,
-    sample_gumbel_softmax, kl_categorical,
-)
-from .divergences import AutocorrelationTempoHead, GeometricEmission, blend_phase
+from model.latents import (TWO_PI, kl_between_categoricals, kl_between_laplaces,
+                           kl_between_wrapped_cauchy, phase_concentration_from_score,
+                           sample_wrapped_cauchy, tempo_std_from_score)
 
-TWO_PI = 2.0 * math.pi
+
+def predicted_phase_mean(prev_phase, prev_log_tempo):
+    # Deterministic bar-pointer advance: phi_{t-1} + exp(log_tempo_{t-1}), wrapped to [0, 2pi).
+    return (prev_phase + torch.exp(prev_log_tempo.clamp(-10.0, 3.0))) % TWO_PI
 
 
 @dataclass
 class RolloutResult:
-    phase: torch.Tensor                       # [batch, num_frames] posterior bar phase (the deploy signal)
-    log_tempo: torch.Tensor                   # [batch, num_frames] log bar-phase advance per frame
-    decoder_logits: torch.Tensor             # [batch, num_frames, 2] (beat, downbeat) training logits
-    kl_meter: torch.Tensor | None            # [batch] summed over frames, or None when not computed
+    bar_phase: torch.Tensor               # [batch, frames] sampled posterior phase (deployment signal)
+    log_tempo: torch.Tensor               # [batch, frames]
+    meter_probabilities: torch.Tensor     # [batch, frames, num_meters] (soft one-hot samples)
+    event_logits: torch.Tensor            # [batch, frames, 2] decoder logits for (beat, downbeat)
+    kl_meter: torch.Tensor | None         # [batch] each KL summed over frames (None when compute_kl=False)
     kl_phase: torch.Tensor | None
-    kl_tempo: torch.Tensor | None            # None when tempo is computed (autocorr) rather than a latent
-    tempo_lag_scores: torch.Tensor | None    # [batch, num_lags] autocorr scores, for the tempo CE loss
+    kl_tempo: torch.Tensor | None
+    # Prior-gradient channel: the SAME KLs with the posterior side detached (gradients reach only
+    # the prior-side networks). Used by the prior-preserving free-bits objective; None otherwise.
+    kl_meter_pg: torch.Tensor | None = None
+    kl_phase_pg: torch.Tensor | None = None
+    kl_tempo_pg: torch.Tensor | None = None
+    meter_logits: torch.Tensor | None = None   # [batch, frames, K] posterior logits (meter emission)
 
 
-class BarPointerVAE(nn.Module):
-    def __init__(self, config: Config):
+class TransformerContext(nn.Module):
+    """Bidirectional Transformer context encoder: [B, T, input_dim] -> [B, T, output_dim].
+
+    Sinusoidal positional encoding + full (unmasked) self-attention, so -- like a bidirectional RNN --
+    it is a SMOOTHING encoder: every frame attends over the whole sequence (past and future). Output
+    width is 2*hidden_size so the downstream context projection is identical to the earlier BiGRU's.
+    """
+    def __init__(self, input_dim, output_dim, num_heads=4, num_layers=2, feedforward_multiplier=2,
+                 max_len=8192):
         super().__init__()
-        self.config = config
-        feature_dim, hidden, num_meters = config.feature_dim, config.hidden_size, config.num_meters
+        self.input_projection = nn.Linear(input_dim, output_dim)
+        position = torch.arange(max_len).unsqueeze(1).float()
+        frequency = torch.exp(torch.arange(0, output_dim, 2).float() * (-math.log(10000.0) / output_dim))
+        positional_encoding = torch.zeros(max_len, output_dim)
+        positional_encoding[:, 0::2] = torch.sin(position * frequency)
+        positional_encoding[:, 1::2] = torch.cos(position * frequency)
+        self.register_buffer("positional_encoding", positional_encoding, persistent=False)
+        encoder_layer = nn.TransformerEncoderLayer(
+            output_dim, num_heads, dim_feedforward=feedforward_multiplier * output_dim,
+            dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # The "latent feature" handed to the decoder / next-step posterior: (cos phi, sin phi, log_tempo, meter).
-        self.latent_feature_dim = 3 + num_meters
-        # Packed posterior/prior parameters: meter logits, phase (cos,sin), phase concentration,
-        # log-tempo mean, log-tempo std (raw, pre-softplus).
-        self.packed_param_dim = num_meters + 5
+    def forward(self, x):
+        hidden = self.input_projection(x) + self.positional_encoding[: x.shape[1]].unsqueeze(0)
+        return self.transformer(hidden)   # no attention mask => bidirectional (smoothing)
 
-        # Posterior encoder reads features plus the (possibly dropped-out) beat/downbeat channels.
-        self.posterior_gru = nn.GRU(feature_dim + 2, hidden, batch_first=True, bidirectional=True)
-        self.posterior_context = nn.Linear(2 * hidden, hidden)
-        # Audio-conditioned prior encoder (reads features only).
-        self.prior_gru = nn.GRU(feature_dim, hidden, batch_first=True, bidirectional=True)
-        self.prior_context = nn.Linear(2 * hidden, hidden)
 
-        self.posterior_head = nn.Sequential(
-            nn.Linear(hidden + self.latent_feature_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, self.packed_param_dim),
-        )
-        self.prior_initial = nn.Sequential(
-            nn.Linear(hidden, hidden), nn.Tanh(), nn.Linear(hidden, self.packed_param_dim),
-        )
-        self.prior_phase_concentration = nn.Linear(hidden, 1)   # data-conditioned kappa of the phase prior
-        self.prior_tempo_std = nn.Linear(hidden, 1)             # data-conditioned sigma of the tempo prior
-        self.meter_transition = nn.Sequential(
-            nn.Linear(num_meters + 4 + hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, num_meters * num_meters),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(self.latent_feature_dim, hidden), nn.Tanh(), nn.Linear(hidden, 2),
-        )
+class ParametricPointerEmission(nn.Module):
+    """Madmom-style emission with a FIXED functional form: the beat logit is a learned-height cosine
+    bump at the beats-per-bar harmonic of the bar phase, the downbeat logit a bump at the fundamental.
+    Five scalars total -- structurally incapable of reading event timing out of tempo or meter wiggles
+    (the diagnosed side channel). beats_per_bar comes from the SOFT meter latent (never a hardcoded 4).
+    """
+    def __init__(self, num_meters):
+        super().__init__()
+        self.register_buffer("beats_per_class", torch.arange(1, num_meters + 1).float())
+        self.beat_bias = nn.Parameter(torch.tensor(-2.0))
+        self.beat_gain = nn.Parameter(torch.tensor(2.0))
+        self.downbeat_bias = nn.Parameter(torch.tensor(-3.0))
+        self.downbeat_gain = nn.Parameter(torch.tensor(2.0))
+        self.sharpness = nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, latent_feature):
+        cos_phi, sin_phi = latent_feature[..., 0], latent_feature[..., 1]
+        meter = latent_feature[..., 3:]
+        phase = torch.atan2(sin_phi, cos_phi)
+        beats_per_bar = (meter * self.beats_per_class).sum(-1).clamp(min=1.0)
+        k = F.softplus(self.sharpness)
+        beat_bump = torch.exp(k * (torch.cos(beats_per_bar * phase) - 1.0))
+        downbeat_bump = torch.exp(k * (torch.cos(phase) - 1.0))
+        return torch.stack([self.beat_bias + F.softplus(self.beat_gain) * beat_bump,
+                            self.downbeat_bias + F.softplus(self.downbeat_gain) * downbeat_bump], dim=-1)
+
+
+class VariationalBarPointerModel(nn.Module):
+    def __init__(self, feature_dim=512, hidden_size=64, num_meters=4,
+                 transition_correction_scale=0.0, decoder_sees_tempo=True,
+                 decoder_input_mode="parametric", fixed_prior_scales=None):
+        super().__init__()
+        self.num_meters = num_meters
+        self.latent_feature_dim = 3 + num_meters            # (cos phi, sin phi, log tempo, meter one-hot)
+        # One packed parameter vector per frame: meter logits, phase mean as (cos, sin),
+        # raw phase concentration, log-tempo mean, raw log-tempo std.
+        self.packed_parameter_dim = num_meters + 5
+
+        # Posterior context reads features AND the observed event channels. A bidirectional
+        # Transformer encoder (full self-attention) -- a smoothing context: every frame sees the
+        # whole sequence. Prior context reads features only (the generative side never sees answers).
+        self.posterior_encoder = TransformerContext(feature_dim + 2, 2 * hidden_size)
+        self.posterior_context_projection = nn.Linear(2 * hidden_size, hidden_size)
+        self.prior_encoder = TransformerContext(feature_dim, 2 * hidden_size)
+        self.prior_context_projection = nn.Linear(2 * hidden_size, hidden_size)
+
+        self.posterior_parameter_head = nn.Sequential(          # all q parameters at frame t
+            nn.Linear(hidden_size + self.latent_feature_dim, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, self.packed_parameter_dim))
+        self.initial_prior_head = nn.Sequential(                # p(z_1 | h)
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, self.packed_parameter_dim))
+        self.prior_phase_concentration_head = nn.Linear(hidden_size, 1)   # phase concentration c^p_t
+        self.prior_tempo_std_head = nn.Linear(hidden_size, 1)             # tempo Laplace scale b_t
+        self.meter_transition_network = nn.Sequential(                    # K x K meter transition
+            nn.Linear(num_meters + 4 + hidden_size, hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, num_meters * num_meters))
+        if decoder_input_mode == "parametric":
+            self.event_decoder = ParametricPointerEmission(num_meters)
+        else:
+            self.event_decoder = nn.Sequential(                           # MLP emission (ladder arms)
+                nn.Linear(self.latent_feature_dim, hidden_size), nn.Tanh(), nn.Linear(hidden_size, 2))
         self.initial_latent_feature = nn.Parameter(torch.zeros(self.latent_feature_dim))
+        # g-prior: bounded audio correction of the transition MEANS. Head constructed ONLY when
+        # enabled, so the baseline's parameter list and init RNG stream are byte-identical at scale 0.
+        self.transition_correction_scale = transition_correction_scale
+        # Side-channel cut (2026-07-10 root cause): when False, the event decoder sees
+        # (phase, meter) ONLY. Tempo then affects the likelihood solely through phase advance, so
+        # the encoder cannot Morse-code event timing through unphysical tempo wiggles.
+        self.decoder_sees_tempo = decoder_sees_tempo
+        # Ladder over what the emission may see (side-channel cuts, weakest -> strongest):
+        #   'full'       -- z = (phase, tempo, meter)          [L0: the diagnosed broken baseline]
+        #   'no_tempo'   -- tempo dim zeroed                    [L1]
+        #   'phase_only' -- tempo AND meter dims zeroed         [L2: no side channel left]
+        #   'parametric' -- madmom-style cosine-bump emission   [L3: fixed functional form; DEFAULT]
+        self.decoder_input_mode = decoder_input_mode or ("full" if decoder_sees_tempo else "no_tempo")
+        # L4 (scale-leak cut): freeze the PRIOR transition scales at physical values
+        # (tempo_sigma_nats_per_frame, phase_concentration). The learned heads otherwise inflate
+        # them to zero the KL price of posterior side-channel wiggles. ELBO stays exact -- this is
+        # a spec choice of p(z_t|z_{t-1},h), not a loss change.
+        self.fixed_prior_scales = fixed_prior_scales   # None or (sigma, concentration)
+        if transition_correction_scale > 0.0:
+            self.transition_correction_head = nn.Sequential(
+                nn.Linear(hidden_size + self.latent_feature_dim, hidden_size), nn.Tanh(),
+                nn.Linear(hidden_size, 2))
 
-        # ---- divergence modules (only instantiated when the corresponding flag is set) ----
-        self.tempo_head = (
-            AutocorrelationTempoHead(feature_dim) if config.divergence_tempo_source == "autocorr" else None
-        )
-        self.geometric_emission = (
-            GeometricEmission() if config.divergence_decoder == "geometric" else None
-        )
-        self.filter_gain = (
-            nn.Parameter(torch.tensor(0.0)) if config.divergence_phase_update == "filter" else None
-        )
-
-    # ---- small helpers -------------------------------------------------------------------------
-
-    def _unpack(self, packed: torch.Tensor):
-        """Split a packed parameter vector into (meter_logits, phase_mean, phase_conc, tempo_mean, tempo_std)."""
-        num_meters = self.config.num_meters
-        meter_logits = packed[:, :num_meters]
-        # Phase mean is parameterized as an unconstrained (cos, sin) pair; atan2 recovers the angle,
-        # which sidesteps any 0/2*pi wrap discontinuity a direct angle output would have.
-        phase_mean = torch.atan2(packed[:, num_meters + 1], packed[:, num_meters]) % TWO_PI
-        phase_concentration = F.softplus(packed[:, num_meters + 2]) + 0.01
-        log_tempo_mean = packed[:, num_meters + 3]
-        log_tempo_std = F.softplus(packed[:, num_meters + 4]) + 1e-3
+    # ---- helpers ------------------------------------------------------------------------------
+    def unpack_distribution_parameters(self, packed):
+        meter_logits = packed[:, :self.num_meters]
+        phase_mean = torch.atan2(packed[:, self.num_meters + 1], packed[:, self.num_meters]) % TWO_PI
+        phase_concentration = F.softplus(packed[:, self.num_meters + 2]) + 0.01
+        log_tempo_mean = packed[:, self.num_meters + 3]
+        log_tempo_std = F.softplus(packed[:, self.num_meters + 4]) + 1e-3
         return meter_logits, phase_mean, phase_concentration, log_tempo_mean, log_tempo_std
 
-    def _latent_feature(self, meter: torch.Tensor, phase: torch.Tensor, log_tempo: torch.Tensor) -> torch.Tensor:
-        return torch.cat(
-            [torch.cos(phase).unsqueeze(-1), torch.sin(phase).unsqueeze(-1), log_tempo.unsqueeze(-1), meter], dim=-1
-        )
+    def latent_feature_vector(self, meter, bar_phase, log_tempo):
+        return torch.cat([torch.cos(bar_phase).unsqueeze(-1), torch.sin(bar_phase).unsqueeze(-1),
+                          log_tempo.unsqueeze(-1), meter], dim=-1)
 
-    def _meter_prior_logprob(self, previous_meter, phase, previous_phase, prior_context):
-        features = torch.cat([
+    def decoder_input(self, latent_feature):
+        # Emission input per ladder rung (dims: 0-1 cos/sin phase, 2 log tempo, 3: meter).
+        if self.decoder_input_mode in ("full", "parametric"):
+            return latent_feature
+        masked = latent_feature.clone()
+        masked[..., 2] = 0.0
+        if self.decoder_input_mode == "phase_only":
+            masked[..., 3:] = 0.0
+        return masked
+
+    def prior_tempo_sigma(self, prior_context_frames):
+        if self.fixed_prior_scales is not None:
+            sigma, _ = self.fixed_prior_scales
+            return torch.full(prior_context_frames.shape[:-1], sigma,
+                              device=prior_context_frames.device)
+        return tempo_std_from_score(self.prior_tempo_std_head(prior_context_frames).squeeze(-1))
+
+    def prior_phase_concentration(self, prior_context_frames):
+        if self.fixed_prior_scales is not None:
+            _, concentration = self.fixed_prior_scales
+            return torch.full(prior_context_frames.shape[:-1], concentration,
+                              device=prior_context_frames.device)
+        return phase_concentration_from_score(
+            self.prior_phase_concentration_head(prior_context_frames).squeeze(-1))
+
+    def transition_mean_corrections(self, prior_context_frame, previous_latent_feature, previous_log_tempo):
+        """g: bounded residual corrections to the transition MEANS from (z_{t-1}, h_t).
+        Phase correction bounded to (scale x one frame's advance) -- tempo-proportional, so it can
+        re-lock but never teleport the pointer; tempo correction bounded to 0.04*scale nats/frame
+        (~2%/frame at scale 0.5, the magnitude real tempo increments actually have).
+        Identically zero when disabled: the exact spec transition."""
+        if self.transition_correction_scale == 0.0:
+            zero = torch.zeros_like(previous_log_tempo)
+            return zero, zero
+        raw = self.transition_correction_head(
+            torch.cat([prior_context_frame, previous_latent_feature], dim=-1))
+        frame_advance = torch.exp(previous_log_tempo.clamp(-10.0, 3.0))
+        delta_phase = self.transition_correction_scale * frame_advance * torch.tanh(raw[..., 0])
+        delta_log_tempo = 0.04 * self.transition_correction_scale * torch.tanh(raw[..., 1])
+        return delta_phase, delta_log_tempo
+
+    def meter_transition_log_probabilities(self, previous_meter, bar_phase, previous_phase, prior_context):
+        # A full K x K transition matrix conditioned on (m_{t-1}, phi_t, phi_{t-1}, h_t);
+        # the (soft) previous meter selects its row via a batched vector-matrix product.
+        network_input = torch.cat([
             previous_meter,
-            torch.cos(phase).unsqueeze(-1), torch.sin(phase).unsqueeze(-1),
+            torch.cos(bar_phase).unsqueeze(-1), torch.sin(bar_phase).unsqueeze(-1),
             torch.cos(previous_phase).unsqueeze(-1), torch.sin(previous_phase).unsqueeze(-1),
-            prior_context,
-        ], dim=-1)
-        transition = F.softmax(self.meter_transition(features).reshape(-1, self.config.num_meters, self.config.num_meters), dim=2)
-        return torch.log(torch.bmm(previous_meter.unsqueeze(1), transition).squeeze(1) + 1e-9)
+            prior_context], dim=-1)
+        transition_matrix = F.softmax(
+            self.meter_transition_network(network_input).reshape(-1, self.num_meters, self.num_meters), dim=2)
+        return torch.log(torch.bmm(previous_meter.unsqueeze(1), transition_matrix).squeeze(1) + 1e-9)
 
-    def _decode(self, latent_feature, phase):
-        if self.geometric_emission is not None:
-            return self.geometric_emission.logits(phase, self.config.beats_per_bar)
-        return self.decoder(latent_feature)
-
-    def _sample_meter(self, meter_logits, gumbel_temperature, sample):
-        if self.config.divergence_meter == "fixed":
-            # Hard one-hot at the configured beats-per-bar (meter latent disabled).
-            fixed = torch.zeros_like(meter_logits)
-            fixed[:, min(self.config.beats_per_bar - 1, self.config.num_meters - 1)] = 1.0
-            return fixed
-        if sample:
-            return sample_gumbel_softmax(meter_logits, gumbel_temperature)
-        return F.softmax(meter_logits, dim=-1)
-
-    # ---- the rollout ---------------------------------------------------------------------------
-
-    def rollout(self, features, beat_channel, downbeat_channel,
-                gumbel_temperature: float = 0.5, sample: bool = True, compute_kl: bool = True) -> RolloutResult:
-        """Run the posterior forward over time, applying the prior dynamics and any divergence switches."""
+    # ---- the SGVB rollout (single reparameterized sample path) ---------------------------------
+    def rollout(self, features, observed_beats, observed_downbeats,
+                gumbel_temperature=0.5, sample=True, compute_kl=True):
         batch_size, num_frames, _ = features.shape
-        device = features.device
 
-        posterior_sequence, _ = self.posterior_gru(torch.cat([features, beat_channel.unsqueeze(-1),
-                                                              downbeat_channel.unsqueeze(-1)], dim=-1))
-        posterior_context = self.posterior_context(posterior_sequence)            # [batch, frames, hidden]
-        prior_context = self.prior_context(self.prior_gru(features)[0]) if compute_kl else None
+        posterior_context = self.posterior_context_projection(self.posterior_encoder(
+            torch.cat([features, observed_beats.unsqueeze(-1), observed_downbeats.unsqueeze(-1)], dim=-1)))
+        prior_context = self.prior_context_projection(self.prior_encoder(features)) if compute_kl else None
 
-        # Per-clip computed tempo (divergence): one bar-phase advance for the whole crop, from autocorrelation.
-        autocorr_advance, tempo_lag_scores = (None, None)
-        if self.tempo_head is not None:
-            autocorr_advance, tempo_lag_scores = self.tempo_head.bar_phase_advance(features, self.config.beats_per_bar)
+        def sample_meter(meter_logits):
+            return F.gumbel_softmax(meter_logits, tau=gumbel_temperature) if sample \
+                else F.softmax(meter_logits, dim=-1)
 
-        kl_meter = kl_phase = kl_tempo = (torch.zeros(batch_size, device=device) if compute_kl else None)
+        kl_meter = kl_phase = kl_tempo = (
+            torch.zeros(batch_size, device=features.device) if compute_kl else None)
+        kl_meter_pg = kl_phase_pg = kl_tempo_pg = (
+            torch.zeros(batch_size, device=features.device) if compute_kl else None)
 
-        # ---- frame 0: initialise the latents from the data ----
-        packed = self.posterior_head(torch.cat([posterior_context[:, 0],
-                                                self.initial_latent_feature.expand(batch_size, -1)], dim=-1))
-        meter_logits, phase_mean, phase_conc, tempo_mean, tempo_std = self._unpack(packed)
-        meter = self._sample_meter(meter_logits, gumbel_temperature, sample)
-        log_tempo = self._frame_log_tempo(tempo_mean, tempo_std, autocorr_advance, sample)
-        phase = sample_von_mises(phase_mean, phase_conc) if sample else phase_mean   # data-read initial offset
+        # ---- frame 0: initial posterior q(z_1 | b, h) and initial prior p(z_1 | h) ----
+        packed = self.posterior_parameter_head(torch.cat(
+            [posterior_context[:, 0], self.initial_latent_feature.expand(batch_size, -1)], dim=-1))
+        meter_logits, phase_mean, phase_concentration, log_tempo_mean, log_tempo_std = \
+            self.unpack_distribution_parameters(packed)
+        meter = sample_meter(meter_logits)
+        log_tempo = Laplace(log_tempo_mean, log_tempo_std).rsample() if sample else log_tempo_mean
+        bar_phase = sample_wrapped_cauchy(phase_mean, phase_concentration) if sample else phase_mean
 
-        if compute_kl:
-            prior_packed = self.prior_initial(prior_context.mean(dim=1))
-            prior_meter_logits, prior_phase_mean, prior_phase_conc, prior_tempo_mean, prior_tempo_std = self._unpack(prior_packed)
-            kl_meter = kl_meter + kl_categorical(torch.log_softmax(meter_logits, -1), torch.log_softmax(prior_meter_logits, -1))
-            kl_phase = kl_phase + kl_von_mises(phase_mean, phase_conc, prior_phase_mean, prior_phase_conc)
-            if kl_tempo is not None and self.tempo_head is None:
-                kl_tempo = kl_tempo + kl_normal(tempo_mean, tempo_std, prior_tempo_mean, prior_tempo_std)
+        if compute_kl:  # the three t=1 KL terms
+            prior_packed = self.initial_prior_head(prior_context.mean(dim=1))
+            (prior_meter_logits, prior_phase_mean, prior_phase_concentration,
+             prior_log_tempo_mean, prior_log_tempo_std) = self.unpack_distribution_parameters(prior_packed)
+            kl_meter = kl_meter + kl_between_categoricals(
+                F.log_softmax(meter_logits, -1), F.log_softmax(prior_meter_logits, -1))
+            kl_phase = kl_phase + kl_between_wrapped_cauchy(
+                phase_mean, phase_concentration, prior_phase_mean, prior_phase_concentration)
+            kl_tempo = kl_tempo + kl_between_laplaces(
+                log_tempo_mean, log_tempo_std, prior_log_tempo_mean, prior_log_tempo_std)
+            # prior-gradient channel (posterior detached; prior heads keep their gradients)
+            kl_meter_pg = kl_meter_pg + kl_between_categoricals(
+                F.log_softmax(meter_logits, -1).detach(), F.log_softmax(prior_meter_logits, -1))
+            kl_phase_pg = kl_phase_pg + kl_between_wrapped_cauchy(
+                phase_mean.detach(), phase_concentration.detach(), prior_phase_mean, prior_phase_concentration)
+            kl_tempo_pg = kl_tempo_pg + kl_between_laplaces(
+                log_tempo_mean.detach(), log_tempo_std.detach(), prior_log_tempo_mean, prior_log_tempo_std)
 
-        phase_sequence = [phase]
-        log_tempo_sequence = [log_tempo]
-        latent_features = [self._latent_feature(meter, phase, log_tempo)]
-        previous_meter, previous_phase, previous_log_tempo = meter, phase, log_tempo
+        phase_frames, log_tempo_frames, meter_frames = [bar_phase], [log_tempo], [meter]
+        meter_logits_frames = [meter_logits]
+        latent_features = [self.latent_feature_vector(meter, bar_phase, log_tempo)]
 
-        # ---- frames 1..T-1: apply the dynamics + chosen phase update ----
+        # ---- frames 1..T-1: transitions + per-frame KLs ----
         for frame_index in range(1, num_frames):
-            packed = self.posterior_head(torch.cat([
-                posterior_context[:, frame_index], self._latent_feature(previous_meter, previous_phase, previous_log_tempo)
-            ], dim=-1))
-            meter_logits, phase_data_mean, phase_conc, tempo_mean, tempo_std = self._unpack(packed)
-            meter = self._sample_meter(meter_logits, gumbel_temperature, sample)
-            log_tempo = self._frame_log_tempo(tempo_mean, tempo_std, autocorr_advance, sample)
+            previous_meter, previous_phase, previous_log_tempo = meter, bar_phase, log_tempo
+            packed = self.posterior_parameter_head(torch.cat(
+                [posterior_context[:, frame_index], latent_features[-1]], dim=-1))
+            meter_logits, phase_mean, phase_concentration, log_tempo_mean, log_tempo_std = \
+                self.unpack_distribution_parameters(packed)
 
-            # Prior dynamics mean: advance phase by the per-frame tempo. The clamp bounds exp() so a
-            # runaway log_tempo cannot produce an inf/NaN phase advance (>~20 rad/frame is already absurd).
-            predicted_phase = (previous_phase + torch.exp(previous_log_tempo.clamp(-10.0, 3.0))) % TWO_PI   # prior dynamics mean
-            phase = self._update_phase(predicted_phase, phase_data_mean, phase_conc, sample)
+            meter = sample_meter(meter_logits)
+            log_tempo = Laplace(log_tempo_mean, log_tempo_std).rsample() if sample else log_tempo_mean
+            # Prior mean: the bar-pointer advance, evaluated at the SAMPLED previous state.
+            predicted_phase = predicted_phase_mean(previous_phase, previous_log_tempo)
+            bar_phase = sample_wrapped_cauchy(phase_mean, phase_concentration) if sample else phase_mean
 
             if compute_kl:
-                prior_phase_conc = F.softplus(self.prior_phase_concentration(prior_context[:, frame_index]).squeeze(-1)) + 0.01
-                prior_tempo_std = F.softplus(self.prior_tempo_std(prior_context[:, frame_index]).squeeze(-1)) + 1e-3
-                kl_meter = kl_meter + kl_categorical(
-                    torch.log_softmax(meter_logits, -1),
-                    self._meter_prior_logprob(previous_meter, phase, previous_phase, prior_context[:, frame_index]),
-                )
-                # Phase KL pulls the posterior phase toward the dynamics prediction -> couples phase to tempo.
-                posterior_phase_mean = phase_data_mean if self.config.divergence_phase_update == "free" else predicted_phase
-                kl_phase = kl_phase + kl_von_mises(posterior_phase_mean, phase_conc, predicted_phase, prior_phase_conc)
-                if kl_tempo is not None and self.tempo_head is None:
-                    kl_tempo = kl_tempo + kl_normal(tempo_mean, tempo_std, previous_log_tempo, prior_tempo_std)
+                prior_phase_concentration = self.prior_phase_concentration(prior_context[:, frame_index])
+                prior_log_tempo_std = self.prior_tempo_sigma(prior_context[:, frame_index])
+                # g-prior: bounded audio corrections of the transition MEANS (zero when disabled --
+                # then the two KLs below are the exact faithful transitions).
+                delta_phase, delta_log_tempo = self.transition_mean_corrections(
+                    prior_context[:, frame_index], latent_features[-1], previous_log_tempo)
+                predicted_phase = (predicted_phase + delta_phase) % TWO_PI
+                # Tempo piece: Laplace(mu_q, b_q) vs Laplace(s_{t-1} + delta, b_t).
+                kl_tempo = kl_tempo + kl_between_laplaces(
+                    log_tempo_mean, log_tempo_std, previous_log_tempo + delta_log_tempo, prior_log_tempo_std)
+                # Phase piece: WC(mu_q, rho_q) vs WC(predicted advance, rho^p) -- THE term that
+                # couples the phase to the tempo dynamics.
+                kl_phase = kl_phase + kl_between_wrapped_cauchy(
+                    phase_mean, phase_concentration, predicted_phase, prior_phase_concentration)
+                # Meter piece: evaluated AFTER sampling phi_t (its prior conditions on it).
+                kl_meter = kl_meter + kl_between_categoricals(
+                    F.log_softmax(meter_logits, -1),
+                    self.meter_transition_log_probabilities(
+                        previous_meter, bar_phase, previous_phase, prior_context[:, frame_index]))
+                # prior-gradient channel: q detached AND the sampled state inputs to the prior
+                # detached, so gradients flow ONLY into the prior-side networks (scale heads,
+                # meter transition, correction head, prior encoder).
+                delta_phase_pg, delta_log_tempo_pg = self.transition_mean_corrections(
+                    prior_context[:, frame_index], latent_features[-1].detach(), previous_log_tempo.detach())
+                predicted_phase_pg = (predicted_phase_mean(
+                    previous_phase.detach(), previous_log_tempo.detach()) + delta_phase_pg) % TWO_PI
+                kl_phase_pg = kl_phase_pg + kl_between_wrapped_cauchy(
+                    phase_mean.detach(), phase_concentration.detach(), predicted_phase_pg, prior_phase_concentration)
+                kl_tempo_pg = kl_tempo_pg + kl_between_laplaces(
+                    log_tempo_mean.detach(), log_tempo_std.detach(),
+                    previous_log_tempo.detach() + delta_log_tempo_pg, prior_log_tempo_std)
+                kl_meter_pg = kl_meter_pg + kl_between_categoricals(
+                    F.log_softmax(meter_logits, -1).detach(),
+                    self.meter_transition_log_probabilities(
+                        previous_meter.detach(), bar_phase.detach(), previous_phase.detach(),
+                        prior_context[:, frame_index]))
 
-            phase_sequence.append(phase)
-            log_tempo_sequence.append(log_tempo)
-            latent_features.append(self._latent_feature(meter, phase, log_tempo))
-            previous_meter, previous_phase, previous_log_tempo = meter, phase, log_tempo
+            phase_frames.append(bar_phase)
+            log_tempo_frames.append(log_tempo)
+            meter_frames.append(meter)
+            meter_logits_frames.append(meter_logits)
+            latent_features.append(self.latent_feature_vector(meter, bar_phase, log_tempo))
 
-        decoder_logits = torch.stack([self._decode(latent_features[t], phase_sequence[t]) for t in range(num_frames)], dim=1)
+        event_logits = torch.stack(
+            [self.event_decoder(self.decoder_input(latent_features[t])) for t in range(num_frames)], dim=1)
         return RolloutResult(
-            phase=torch.stack(phase_sequence, dim=1),
-            log_tempo=torch.stack(log_tempo_sequence, dim=1),
-            decoder_logits=decoder_logits,
+            bar_phase=torch.stack(phase_frames, dim=1),
+            log_tempo=torch.stack(log_tempo_frames, dim=1),
+            meter_probabilities=torch.stack(meter_frames, dim=1),
+            event_logits=event_logits,
             kl_meter=kl_meter, kl_phase=kl_phase, kl_tempo=kl_tempo,
-            tempo_lag_scores=tempo_lag_scores,
-        )
+            kl_meter_pg=kl_meter_pg, kl_phase_pg=kl_phase_pg, kl_tempo_pg=kl_tempo_pg,
+            meter_logits=torch.stack(meter_logits_frames, dim=1))
 
-    def _frame_log_tempo(self, tempo_mean, tempo_std, autocorr_advance, sample):
-        """The frame's log tempo: from the latent (default) or from the autocorrelation head (divergence)."""
-        if self.tempo_head is not None:
-            return torch.log(autocorr_advance)   # computed, constant per clip
-        return sample_normal(tempo_mean, tempo_std) if sample else tempo_mean
+    # ---- the PREDICTION pipeline (Sohn et al. 2015): z from the prior network only, never y ----
+    def rollout_prior(self, features, gumbel_temperature=0.5, sample=True):
+        """Generate through p_theta(z|x) alone -- the pipeline used at TEST time (Sohn et al. 2015,
+        sec. 4.1: y* from z* = E[z|x] when sample=False). The event channels y are never an input
+        anywhere on this path."""
+        batch_size, num_frames, _ = features.shape
+        prior_context = self.prior_context_projection(self.prior_encoder(features))
 
-    def _update_phase(self, predicted_phase, phase_data_mean, phase_concentration, sample):
-        """Apply the configured phase-update rule (free / integrator / filter)."""
-        rule = self.config.divergence_phase_update
-        if rule == "free":
-            return sample_von_mises(phase_data_mean, phase_concentration) % TWO_PI if sample else phase_data_mean
-        if rule == "integrator":
-            return sample_von_mises(predicted_phase, phase_concentration) % TWO_PI if sample else predicted_phase
-        if rule == "filter":
-            return blend_phase(predicted_phase, phase_data_mean % TWO_PI, torch.sigmoid(self.filter_gain))
-        raise ValueError(f"unknown phase update rule: {rule}")
+        def sample_meter(meter_logits):
+            return F.gumbel_softmax(meter_logits, tau=gumbel_temperature) if sample \
+                else F.softmax(meter_logits, dim=-1)
+
+        # frame 0: the audio-conditioned initial prior p(z_1 | h)
+        prior_packed = self.initial_prior_head(prior_context.mean(dim=1))
+        meter_logits, phase_mean, phase_concentration, log_tempo_mean, log_tempo_std = \
+            self.unpack_distribution_parameters(prior_packed)
+        meter = sample_meter(meter_logits)
+        log_tempo = Laplace(log_tempo_mean, log_tempo_std).rsample() if sample else log_tempo_mean
+        bar_phase = sample_wrapped_cauchy(phase_mean, phase_concentration) if sample else phase_mean
+
+        phase_frames, log_tempo_frames, meter_frames = [bar_phase], [log_tempo], [meter]
+        latent_features = [self.latent_feature_vector(meter, bar_phase, log_tempo)]
+
+        # frames 1..T-1: the transition priors -- means from the dynamics, scales (and the meter
+        # transition) audio-conditioned through the prior context.
+        for frame_index in range(1, num_frames):
+            previous_meter, previous_phase, previous_log_tempo = meter, bar_phase, log_tempo
+            prior_log_tempo_std = self.prior_tempo_sigma(prior_context[:, frame_index])
+            delta_phase, delta_log_tempo = self.transition_mean_corrections(
+                prior_context[:, frame_index], latent_features[-1], previous_log_tempo)
+            prior_log_tempo_mean = previous_log_tempo + delta_log_tempo
+            log_tempo = (Laplace(prior_log_tempo_mean, prior_log_tempo_std).rsample()
+                         if sample else prior_log_tempo_mean)
+            predicted_phase = (predicted_phase_mean(previous_phase, previous_log_tempo) + delta_phase) % TWO_PI
+            prior_phase_concentration = self.prior_phase_concentration(prior_context[:, frame_index])
+            bar_phase = (sample_wrapped_cauchy(predicted_phase, prior_phase_concentration)
+                         if sample else predicted_phase)
+            meter_logits = self.meter_transition_log_probabilities(
+                previous_meter, bar_phase, previous_phase, prior_context[:, frame_index])
+            meter = sample_meter(meter_logits)
+
+            phase_frames.append(bar_phase)
+            log_tempo_frames.append(log_tempo)
+            meter_frames.append(meter)
+            latent_features.append(self.latent_feature_vector(meter, bar_phase, log_tempo))
+
+        event_logits = torch.stack(
+            [self.event_decoder(self.decoder_input(latent_features[t])) for t in range(num_frames)], dim=1)
+        return RolloutResult(
+            bar_phase=torch.stack(phase_frames, dim=1),
+            log_tempo=torch.stack(log_tempo_frames, dim=1),
+            meter_probabilities=torch.stack(meter_frames, dim=1),
+            event_logits=event_logits,
+            kl_meter=None, kl_phase=None, kl_tempo=None)
+
+    # ---- deployment by FILTERING: the lineage's own inference ----------------------------------
+    @torch.no_grad()
+    def filter_deploy(self, features, observations, **filter_kwargs):
+        """Bootstrap particle filter on the learned model; see model/particle_filter.py for the
+        implementation and the fixed 2026-07-10 deployment defaults."""
+        from model.particle_filter import run_particle_filter
+        return run_particle_filter(self, features, observations, **filter_kwargs)

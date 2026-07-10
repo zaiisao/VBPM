@@ -1,0 +1,8 @@
+name: mert_v1_95m
+feature_dim: 768
+native_fps: 75.0               # hop 320 @ 24 kHz
+cache_fps: 86.1328125
+sample_rate: 24000
+checkpoint: external/MERT-v1-95M   # HF submodule; pos_conv weight-norm remap REQUIRED (see adapter)
+submodule: external/MERT-v1-95M
+provides_activations: false    # no beat head -> filter needs a trained activation head

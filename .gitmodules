@@ -1,3 +1,6 @@
 [submodule "external/beat_this"]
 	path = external/beat_this
 	url = https://github.com/CPJKU/beat_this.git
+[submodule "external/MERT-v1-95M"]
+	path = external/MERT-v1-95M
+	url = https://huggingface.co/m-a-p/MERT-v1-95M
