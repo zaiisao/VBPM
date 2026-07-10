@@ -21,8 +21,31 @@ class Song:
                                       # (cached "act2") -- the deploy-time OBSERVABLE filter evidence
 
 
-def load_cached_songs(feature_dir, num_songs, selection_seed, min_frames=400, min_beats=8):
+class FoldContaminationError(RuntimeError):
+    """Raised when TRAINING data violates the Beat This 8-fold protocol (user directive
+    2026-07-11: fold violation must not even be an option). A training record must carry fold
+    provenance ("fold" + "extractor" == "beat_this-fold{fold}", i.e. the checkpoint that held the
+    song out) or be marked "clean_frontend" (song never in Beat This training, e.g. GTZAN).
+    Legacy final0-extracted caches (bt_*_rich, ...) are memorized evidence: the model would never
+    see a real frontend error, and every cross-system claim off them was retracted on 2026-07-10.
+    There is deliberately NO bypass flag -- re-extract with data/extract_fold_honest.py."""
+
+
+def _assert_fold_honest(record, file_path):
+    if record.get("clean_frontend", False):
+        return
+    fold = record.get("fold")
+    extractor = record.get("extractor", "")
+    if fold is None or extractor != f"beat_this-fold{fold}":
+        raise FoldContaminationError(
+            f"{file_path}: no fold-honest provenance (fold={fold!r}, extractor={extractor!r}). "
+            "Training on frontend-memorized evidence is disabled; see FoldContaminationError.")
+
+
+def load_cached_songs(feature_dir, num_songs, selection_seed, min_frames=400, min_beats=8,
+                      for_training=False):
     # Deterministic selection; skips songs too short/beatless to score meaningfully.
+    # ``for_training=True`` enforces the Beat This fold protocol on every record (no bypass).
     file_paths = sorted(glob.glob(f"{feature_dir}/*.pt"))
     random.Random(selection_seed).shuffle(file_paths)
     songs = []
@@ -30,6 +53,8 @@ def load_cached_songs(feature_dir, num_songs, selection_seed, min_frames=400, mi
         if len(songs) >= num_songs:
             break
         record = torch.load(file_path, map_location="cpu")
+        if for_training:
+            _assert_fold_honest(record, file_path)
         if record["activations"].shape[0] < min_frames or record["beat_targets"].sum() < min_beats:
             continue
         songs.append(Song(record["activations"].float(), record["beat_targets"].float(),

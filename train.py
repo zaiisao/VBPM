@@ -39,10 +39,13 @@ def build_model(cfg):
 
 def train(cfg):
     set_all_seeds(cfg.seed)
+    # for_training=True enforces the Beat This 8-fold protocol on every record -- training on
+    # frontend-memorized (final0-extracted) evidence raises FoldContaminationError, no bypass.
     train_songs = load_cached_songs(cfg.training.train_feature_dir, cfg.training.train_songs,
-                                    selection_seed=1)
+                                    selection_seed=1, for_training=True)
     for extra_dir in cfg.training.extra_train_dirs:   # tempo-aug pool: same songs, new tempos
-        train_songs += load_cached_songs(extra_dir, cfg.training.aug_songs_per_dir, selection_seed=1)
+        train_songs += load_cached_songs(extra_dir, cfg.training.aug_songs_per_dir,
+                                         selection_seed=1, for_training=True)
     validation_songs = load_cached_songs(cfg.training.val_feature_dir, cfg.training.val_songs,
                                          selection_seed=2)
     print(f"loaded {len(train_songs)} train / {len(validation_songs)} val songs", flush=True)
