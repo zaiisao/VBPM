@@ -1,0 +1,11 @@
+# Treatment B: num_meters=7 so Meter2800's 5s and 7s participate (class coverage arm).
+seed: 0
+frontend: beat_this
+model:
+  num_meters: 7
+training:
+  train_feature_dir: cache/acts/foldhonest_train_rich
+  val_feature_dir: cache/acts/foldhonest_val_rich
+  steps: 2000
+  meter_only_dir: cache/acts/meter2800_rich
+  save_path: checkpoints/meterB_s0.pt

@@ -1,0 +1,16 @@
+# Crop-length A/B: 30s crops (~2560 frames) vs the 12s default (1024). Tests WaveBeat's cited
+# claim (Fuentes 2019 [22]) that beat/downbeat tracking needs ~30s of context. Same wave-1 recipe
+# otherwise; batch reduced for the longer sequences. Report BEST val (sidesteps late collapse).
+seed: 0
+frontend: beat_this
+model: {hidden_size: 64, num_meters: 4, emission: parametric, transition_correction_scale: 0.5}
+objective: {free_bits_nats_per_frame: 0.3, prior_preserving_free_bits: true, tempo_slope_weight: 0.5, meter_ce_weight: 0.1}
+training:
+  train_feature_dir: cache/acts/foldhonest_train_rich
+  val_feature_dir: cache/acts/foldhonest_val_rich
+  steps: 2000
+  batch_size: 12
+  crop_frames: 2560
+  learning_rate: 1.0e-3
+  save_path: checkpoints/crop30s_s0.pt
+filter: {num_particles: 800, observation_temperature: 3.0, proposal_tempo_sigma_scale: 0.01, proposal_phase_concentration_scale: 50.0, downbeat_evidence_weight: 3.0, stratified_gauge_init: true}

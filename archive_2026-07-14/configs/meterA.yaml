@@ -1,0 +1,11 @@
+# Treatment A: fold-honest recipe + Meter2800 meter-only co-training (3s/4s within num_meters=4).
+seed: 0
+frontend: beat_this
+model:
+  num_meters: 4
+training:
+  train_feature_dir: cache/acts/foldhonest_train_rich
+  val_feature_dir: cache/acts/foldhonest_val_rich
+  steps: 2000
+  meter_only_dir: cache/acts/meter2800_rich
+  save_path: checkpoints/meterA_s0.pt

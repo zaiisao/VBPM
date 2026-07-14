@@ -421,3 +421,177 @@ tempo-grounding emission (sawtooth OR slope).
 Bayes 0.841/0.782 (s0), 0.828/0.791 (s1) — beat/downbeat neutral. BUT s0 meter acc 0.97 with
 real 3/4 predictions ({4:99, 3:19}) — first arm to predict non-4/4 on real val (s1 all-4s,
 0.86; seed-sensitive). Mechanism probe PASS both seeds (oracle margin ~+100 nats, 8/8).
+
+## 18. GTZAN meter confusion (2026-07-11) — first honest win over the always-4 baseline
+
+Per-song meter read-out (filter map_beats_per_bar) vs GT bpb (from downbeat intervals),
+993 clean GTZAN songs; GT dist {4:930, 3:54, 2:7, 5:2}, always-4 baseline = 0.937:
+
+- KAPPA2_s0: acc 0.937 = baseline exactly; predicts 4 for ALL 993 songs (non-4/4 recall 0.000).
+  Its downbeat 0.754 is phase tracking under an assumed-4 bar, not meter inference.
+- AUGK2_s0 (tempo-aug pool arm): acc 0.951 > baseline; non-4/4 recall 0.571.
+  3/4: recall 0.667 (36/54), precision 0.590. 4/4: recall 0.976 / precision 0.974.
+  2/4: 0/7 (3 of 7 called "3" — senses non-4, wrong class). 5/4: 0/2.
+  Confusion (gt,pred): {(2,3):3, (2,4):4, (3,3):36, (3,4):18, (4,3):22, (4,4):908, (5,4):2}
+
+First model to beat the trivial baseline on an uncontaminated benchmark, with genuine
+minority-class recall. Data (larger pool incl. more waltz) — not loss reweighting (focal
+verdict: no) — is what unlocked it. Peak-picking cannot produce this output at all.
+
+## 19. Blind-spot protocol, fold-honest SMC (2026-07-12 overnight)
+
+| arm | F | CMLt | AMLt |
+|---|---|---|---|
+| peak-pick | 0.599 | 0.393 | 0.486 |
+| KAPPA2_s0 / EB_s0, sharp proposals | 0.452 / 0.454 | 0.156 / 0.142 | 0.190 / 0.176 |
+| KAPPA2_s0 / EB_s0, adaptive (learned scales) | 0.267 / 0.265 | 0.000 / 0.000 | 0.008 / 0.007 |
+
+1. OCTAVE BLIND SPOT: solved by architecture. Filter AMLt-CMLt gap ~0.03 vs peak-pick 0.09 --
+   continuous log-tempo removes the discretization/octave failure mode (SMC Blind Spot sequel claim).
+2. CONTINUITY DRIFT: not solved. Filter errors come in long runs (CMLt collapses 2.5x harder than F);
+   sharp proposals forbid re-locking; once ancestry collapses the correct hypothesis is extinct.
+3. LEARNED SCALES UNDEPLOYABLE even after EB alternation (CMLt = 0.000 both checkpoints): EB trains
+   the prior toward the posterior on MEMORIZED evidence -- the wrong target for deployment calibration.
+   Remaining test: fold-honest models' scales (first heads trained on evidence that actually fails).
+   If those fail too, the fix is STRUCTURAL: particle rejuvenation lanes (keep every gauge hypothesis
+   alive, madmom-style) + offline smoothing, not scale tuning.
+
+## 20. FOLD-HONEST TRAINING: near-parity with peak-picking (2026-07-12 overnight)
+
+First models trained on fold-honest evidence (1,242 songs, folds 0-6), evaluated on the honest
+val (177 fold-7 songs, 1600-frame cap, matched peak-pick baseline):
+
+| | beat F | downbeat F |
+|---|---|---|
+| peak-pick (same evidence) | 0.914 | 0.836 |
+| foldhonest_s0 filter Bayes | 0.907 | 0.834 |
+| foldhonest_s1 filter Bayes | 0.907 | 0.835 |
+| untrained control | 0.788 | 0.794 |
+
+- DOWNBEAT PARITY (-0.001/-0.002), beat near-parity (-0.007), replicated across seeds to three
+  decimals. The memorized-evidence-trained checkpoint (KAPPA2_s0) scored 0.664 on this val at the
+  same dial family -- fold-honest training closed almost the whole gap. Calibration hypothesis
+  CONFIRMED at the training level: models that see real frontend errors deploy through them.
+- Learning is real: +0.12/+0.04 over the untrained architecture.
+- Open: paired per-song significance; adaptive-scales deployment of these checkpoints (probe
+  running); GTZAN transfer.
+
+## 21. Fold-honest model on fold-honest SMC: continuity healed by TRAINING (2026-07-12)
+
+| fold-honest SMC | F | CMLt | AMLt |
+|---|---|---|---|
+| peak-pick | 0.599 | 0.393 | 0.486 |
+| foldhonest_s0 sharp | 0.591 | 0.397 | 0.467 |
+| KAPPA2_s0 sharp (sec. 19) | 0.452 | 0.156 | 0.190 |
+| foldhonest_s0 adaptive | 0.261 | 0.000 | 0.007 |
+
+- Continuity drift HEALED by calibrated training (CMLt 0.156 -> 0.397, now >= peak-pick): the
+  cure was fold-honest evidence, not structural machinery. Rejuvenation lanes demoted from
+  "required" to "possible further upside".
+- Adaptive-scales question CLOSED (4/4 checkpoints, incl. fold-honest: CMLt 0.000): learned
+  transition scales are never deployable as proposals; recipe = sharp physical proposals +
+  calibration-trained model.
+
+### 21b. GTZAN transfer of the fold-honest models (2026-07-12)
+
+peak-pick 0.893/0.774 | foldhonest_s1 0.865/0.755 | foldhonest_s0 0.772/0.740 (n=993, cap 8000).
+GTZAN evidence is final0-extracted (legitimate; GTZAN in nobody's training), but fold-honest
+models trained on FOLD-checkpoint activation statistics -> mild evidence-distribution shift
+AGAINST them here (mirror of KAPPA2's fold-honest SMC penalty). Seed divergence (0.772 vs 0.865)
+appears exactly under this shift despite 3-decimal seed agreement in-distribution.
+LESSON: evidence-distribution match governs transfer; honest scorecard = val parity, SMC parity
+(continuity healed), GTZAN -0.03 (best seed).
+
+## 22. Deploy-dial sweep verdict (24 configs, fold-honest val, 2026-07-12)
+
+- BEST pure-filter config = the existing standard dials (T=3, sharp proposals, eps=0):
+  EB_s0 0.755/0.837, KAPPA2_s0 0.740/0.816. No deployment dial improves on the pinned recipe.
+- Robust-observation epsilon: monotonically NEGATIVE (0 -> 0.1 -> 0.3: 0.755 -> 0.682 -> 0.489);
+  hurts DOWNBEATS most (0.837 -> 0.453 at eps 0.1) -- uniform mixing flattens the rare
+  gauge-breaking downbeat spikes. The confident-but-wrong fix belongs in TRAINING (fold-honest,
+  sec. 20 -- which worked), not in a deploy-time outlier mixture.
+- Fusion ~0.92 regardless of filter dials (diagnostic only, per user: not a deliverable).
+- Fold-honest-trained models (0.907, sec. 20) dominate every sweep row -- training quality
+  beats deployment tuning by an order of magnitude.
+
+## 23. E2E under the repaired recipe: cliff delayed 2x, character changed, not yet survived (2026-07-12)
+
+Warm trunk (final0), lr 1e-5 + L2SP, repaired VBPM recipe, 3000 steps on mel (789 songs).
+- Historical cliff (~step 1200: recon 78->1.2, KL->0, shuffle==real) did NOT occur. No leak at any
+  point; recon stayed ~160-190; PRIOR read-out stable ~0.30 with physical rotation throughout.
+- A DIFFERENT collapse arrived at steps 2400-2800: phase KL 162->2.7 (posterior onto prior) with
+  recon intact -- slow-motion, phase-only, no feature-cheating signature.
+- Filter verdict on the final ckpt: 0.427/0.584 (mel val, tuned trunk's own activations as
+  evidence) -- degraded well below the frozen-frontend fold-honest models (0.907/0.834).
+- VERDICT: the side-channel fixes removed the OLD e2e failure mode (trunk feature-cheating) but a
+  phase-posterior collapse remains late in training. Next levers: early-stop ~step 2200 (pre-
+  collapse checkpoint), phase-specific free-bits pressure, trunk lr decay schedule, fold-honest
+  init instead of final0. E2E remains open, now with a much better-understood failure.
+
+## 24. OWN EVIDENCE HEAD: structure now BEATS same-evidence peak-picking (2026-07-12)
+
+User directive: the frontend contributes frozen features ONLY; the filter's observation comes from
+OUR ActivationHead (model/activation_head.py; BCE on fold-honest data), never from BT's act2
+(act2 survives only inside the peak-pick baseline, which IS Beat This).
+
+| honest val | beat F | downbeat F |
+|---|---|---|
+| own-head peak-pick (same evidence) | 0.896 | 0.783 |
+| foldhonest_s0 filter, own evidence | 0.917 | 0.800 |
+| foldhonest_s1 filter, own evidence | 0.922 | 0.807 |
+| BT-headed peak-pick (reference)    | 0.930 | 0.855 |
+
+- FIRST positive same-evidence delta in project history: +0.021/+0.026 beat, replicated across
+  seeds; beats parsed from z (posterior wrap probability), decoder used only as likelihood.
+- Mechanism = the confident-but-wrong thesis, now constructive: BT's pre-sharpened act2 leaves
+  nothing for structure to add (filter -0.023 there); an honestly-calibrated BCE head is weaker
+  standalone but EXPLOITABLE (+0.021). Structure pays exactly when evidence is not argmax-optimal.
+- Residual gap to the BT-headed baseline (-0.008/-0.013 vs 0.930) localizes in evidence-head
+  TRAINING DATA (1,242 songs vs their ~16 datasets), not the model. Head data scales trivially.
+- Downbeat channel of our head is the weak spot (0.783; sparser positives -- tune pos_weight).
+- MERT own-head peak-pick: 0.612 -- weak-but-honest evidence, the ideal regime for the MERT+VBPM
+  arm to test whether the structural win generalizes across frontends.
+
+### 24b. Own-evidence OOD validation + the feature-consistency lesson (2026-07-12)
+
+| same-evidence cell | own-head peak-pick | filter(own) | delta |
+|---|---|---|---|
+| honest val | 0.896 | 0.917-0.922 | +0.02 (both seeds) |
+| fold-honest SMC | 0.500 | 0.543 | +0.043 (edge doubles on weak evidence) |
+| GTZAN (final0 features = MISMATCHED) | 0.428 | 0.381 | -0.047 (confounded) |
+
+GTZAN cell is a double distribution shift: head AND model trained on fold-checkpoint features,
+evaluated on final0 features. The 10k-param head collapses under the shift (0.896 -> 0.428; BT's
+own head scores 0.893 on the same songs), and structure amplifies bad+shifted evidence (the
+KAPPA2-on-fold-honest-SMC pattern again). Re-extraction of GTZAN with fold0 features running;
+matched-features re-test to follow.
+LESSON (also a MIREX-submission requirement): ONE checkpoint family end-to-end -- the features
+the head/model trained on must be the features at inference. Measured cost of violating: -0.47
+evidence quality.
+
+## 25. MERT layer probe (2026-07-12): rhythm peaks mid-stack; layer 6 adopted
+
+Per-layer ActivationHead curves (300-song corpus subset + all SMC; relative ordering is the
+signal): corpus val peaks at LAYER 6 (0.643), plateau 3-8, top layer 12 only 0.567 (-0.076),
+layer 0 0.525. SMC nearly flat (~0.33) and peaks at the same layer 6 -- NO evidence that SMC
+prefers different/complementary layers (user hypothesis not supported at single-layer level);
+SMC is uniformly hard for MERT features at this scale. Decision: deterministic layer-6
+re-extraction (mert_l6_train_rich, running); layer-weighted combination deferred (no
+cross-layer complementarity signal); optional plateau-concat (4+6+8) arm later.
+Context: BeatFM aggregates multi-level FM features (their channel attention) -- consistent with
+mid-stack rhythm; our top-layer default cost ~0.08 F and plausibly the MERT posterior collapse.
+
+## 26. Wave-2 battery + HARMONIX QUARANTINE (2026-07-12 evening)
+
+Re-anchored per-dataset baselines (421-song val) exposed harmonix as MISALIGNED, not hard:
+BT-pp 0.371 on mainstream pop is impossible; per-song act2-peakpick spreads 0.00-0.98 with 50%
+<0.3 = per-song offsets (YouTube-re-downloaded audio vs original annotation timelines). ACTION:
+722 train + 94 val harmonix records QUARANTINED (cache/acts/quarantine_harmonix*); wave-2 s0
+killed and relaunched on the clean 2,287-song corpus; wave-2 evidence head must be retrained
+post-quarantine (its 0.724 own-pp ALL row was trained WITH poisoned labels). Recovery path
+(later): estimate per-song offset by cross-correlating act2 with annotation grid; realign or drop.
+
+Battery gems (clean rows): own head BEATS BT's 16-dataset head on every expressive domain it
+trained on -- ASAP 0.603 vs 0.507, rwc_classical 0.671 vs 0.620, rwc_jazz 0.696 vs 0.672.
+Wave-2 data pays exactly where aimed. MERT-v2 (layer 6): phase KL ALIVE at step 300 (224 vs
+v1's ~45) -- the posterior-collapse fix is holding so far.

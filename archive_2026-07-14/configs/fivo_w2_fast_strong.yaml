@@ -1,0 +1,26 @@
+# Faster strong FIVO: 512-frame crops (halves per-step time vs 1024) with the STRONGER dose
+# (weight 0.5, ELBO floor 0.15) that the weak w0.1 run lacked. Snapshots every 300 so we capture
+# and eval pre-collapse checkpoints -- the FIRST snapshot (step 300) gives an early deployment read.
+seed: 0
+frontend: beat_this
+model: {hidden_size: 64, num_meters: 4, emission: parametric, transition_correction_scale: 0.5}
+objective:
+  free_bits_nats_per_frame: 0.3
+  prior_preserving_free_bits: true
+  tempo_slope_weight: 0.5
+  meter_ce_weight: 0.1
+  fivo_weight: 0.5
+  fivo_num_particles: 16
+  fivo_elbo_anneal_steps: 400
+  fivo_elbo_floor: 0.15
+training:
+  train_feature_dir: cache/acts/foldhonest_train_rich
+  val_feature_dir: cache/acts/foldhonest_val_rich
+  steps: 2000
+  batch_size: 24
+  crop_frames: 512
+  learning_rate: 1.0e-3
+  save_path: checkpoints/fivo_fast_strong_s0.pt
+  snapshot_every_steps: 300
+  log_every_steps: 50
+filter: {num_particles: 800, observation_temperature: 3.0, proposal_tempo_sigma_scale: 0.01, proposal_phase_concentration_scale: 50.0, downbeat_evidence_weight: 3.0, stratified_gauge_init: true}

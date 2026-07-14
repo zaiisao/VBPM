@@ -1,0 +1,28 @@
+# Tutorial section-7 encoder-only fork on the MERT lane: q(z|x) with a fixed physical prior.
+# The posterior never sees events (x_only_posterior), the prior transition scales are pinned to
+# physical values (fixed_prior_scales) and the learned correction is off -- so the trained
+# inference net IS the deployment net, gap-free by construction. Deployment metric = recog read-out.
+frontend: mert_v1_95m
+seed: 0
+
+model:
+  hidden_size: 64
+  num_meters: 4
+  emission: parametric
+  transition_correction_scale: 0.0
+  fixed_prior_scales: [0.005, 99.0]
+  x_only_posterior: true
+
+objective:
+  free_bits_nats_per_frame: 0.3
+  prior_preserving_free_bits: true
+  tempo_slope_weight: 0.5
+  meter_ce_weight: 0.1
+
+training:
+  steps: 2000
+  batch_size: 32
+  crop_frames: 1024
+  train_feature_dir: cache/acts/mert_l6_train_rich
+  val_feature_dir: cache/acts/mert_l6_val_rich
+  save_path: checkpoints/mert_xonly_s0.pt

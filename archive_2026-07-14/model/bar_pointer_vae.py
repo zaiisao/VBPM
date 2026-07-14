@@ -44,6 +44,9 @@ class RolloutResult:
     kl_phase_pg: torch.Tensor | None = None
     kl_tempo_pg: torch.Tensor | None = None
     meter_logits: torch.Tensor | None = None   # [batch, frames, K] posterior logits (meter emission)
+    # Prior transition scales along the rollout (for the tutorial's eq-27 physical anchoring):
+    prior_tempo_scales: torch.Tensor | None = None       # [batch, frames-1]
+    prior_phase_concentrations: torch.Tensor | None = None  # [batch, frames-1]
 
 
 class TransformerContext(nn.Module):
@@ -272,6 +275,7 @@ class VariationalBarPointerModel(nn.Module):
 
         phase_frames, log_tempo_frames, meter_frames = [bar_phase], [log_tempo], [meter]
         meter_logits_frames = [meter_logits]
+        prior_sigma_frames, prior_conc_frames = [], []
         latent_features = [self.latent_feature_vector(meter, bar_phase, log_tempo)]
 
         # ---- frames 1..T-1: transitions + per-frame KLs ----
@@ -291,6 +295,8 @@ class VariationalBarPointerModel(nn.Module):
             if compute_kl:
                 prior_phase_concentration = self.prior_phase_concentration(prior_context[:, frame_index])
                 prior_log_tempo_std = self.prior_tempo_sigma(prior_context[:, frame_index])
+                prior_sigma_frames.append(prior_log_tempo_std)
+                prior_conc_frames.append(prior_phase_concentration)
                 # g-prior: bounded audio corrections of the transition MEANS (zero when disabled --
                 # then the two KLs below are the exact faithful transitions).
                 delta_phase, delta_log_tempo = self.transition_mean_corrections(
@@ -341,7 +347,9 @@ class VariationalBarPointerModel(nn.Module):
             event_logits=event_logits,
             kl_meter=kl_meter, kl_phase=kl_phase, kl_tempo=kl_tempo,
             kl_meter_pg=kl_meter_pg, kl_phase_pg=kl_phase_pg, kl_tempo_pg=kl_tempo_pg,
-            meter_logits=torch.stack(meter_logits_frames, dim=1))
+            meter_logits=torch.stack(meter_logits_frames, dim=1),
+            prior_tempo_scales=(torch.stack(prior_sigma_frames, dim=1) if prior_sigma_frames else None),
+            prior_phase_concentrations=(torch.stack(prior_conc_frames, dim=1) if prior_conc_frames else None))
 
     # ---- the PREDICTION pipeline (Sohn et al. 2015): z from the prior network only, never y ----
     def rollout_prior(self, features, gumbel_temperature=0.5, sample=True):

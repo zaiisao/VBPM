@@ -1,0 +1,216 @@
+% Compile with XeLaTeX (needs a CJK font for the quoted Korean sentences).
+% If XeLaTeX/kotex is unavailable, replace the \korean{...} quotes with their English glosses.
+\documentclass[11pt]{article}
+\usepackage{kotex}          % Korean support; use xelatex
+\usepackage{amsmath, amssymb}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\newcommand{\korean}[1]{\textit{#1}}
+\title{A Sentence-by-Sentence Self-Analysis of My Claims\\
+on the Tractability of the Bar-Pointer Latent Variable Model}
+\author{Jaehoon Ahn}
+\date{Prepared in response to Prof.\ Jung's tractability tutorial}
+\begin{document}
+\maketitle
+
+\section*{0. Purpose and the single most important concession}
+
+Professor, you asked me to quote each of my own sentences and analyze, precisely, why each is
+right or wrong---using the framework in your tutorial. I take that seriously, so I have checked
+every sentence against Definition~2.1 (tractability $=$ polynomial-time marginal likelihood) and
+the five mechanisms of Section~2.5.
+
+Before anything else, the one concession that I believe is the true root of my error:
+
+\begin{quote}
+I repeatedly wrote or implied ``\emph{the latent is low-dimensional, therefore exact inference is
+possible.}'' \textbf{This causal step is wrong, and you are right to reject it.} Low dimensionality
+is only what makes \emph{discretization feasible}; it is a \emph{necessary} condition for one route
+to tractability, never a \emph{sufficient} one. The sufficient condition is \emph{structural}:
+Markov transitions $+$ factorized emissions (your Mechanism~3), or linear-Gaussian structure (your
+Mechanism~4), etc. I collapsed ``low-dimensional'' and ``tractable'' into one idea. They are not one
+idea. This is the misconception, stated plainly.
+\end{quote}
+
+The rest of this note does two things. First (Sec.~2) it re-derives which structural property each
+of my sentences actually depends on. Second, and this is the crux, it shows that the truth value of
+my central sentences is \emph{not} a matter of opinion but of \emph{one checkable fact about the
+generative model}: whether its transition is Markov and its emission factorized. I state that
+criterion here, in your framework, and commit to verifying it in the code line-by-line (Sec.~4). I
+do not assert the answer in this document, because I have not yet finished reading every line, and
+you are right that this must be established from the code, not asserted.
+
+\section*{1. The framework, in my own words (to show I have absorbed it)}
+
+For a latent-variable model $p_\theta(z,x)=p_\theta(x\mid z)\,p_\theta(z)$, tractability is the
+ability to compute the marginal likelihood
+\[
+  p_\theta(x)=\int p_\theta(x\mid z)\,p_\theta(z)\,dz
+\]
+in time polynomial in $(K,d,T,N)$ (Def.~2.1). Writing down the numerator pointwise is trivial and
+irrelevant; the content is the \emph{normalizer}. Everything downstream (posterior evaluation,
+EM's E-step, sampling) follows from having $p_\theta(x)$.
+
+The two mechanisms that matter for our discussion:
+\begin{description}[leftmargin=1.4em]
+\item[Mechanism 3 (Sec.~2.5.3).] If $z$ is discrete with \emph{Markov} structure and \emph{factorized}
+emissions, the $K^{T}$-term sum collapses to $O(TK^2)$ by forward--backward. Discreteness alone is
+not enough; the sum collapses \emph{because} of Markov $+$ factorized structure. This is exactly the
+distinction you draw between ``expressible'' and ``computable'' (Sec.~2.5.3, the note after Eq.~7).
+\item[Mechanism 4 (Sec.~2.5.4).] A $Td$-dimensional linear-Gaussian sequence is tractable by the
+Kalman recursions---\emph{high}-dimensional yet tractable. This is your decisive refutation of
+``low-dimensional $\Rightarrow$ tractable,'' and I accept it without reservation.
+\end{description}
+
+The four-stage progression is the key organizing device, and I now use \emph{your} labels:
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Stage 1:} discrete state, \emph{Markov} transition, \emph{factorized} emission
+$\Rightarrow$ Mechanism 3 $\Rightarrow$ tractable (EM/Baum--Welch, Viterbi). This is madmom/Krebs.
+\item \textbf{Stage 2--3:} a Transformer \emph{inside the latent prior or the emission} breaks
+factorization (Stage 2) or the Markov property of the \emph{latent} chain (Stage 3).
+\item \textbf{Stage 4:} continuous $(\varphi,v)$ \emph{on top of} the Stage-3 Transformer prior and
+Transformer emission $\Rightarrow$ intractable; VAE machinery is then a technical necessity.
+\end{itemize}
+
+\section*{2. Sentence-by-sentence analysis}
+
+For each sentence I give: the verdict, and the structural property it depends on.
+
+\paragraph{S1. \korean{``이 모델은 HMM이 아니다; HMM이라 부른 적도 없다.''}}
+(``This model is not an HMM.'') \textbf{Correct as stated.} A continuous-state model is literally not
+an HMM (HMMs have finite discrete states). This is a true factual statement and carries no claim
+about tractability by itself.
+
+\paragraph{S2. \korean{``$z$가 continuous이므로 정확 추론은 여전히 intractable하다.''}}
+\textbf{Correct---and it is a concession in your favor.} With a wrapped/von~Mises transition and a
+cosine-bump (nonlinear) emission, the continuous posterior is neither conjugate (Mech.~1 fails) nor
+linear-Gaussian (Mech.~4 fails). So exact inference \emph{on the continuous latent} is intractable.
+I agree.
+
+\paragraph{S3. \korean{```Viterbi 돌릴 만큼 단순하다'는 과장이었지만 일리는 있다.''}}
+\textbf{Correct/calibrated, with one clarification I owe you.} The clarification: for \emph{training}
+the relevant object is the forward algorithm (the marginal likelihood, Mech.~3); Viterbi is the
+\emph{deployment-time} decoder. My shorthand ``Viterbi'' conflated the two. I was \emph{not}
+confusing training with inference conceptually---my intended claim was ``the posterior is tractable,
+hence trainable by an EM-type exact-likelihood method rather than by ELBO/VAE,'' which is precisely
+your own dichotomy (your message, point~1). But the word ``Viterbi'' was the wrong token for
+``forward algorithm,'' and I accept the correction.
+
+\paragraph{S4. \korean{``잠재공간이 저차원적이다.''}}
+\textbf{Correct about the per-frame state} $(\varphi,v,m)\in\mathbb{R}^2\times\{2,\dots,7\}$, which is
+what makes per-state discretization into $K$ bins feasible. Your \S8.2 nuance (the \emph{sequence}
+latent is $3T$-dimensional) is true but does not falsify S4, because no one discretizes the $3T$-dim
+sequence space directly---that would be $K^T$. Under Mechanism 3 one discretizes the \emph{per-frame}
+state and lets forward--backward handle $T$ in $O(TK^2)$. So the relevant quantity is exactly the
+per-frame dimension, and it is low. (But per S0, low dimension alone proves nothing; it only enables
+the discretization \emph{route}.)
+
+\paragraph{S5. \korean{``phase/tempo/meter는 이미지 잠재보다 천만 배 단순하다.''}}
+\textbf{The factual content is correct} (3 physical dimensions vs.\ hundreds/thousands for image
+latents; ``천만 배'' is rhetorical). \textbf{The \emph{implication} I attached to it was wrong}: I
+used it to suggest tractability, which is the S0 error. Restated correctly: the low per-frame
+dimension makes the \emph{discretization route} available; whether that route yields tractability
+still requires the structural condition (Mech.~3).
+
+\paragraph{S6 (the crux). \korean{``지금 설계된 모델은 HMM은 아니지만, 이산화만 하면 HMM으로
+축소 가능하다. Image VAE에서는 성립하지 않는다.''}}
+\textbf{This sentence is conditionally true, and the condition is a checkable property of the
+generative model---not a matter of opinion.} Precisely:
+\begin{itemize}[leftmargin=1.4em]
+\item \emph{If} the generative model is Stage-1-structured---transition
+$p(z_t\mid z_{t-1}, h_t)$ that is Markov in $z$ (where $h_t$ is a fixed function of the
+\emph{observed} audio $x$, not of the latent $z$), and emission $p(b_t\mid z_t)$ that is per-frame
+factorized---\emph{then} discretizing $(\varphi,v)$ yields a genuine (time-inhomogeneous,
+input-conditioned) HMM, and Mechanism 3 applies. S6 is \emph{true}.
+\item \emph{If} the generative model is Stage-3/4---a Transformer \emph{prior over the latent
+sequence} $z_{1:T}$ (non-Markov in $z$) or a Transformer \emph{emission} attending over $z_{1:T}$
+(non-factorized)---\emph{then} your \S8.1 is exactly right: discretizing $(\varphi,v)$ recovers only
+the discrete \emph{state space} while leaving the non-Markov/non-factorized structure intact, so it
+does \emph{not} give an HMM. S6 is \emph{false}.
+\end{itemize}
+The image-VAE half of S6 is unconditionally correct for a separate reason: an image latent of
+hundreds of dimensions cannot be gridded at all ($K^{\text{hundreds}}$), so the discretization route
+is unavailable regardless of structure.
+
+\medskip
+\noindent\textbf{Therefore the entire disagreement reduces to one question about my code:}
+\emph{is the transition Markov in $z$ (conditioned on audio-derived context), and is the emission
+per-frame factorized?} I believe the \emph{design intent} is the Stage-1 structure---the Transformer
+in the model processes the \emph{audio} $x$ into a context sequence $h_{1:T}$, and the latent
+transition consumes $h_t$ and $z_{t-1}$ only---which would make the model an input-conditioned
+Stage-1 model rather than a Stage-4 model. But I have not yet audited every line, and you are right
+that this must be established from the implementation, not from my description. Section~4 is my
+verification plan.
+
+\paragraph{S7. \korean{``exact inference가 가능하면 VAE를 쓸 이유가 없다; VAE는 $p(z|x)$가
+intractable일 때의 기법이다.''}}
+\textbf{The conclusion is correct and is your own point 4}: the VAE (ELBO $+$ amortized encoder)
+exists to approximate an \emph{intractable} posterior; where exact inference is available, EM-type
+exact-likelihood training is the appropriate tool (GMM is the canonical example you cite). \textbf{The
+one weak link is the antecedent} ``because the latent is low-dimensional, exact inference is
+possible''---the S0 error again. Corrected: ``\emph{if} the model is Stage-1-structured (Mech.~3),
+exact inference is possible, and then a VAE is unnecessary.''
+
+\paragraph{S8. \korean{``이미지 VAE의 잠재공간은 학습 후에야 정의되지만, bar-pointer의 잠재는
+이미 well-defined 물리량이다.''}}
+\textbf{True as an observation, and I accept your correction about its scope.} You are right (\S2.6,
+your point 2) that physical meaning is \emph{orthogonal to tractability}: an image VAE and a
+neurally-parameterized bar-pointer VAE can both be intractable. So S8 is \emph{not} a tractability
+argument, and I should not have deployed it as one. Its correct role is narrower and separate: it
+explains why the \emph{encoder} is less essential---in an image VAE the latent semantics must be
+\emph{discovered} by training, whereas here the latent targets are pre-specified, so there is nothing
+for a recognition network to ``invent.'' That is a statement about the encoder's necessity, not
+about the marginal likelihood.
+
+\section*{3. Consolidated: exactly where I was wrong}
+
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Dimension $\Rightarrow$ tractability (S5, S7 antecedent, and the spirit of S4/S6).}
+The genuine misconception. Tractability needs \emph{structure} (Mech.~3 or 4), not smallness. Your
+Kalman example (Mech.~4: 1000-dim, tractable) is the clean disproof and I accept it fully.
+\item \textbf{``Viterbi'' as shorthand for the training objective (S3).} The training object is the
+forward algorithm / marginal likelihood; Viterbi is deployment decoding. Sloppy tokenization on my
+part.
+\item \textbf{Using physical meaning as a tractability argument (S8).} It is orthogonal to
+tractability; it bears only on the encoder's necessity.
+\end{enumerate}
+
+\section*{4. What is \emph{not} settled by opinion, and my verification plan}
+
+Sentences S1--S5, S7, S8 are settled above on their own terms. The crux, S6, is settled \emph{only}
+by a property of the code, and I will not claim it until I have verified it. The criterion, stated in
+your framework, is a two-part checklist:
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Markov test.} In the generative prior, does $z_t$ depend on $z_{1:t-1}$, or only on
+$z_{t-1}$ and an audio-derived context $h_t=f(x)$? Only the latter is Markov-in-$z$ (Stage 1); the
+former is Stage 3. (Conditioning the transition \emph{parameters} on all of $x$ via a bidirectional
+$h$ does not break Markov-in-$z$; it is an input-conditioned HMM.)
+\item \textbf{Factorization test.} Does the emission $p(b_t\mid\cdot)$ read only $z_t$, or does it
+attend over $z_{1:T}$? Only the former is factorized (Stage 1).
+\end{enumerate}
+I will audit \texttt{rollout\_prior} and the emission module line-by-line against this checklist and
+report which stage the implementation actually realizes. If it is Stage 1, S6 is true and Mechanism 3
+applies; if a Transformer sits inside the latent prior/emission, S6 is false and your \S8.1 stands.
+As an \emph{independent} empirical check of the same fact, I will run the forward algorithm
+(Mechanism 3's own algorithm) on the model: if it computes a well-defined marginal likelihood and
+trains the model, the generative structure is necessarily Markov$+$factorized, because forward
+algorithm is not merely inefficient but \emph{ill-defined} on a Stage-4 model. (I will present those
+numbers separately, after the code audit, so that the argument here rests on structure, not on
+results.)
+
+\section*{5. Agreement on the path forward}
+
+Your proposed plan---formulate the bar-pointer model as a Stage-1 HMM, train its parameters by EM,
+publish that, and \emph{then} extend toward the VAE---is, I think, exactly right, for the reason this
+note makes precise: Stage~1 is the tractable regime (Mech.~3), and it is where exact-likelihood
+training lives. I would like to build it in that order. Implementing Stage~1 with EM will also be the
+cleanest way for me to internalize, at the level of code, the distinction between ``discrete state''
+and ``Markov$+$factorized structure'' that I blurred---which is the concept I most need to solidify.
+
+\medskip
+\noindent I am aware these are not easy ideas and that my probability/statistics vocabulary has been
+imprecise. I am treating that as a gap to close, not a verdict. Thank you for writing the tutorial;
+using its framework to check my own sentences is the exercise that finally located my error precisely
+(Sec.~3), which no amount of back-and-forth in text had done.
+
+\end{document}

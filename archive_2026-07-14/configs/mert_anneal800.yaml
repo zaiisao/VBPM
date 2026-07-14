@@ -1,0 +1,13 @@
+# MERT-v2: layer-6 features (rhythm peaks mid-stack; layer probe 2026-07-12).
+seed: 0
+frontend: mert_v1_95m
+model:
+  num_meters: 4
+training:
+  train_feature_dir: cache/acts/mert_l6_train_rich
+  val_feature_dir: cache/acts/mert_l6_val_rich
+  steps: 800
+  save_path: checkpoints/mert_anneal800.pt
+
+objective:
+  kl_warmup_steps: 400

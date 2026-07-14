@@ -1,0 +1,11 @@
+# First MERT arm: self-supervised frontend (no beat supervision anywhere upstream of the ELBO).
+# No act2 in these caches -> filter eval skipped until an activation head is trained.
+seed: 0
+frontend: mert_v1_95m
+model:
+  num_meters: 4
+training:
+  train_feature_dir: cache/acts/mert_train_rich
+  val_feature_dir: cache/acts/mert_val_rich
+  steps: 2000
+  save_path: checkpoints/mert_s0.pt

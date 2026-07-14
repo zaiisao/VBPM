@@ -30,7 +30,7 @@ from model.latents import TWO_PI, sample_wrapped_cauchy
 def run_particle_filter(model, features, observations, num_particles=800, ess_fraction=0.5,
                         observation_temperature=3.0, proposal_tempo_sigma_scale=0.01,
                         proposal_phase_concentration_scale=50.0, downbeat_evidence_weight=3.0,
-                        stratified_gauge_init=True):
+                        stratified_gauge_init=True, observation_outlier_epsilon=0.0):
     """Filter ``observations`` [num_frames, 2] (frontend beat/downbeat probabilities in [0,1] --
     available at test time, so this needs no ground truth anywhere) through ``model``'s trained
     prior dynamics, scoring each particle with the trained z-only emission as soft Bernoulli
@@ -66,6 +66,14 @@ def run_particle_filter(model, features, observations, num_particles=800, ess_fr
     downbeat_activation = torch.zeros(num_frames, device=device)
 
     channel_weights = torch.tensor([1.0, downbeat_evidence_weight], device=device)
+    if observation_outlier_epsilon > 0.0:
+        # Robust observation model: mix the frontend probabilities with a uniform outlier
+        # component -- p' = (1-eps) p + eps/2 -- so a CONFIDENT-BUT-WRONG spike (p ~ 1 at a wrong
+        # location) has bounded log-likelihood pull instead of dragging the ensemble off phase.
+        # A spec choice of the observation model (the frontend is sometimes just wrong), not a
+        # loss change; the direct counter to the blind-spot paper's miscalibrated-evidence regime.
+        observations = ((1.0 - observation_outlier_epsilon) * observations
+                        + observation_outlier_epsilon / 2.0)
 
     def emission_log_likelihood(t):
         logits = model.event_decoder(model.decoder_input(
@@ -124,6 +132,84 @@ def run_particle_filter(model, features, observations, num_particles=800, ess_fr
             "map_beats_per_bar": map_beats_per_bar,   # MAP particle's majority meter (soft latent)
             "beat_activation": beat_activation.cpu().numpy(),
             "downbeat_activation": downbeat_activation.cpu().numpy()}
+
+
+def fivo_bound(model, features, observations, num_particles=16, observation_temperature=3.0,
+               downbeat_evidence_weight=3.0, gumbel_temperature=0.5):
+    """Filtering Variational Objective (Maddison et al. 2017): the log of the bootstrap particle
+    filter's marginal-likelihood estimate, DIFFERENTIABLE, batched over songs. Maximizing it trains
+    the model + proposal so the FILTER's estimate is good -- i.e. it optimizes the exact deployment
+    computation, closing the train/deploy gap that free bits / prior anchoring cannot reach.
+
+    Resample-every-step bootstrap variant (proposal = the prior transition, so the incremental
+    importance weight is the emission likelihood). Ancestor indices are detached at resampling
+    (standard biased-but-workable FIVO gradient); the pathwise gradient flows through the
+    reparameterized phase (wrapped-Cauchy) / tempo (Laplace) / soft-meter (gumbel) samples and the
+    emission. Returns [batch] log-marginal-likelihood estimates (higher = better; loss = -mean).
+
+    ``observations`` [batch, frames, 2] are the test-time frontend evidence (NOT ground truth).
+    Use a SMALL num_particles in training (16-32); deployment still uses 800.
+    """
+    from model.bar_pointer_vae import predicted_phase_mean
+    B, T, _ = features.shape
+    N = num_particles
+    device = features.device
+    context = model.prior_context_projection(model.prior_encoder(features))          # [B, T, H]
+    phase_conc_all = model.prior_phase_concentration(context)                          # [B, T]
+    sigma_all = model.prior_tempo_sigma(context)                                       # [B, T]
+    channel_weights = torch.tensor([1.0, downbeat_evidence_weight], device=device)
+    beats_per_class = torch.arange(1, model.num_meters + 1, device=device).float()
+
+    def emission_ll(t, phase, log_tempo, meter):
+        logits = model.event_decoder(model.decoder_input(
+            model.latent_feature_vector(meter, phase, log_tempo)))                     # [B, N, 2]
+        obs_t = observations[:, t, :].unsqueeze(1).expand(B, N, 2)
+        bce = F.binary_cross_entropy_with_logits(logits, obs_t, reduction="none")
+        return -observation_temperature * (bce * channel_weights).sum(dim=-1)          # [B, N]
+
+    def resample(log_w, tensors):
+        # systematic resampling per batch row; indices detached (values keep their graph)
+        w = torch.softmax(log_w, dim=1)
+        pos = (torch.rand(B, 1, device=device) + torch.arange(N, device=device)) / N   # [B, N]
+        idx = torch.searchsorted(w.cumsum(1).clamp(max=1.0), pos).clamp(max=N - 1)      # [B, N]
+        out = []
+        for x in tensors:
+            if x.dim() == 3:
+                out.append(torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.shape[-1])))
+            else:
+                out.append(torch.gather(x, 1, idx))
+        return out
+
+    packed = model.initial_prior_head(context.mean(dim=1))
+    meter_logits, phase_mean, phase_conc0, log_tempo_mean, log_tempo_std = \
+        model.unpack_distribution_parameters(packed)
+    phase = sample_wrapped_cauchy(phase_mean.unsqueeze(1).expand(B, N), phase_conc0.unsqueeze(1))
+    log_tempo = Laplace(log_tempo_mean.unsqueeze(1).expand(B, N),
+                        log_tempo_std.unsqueeze(1)).rsample().clamp(-10.0, 3.0)
+    meter = F.gumbel_softmax(meter_logits.unsqueeze(1).expand(B, N, -1), tau=gumbel_temperature, dim=-1)
+
+    log_estimate = torch.zeros(B, device=device)
+    log_w = emission_ll(0, phase, log_tempo, meter)
+    log_estimate = log_estimate + torch.logsumexp(log_w, dim=1) - math.log(N)
+    phase, log_tempo, meter = resample(log_w, [phase, log_tempo, meter])
+
+    for t in range(1, T):
+        prev_phase, prev_log_tempo, prev_meter = phase, log_tempo, meter
+        ctx_t = context[:, t].unsqueeze(1).expand(B, N, -1)
+        delta_phase, delta_log_tempo = model.transition_mean_corrections(
+            ctx_t, model.latent_feature_vector(prev_meter, prev_phase, prev_log_tempo), prev_log_tempo)
+        log_tempo = Laplace(prev_log_tempo + delta_log_tempo,
+                            sigma_all[:, t].unsqueeze(1).expand(B, N)).rsample().clamp(-10.0, 3.0)
+        predicted = (predicted_phase_mean(prev_phase, prev_log_tempo) + delta_phase) % TWO_PI
+        phase = sample_wrapped_cauchy(predicted, phase_conc_all[:, t].unsqueeze(1).expand(B, N))
+        trans_logits = model.meter_transition_log_probabilities(
+            prev_meter.reshape(B * N, -1), phase.reshape(B * N), prev_phase.reshape(B * N),
+            ctx_t.reshape(B * N, -1)).reshape(B, N, -1)
+        meter = F.gumbel_softmax(trans_logits, tau=gumbel_temperature, dim=-1)
+        log_w = emission_ll(t, phase, log_tempo, meter)
+        log_estimate = log_estimate + torch.logsumexp(log_w, dim=1) - math.log(N)
+        phase, log_tempo, meter = resample(log_w, [phase, log_tempo, meter])
+    return log_estimate
 
 
 def untrained_control_model(feature_dim=512, hidden_size=64, num_meters=4, seed=0,

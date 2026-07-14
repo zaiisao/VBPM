@@ -18,6 +18,8 @@ objective:
   meter_ce_weight: 0.1
 
 training:
+  train_feature_dir: cache/acts/foldhonest_train_rich   # fold-honest ONLY (enforced by the loader)
+  val_feature_dir: cache/acts/foldhonest_val_rich       # fold 7, held out by its extractor
   steps: 2000
   batch_size: 32
   crop_frames: 1024
