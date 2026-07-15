@@ -3,7 +3,7 @@
 Self-contained: it calls the official madmom DBNDownBeatTrackingProcessor directly and formats the
 input with the standard decorrelation convention (Boeck et al.):
 
-    combined = [ max(beat - downbeat, floor),  downbeat ]
+    decorrelated = [ max(beat - downbeat, floor),  downbeat ]
 
 Why decorrelate: madmom's downbeat observation model computes the "no-beat" log-density as roughly
     log( (1 - (beat + downbeat)) / normalizer ),
@@ -33,6 +33,17 @@ matter:
   Beat Transformer = input_form="logit", bounding="none"
   our prob cache   = input_form="prob",  bounding="clip"    (the defaults)
 
+We deliberately leave madmom's OWN defaults untouched, because Beat This and Beat Transformer also
+call the processor with them -- so R0-as-published includes all three. They are decode heuristics
+wrapped around the DBN, and R1 implements none of them:
+    num_tempi=60    a coarser log-spaced tempo grid (vs all 71 integer intervals here)
+    threshold=0.05  crop to the main above-threshold segment before decoding
+    correct=True    report the activation peak inside a beat region, not the region entry
+Measured on our val set they are worth ~+0.006 beat F over the bare model, almost all of it
+threshold=0.05 cropping fade-in/fade-out -- which only the Ballroom subset has (74/85 songs; every
+other dataset ~0%). correct=True actually costs us -0.0014. So the R1-vs-R0 gap is these heuristics,
+not our inference: against a MATCHED madmom, R1 decodes an identical Viterbi path.
+
 fps: REQUIRED and frontend-specific -- a property of the activations, never a global constant, and a
 wrong fps mis-scales every DBN tempo. Pass record['fps'] from the cache. Native rates differ by model
 (Beat This 50, MERT ~75, WaveBeat 172.27); our cache currently interpolates every frontend up to 86.13
@@ -42,12 +53,14 @@ is cached at its own native rate.
 import numpy as np
 from madmom.features.downbeats import DBNDownBeatTrackingProcessor
 
+DOWNBEAT_POSITION_IN_BAR = 1        # madmom counts bar positions naturally: 1 = downbeat
 
-def _to_numpy(x) -> np.ndarray:
+
+def _to_numpy(array_like) -> np.ndarray:
     """Accept a numpy array or a (possibly CUDA) torch tensor."""
-    if hasattr(x, "detach"):
-        x = x.detach().cpu().numpy()
-    return np.ascontiguousarray(np.asarray(x, dtype=np.float64))
+    if hasattr(array_like, "detach"):
+        array_like = array_like.detach().cpu().numpy()
+    return np.ascontiguousarray(np.asarray(array_like, dtype=np.float64))
 
 
 class MadmomDBN:
@@ -78,7 +91,7 @@ class MadmomDBN:
         self.input_form = input_form
         self.bounding = bounding
         self.eps = eps
-        self._dbn = DBNDownBeatTrackingProcessor(
+        self._madmom_dbn = DBNDownBeatTrackingProcessor(
             beats_per_bar=list(beats_per_bar),
             min_bpm=min_bpm,
             max_bpm=max_bpm,
@@ -86,40 +99,52 @@ class MadmomDBN:
             transition_lambda=transition_lambda
         )
 
-    def _bound(self, beat, downbeat):
+    def _bound(self, beat_activation, downbeat_activation):
         """Bound activations off exact 0/1 and return the decorrelation floor to pair with them."""
         eps = self.eps
-        
-        if self.bounding == "clip":
-            return np.clip(beat, eps, 1 - eps), np.clip(downbeat, eps, 1 - eps), eps
-        if self.bounding == "squeeze":
-            return beat * (1 - eps) + eps / 2, downbeat * (1 - eps) + eps / 2, eps / 2
-        
-        return beat, downbeat, 1e-12                                  # none (Beat Transformer; tiny floor for safety)
 
-    def decode(self, observations) -> dict:
-        """observations: [T, 2] activations (beat, downbeat), in the form given by input_form.
+        if self.bounding == "clip":
+            return (np.clip(beat_activation, eps, 1 - eps),
+                    np.clip(downbeat_activation, eps, 1 - eps), eps)
+        if self.bounding == "squeeze":
+            return (beat_activation * (1 - eps) + eps / 2,
+                    downbeat_activation * (1 - eps) + eps / 2, eps / 2)
+
+        # none (Beat Transformer); tiny floor for safety
+        return beat_activation, downbeat_activation, 1e-12
+
+    def decode(self, activations) -> dict:
+        """activations: [num_frames, 2] (beat, downbeat), in the form given by input_form.
 
         Returns {'beats': seconds[N], 'downbeats': seconds[M]} -- the common deployment interface
         every rung exposes; R0 fulfils it via madmom's joint bar-pointer DBN.
         """
-        obs = _to_numpy(observations)
-        if obs.ndim != 2 or obs.shape[1] < 2:
-            raise ValueError(f"expected [T, 2] activations (beat, downbeat), got {obs.shape}")
+        activations = _to_numpy(activations)
+        if activations.ndim != 2 or activations.shape[1] < 2:
+            raise ValueError(f"expected [num_frames, 2] activations (beat, downbeat), "
+                             f"got {activations.shape}")
 
-        beat, downbeat = obs[:, 0], obs[:, 1]
+        beat_activation, downbeat_activation = activations[:, 0], activations[:, 1]
         if self.input_form == "logit":
-            beat = 1.0 / (1.0 + np.exp(-beat))
-            downbeat = 1.0 / (1.0 + np.exp(-downbeat))
+            beat_activation = 1.0 / (1.0 + np.exp(-beat_activation))
+            downbeat_activation = 1.0 / (1.0 + np.exp(-downbeat_activation))
 
-        beat, downbeat, floor = self._bound(beat, downbeat)
-        combined = np.stack([np.maximum(beat - downbeat, floor), downbeat], axis=-1)   # sums <= 1
+        beat_activation, downbeat_activation, decorrelation_floor = self._bound(
+            beat_activation, downbeat_activation)
+        decorrelated_activations = np.stack(                             # columns now sum to <= 1
+            [np.maximum(beat_activation - downbeat_activation, decorrelation_floor),
+             downbeat_activation], axis=-1)
 
-        out = np.asarray(self._dbn(combined))                     # [M, 2] -> (time, position-in-bar)
-        beats = out[:, 0] if out.size else np.array([])
-        downbeats = out[out[:, 1] == 1, 0] if out.size else np.array([])
+        # madmom returns [num_beats, 2]: (time in seconds, position in bar)
+        beats_with_bar_positions = np.asarray(self._madmom_dbn(decorrelated_activations))
+        if not beats_with_bar_positions.size:
+            return {"beats": np.array([]), "downbeats": np.array([])}
 
-        return {"beats": np.asarray(beats), "downbeats": np.asarray(downbeats)}
+        beat_times = beats_with_bar_positions[:, 0]
+        is_downbeat = beats_with_bar_positions[:, 1] == DOWNBEAT_POSITION_IN_BAR
+        return {"beats": np.asarray(beat_times),
+                "downbeats": np.asarray(beats_with_bar_positions[is_downbeat, 0])}
+
 
 if __name__ == "__main__":
     import warnings
@@ -127,30 +152,34 @@ if __name__ == "__main__":
     # Smoke test: synthetic 120 BPM, 4/4, 10 s of PROBABILITY activations (beat channel fires on every
     # beat, downbeats included). Proves the wrapper runs end to end.
     fps = 50.0   # Beat This's native rate; the synthetic below mimics its channel form
-    T = int(round(10 * fps))
-    beat_period = fps * 60.0 / 120.0
-    obs = np.zeros((T, 2))
-    obs[:, 0], obs[:, 1] = 0.05, 0.02                    # distinct baselines (avoid exact-equal channels)
-    beat_frames = np.round(np.arange(0.0, T, beat_period)).astype(int)
-    beat_frames = beat_frames[beat_frames < T]
-    obs[beat_frames, 0] = 0.9
-    obs[beat_frames[::4], 1] = 0.92
+    num_frames = int(round(10 * fps))
+    beat_period_frames = fps * 60.0 / 120.0
+    activations = np.zeros((num_frames, 2))
+    activations[:, 0], activations[:, 1] = 0.05, 0.02    # distinct baselines (avoid equal channels)
+    beat_frames = np.round(np.arange(0.0, num_frames, beat_period_frames)).astype(int)
+    beat_frames = beat_frames[beat_frames < num_frames]
+    activations[beat_frames, 0] = 0.9
+    activations[beat_frames[::4], 1] = 0.92
 
-    out = MadmomDBN(fps=fps).decode(obs)
+    events = MadmomDBN(fps=fps).decode(activations)
     print(f"synthetic 120 BPM 4/4, 10 s (fps={fps:.1f}), probability activations (defaults):")
-    print(f"  detected beats:     {len(out['beats']):2d}   (expect ~20)")
-    print(f"  detected downbeats: {len(out['downbeats']):2d}   (expect ~5)")
-    if len(out["beats"]) > 1:
-        ibi = float(np.diff(out["beats"]).mean())
-        print(f"  mean inter-beat interval: {ibi:.3f}s  ->  {60.0 / ibi:.1f} BPM  (expect ~120)")
+    print(f"  detected beats:     {len(events['beats']):2d}   (expect ~20)")
+    print(f"  detected downbeats: {len(events['downbeats']):2d}   (expect ~5)")
+    if len(events["beats"]) > 1:
+        mean_inter_beat_interval = float(np.diff(events["beats"]).mean())
+        print(f"  mean inter-beat interval: {mean_inter_beat_interval:.3f}s  ->  "
+              f"{60.0 / mean_inter_beat_interval:.1f} BPM  (expect ~120)")
 
     # Verify the option matrix all runs and lands on ~the same answer (bounding is cosmetic; the logit
     # path recovers the probs via sigmoid). 'none' on prob input can hit log(0) -> harmless -inf.
-    logit_obs = np.log(np.clip(obs, 1e-6, 1 - 1e-6) / (1 - np.clip(obs, 1e-6, 1 - 1e-6)))
+    bounded = np.clip(activations, 1e-6, 1 - 1e-6)
+    logit_activations = np.log(bounded / (1 - bounded))
     print("\noption matrix (beats / downbeats -- should be ~equal across cells):")
     with np.errstate(divide="ignore", invalid="ignore"), warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        for form, src in (("prob", obs), ("logit", logit_obs)):
-            for bnd in ("clip", "squeeze", "none"):
-                r = MadmomDBN(fps=fps, input_form=form, bounding=bnd).decode(src)
-                print(f"  input_form={form:5s} bounding={bnd:7s} -> {len(r['beats']):2d} / {len(r['downbeats']):2d}")
+        for form, source_activations in (("prob", activations), ("logit", logit_activations)):
+            for bounding in ("clip", "squeeze", "none"):
+                events = MadmomDBN(fps=fps, input_form=form, bounding=bounding).decode(
+                    source_activations)
+                print(f"  input_form={form:5s} bounding={bounding:7s} -> "
+                      f"{len(events['beats']):2d} / {len(events['downbeats']):2d}")
