@@ -1,6 +1,6 @@
 """Bootstrap particle filter deployment for the VBPM -- the bar-pointer lineage's own inference
 (Whiteley, Cemgil & Godsill 2006; Hainsworth & Macleod 2004), sampled rather than discretized
-(madmom's DBN, Krebs/Boeck/Widmer 2015, is the grid branch of the same predict-correct recursion).
+(madmom's DBN, Krebs/Böck/Widmer 2015, is the grid branch of the same predict-correct recursion).
 
 Defaults are the FIXED 2026-07-10 deployment (docs/emission_sidechannel_report.md sections 9-12):
 physical proposal scales (the learned transition scales are inflated by the diagnosed side-channel
