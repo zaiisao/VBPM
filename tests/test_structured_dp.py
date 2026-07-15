@@ -1,6 +1,6 @@
 """Certify the structured bar-pointer DP against the dense DP on a small instance.
 
-The dense DP (common/inference) is already certified against hmmlearn AND torch-struct. Here we build
+The dense DP (rungs/bar_pointer/inference) is already certified against hmmlearn AND torch-struct. Here we build
 the SAME Krebs transition two ways -- structured (gather + [num_tempi, num_tempi] boundary mix) and
 dense [num_states, num_states] -- and check the forward LL and the MAP path agree. If they do, the
 structured version inherits the whole certificate chain, and we can use it at real scale where dense
@@ -14,9 +14,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, "/home/sogang/jaehoon/VBPM")
-from common.inference import forward_log_likelihood, viterbi
-from common.state_space import BarPointerStateSpace
-from common.structured_dp import StructuredBarPointerDP
+from rungs.bar_pointer.inference import forward_log_likelihood, viterbi
+from rungs.bar_pointer.state_space import BarPointerStateSpace
+from rungs.bar_pointer.structured_dp import StructuredBarPointerDP
 
 
 def main():

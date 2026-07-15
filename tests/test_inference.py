@@ -1,4 +1,4 @@
-"""Certify common/inference against TWO independent implementations.
+"""Certify rungs/bar_pointer/inference against TWO independent implementations.
 
   hmmlearn     -- an independent forward algorithm + Viterbi (numpy/Cython, sklearn-style)
   torch-struct -- an independent differentiable linear-chain DP (harvardnlp)
@@ -19,7 +19,7 @@ from hmmlearn.hmm import CategoricalHMM
 from torch_struct import LinearChainCRF
 
 sys.path.insert(0, "/home/sogang/jaehoon/VBPM")
-from common.inference import forward_log_likelihood, viterbi
+from rungs.bar_pointer.inference import forward_log_likelihood, viterbi
 
 
 def torch_struct_reference(log_initial_distribution, log_transition, log_emission):

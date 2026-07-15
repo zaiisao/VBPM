@@ -2,7 +2,7 @@
 
 WHAT THIS IS FOR. This dense form cannot run our real model and is not meant to: at our real state
 count (num_states=16756 at 4/4, 86.13 fps) a dense transition is 1.12 GB and 280,763,536 ops/frame,
-i.e. 4.4 trillion ops per 3-minute song. common/structured_dp.py is the engine; this file is the
+i.e. 4.4 trillion ops per 3-minute song. rungs/bar_pointer/structured_dp.py is the engine; this file is the
 plain-English statement of what that engine computes, and the oracle that certifies it
 (tests/test_structured_dp.py builds the same model both ways and compares).
 

@@ -3,7 +3,7 @@ or the ladder stops being a controlled comparison).
 """
 import numpy as np
 
-from common.state_space import BEAT, DOWNBEAT
+from rungs.bar_pointer.state_space import BEAT, DOWNBEAT
 
 
 def state_path_to_events(state_path, state_space, fps: float, snap_to_activations=None,
@@ -28,7 +28,7 @@ def state_path_to_events(state_path, state_space, fps: float, snap_to_activation
     pop/electronic it does nothing or slightly hurts.
 
     first_frame: offset added to every frame index before conversion to seconds -- pass the crop
-    offset when the activations were threshold-cropped (common/deployment.py).
+    offset when the activations were threshold-cropped (rungs/deployment.py).
     """
     position_classes = state_space.position_classes[np.asarray(state_path)]
     is_in_beat_region = position_classes >= BEAT

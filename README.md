@@ -22,15 +22,21 @@ experiments/.)
 ## Layout
 
 ```
+frontends/
+  __init__.py            # Frontend interface + decoder registry + Tracker (frontend x decoder glue)
+  beat_this.py           # wraps the OFFICIAL beat_this.inference.Audio2Frames (one script per frontend)
 rungs/
+  base.py                # the Rung contract: decode() -> events, coercion, Böck decorrelation
   r0_madmom_dbn.py       # Baseline A: the official madmom DBN + the standard decorrelation
   r1_handcrafted_hmm.py  # the same model rebuilt on our engine (the certificate rung)
-common/
-  state_space.py         # Krebs 2015 bar-pointer state space (interval i owns i states)
-  structured_dp.py       # THE ENGINE: exact forward + Viterbi, O(K + M*V^2)/frame, GPU, autograd
-  inference.py           # the readable dense reference the engine is certified against
-  readout.py             # MAP state path -> beat/downbeat times (shared by all rungs)
   deployment.py          # model-independent decode lessons (threshold crop), off by default
+  bar_pointer/           # the shared R1-R4 chassis (rungs change ONLY how factors are produced)
+    state_space.py       # Krebs 2015 bar-pointer state space (interval i owns i states)
+    structured_dp.py     # THE ENGINE: exact forward + Viterbi, O(K + M*V^2)/frame, GPU, autograd
+    inference.py         # the readable dense reference the engine is certified against
+    readout.py           # MAP state path -> beat/downbeat times (shared by all rungs)
+data/
+  songs.py               # live song catalog: official annotations + 8-fold splits + local audio
 tests/
   test_inference.py      # dense DP vs hmmlearn AND torch-struct (independent oracles)
   test_structured_dp.py  # structured engine vs dense DP + compact emission + gradient checks
@@ -40,8 +46,8 @@ tests/
 
 Nothing here is trusted by eye; every layer is machine-checked against something independent:
 
-1. `common/inference.py` (readable, textbook) ≡ **hmmlearn** ≡ **torch-struct** (LL to ~1e-14, paths exact)
-2. `common/structured_dp.py` (the engine) ≡ the dense reference (same model written out as a matrix)
+1. `rungs/bar_pointer/inference.py` (readable, textbook) ≡ **hmmlearn** ≡ **torch-struct** (LL to ~1e-14, paths exact)
+2. `rungs/bar_pointer/structured_dp.py` (the engine) ≡ the dense reference (same model written out as a matrix)
 3. R1 on the engine ≡ **madmom**: identical Viterbi path AND identical path score, 25/25 val songs —
    including {3,4} meter selection (25/25 same choice)
 4. R1 with madmom's shipped decode options (`num_tempi=60, threshold=0.05, correct=True`) ≡ R0
@@ -62,5 +68,12 @@ Environment: needs torch + madmom (+ hmmlearn/torch-struct/mir_eval for tests). 
 interpreter: `/home/sogang/mnt/db_2/anaconda3/envs/chart/bin/python` (madmom is a source checkout
 at `~/jaehoon/madmom`, built for py3.10 — the repo's own `.venv` is py3.8 and cannot import it).
 
-Activations are read from `cache/acts/*` records (`act2` [T,2] + `fps` + fold-honest targets);
-`fps` is a property of the cache record, never a constant.
+NO ACTIVATION CACHES (decision 2026-07-15): activations are computed live through `frontends/`,
+so there is exactly one code path from audio to activations and live == eval by construction. The
+old `cache/acts/*` records were produced by a second, retired pipeline (different chunking/padding;
+activations correlate ~0.97 with the live path, decodes agree to mean |dF| 0.005 — measured, but
+never certified). `data/songs.py` enumerates the data: 2,304 songs live (1,305 across
+ballroom/beatles/hainsworth/hjdb with official 8-fold assignments + 999 GTZAN test-only);
+run `python data/songs.py` for the coverage report, including which annotated datasets lack
+local audio. Fold-honesty: evaluate song `s` with checkpoint `fold{s.fold}`; GTZAN (fold None) is
+held out of every checkpoint. `fps` is a property of the frontend, never a constant.

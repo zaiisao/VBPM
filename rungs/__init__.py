@@ -9,6 +9,7 @@ so evaluate.py can score every rung identically.
     r4 ...          full neural HMM (MLP transition + emission)            [tractable]
     r5 ...          Transformer VAE-DBN (non-Markov prior + emission)      [INTRACTABLE -> ELBO]
 """
+from rungs.base import Rung
 from rungs.r0_madmom_dbn import MadmomDBN
 
-__all__ = ["MadmomDBN"]
+__all__ = ["Rung", "MadmomDBN"]

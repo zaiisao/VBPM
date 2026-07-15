@@ -18,14 +18,16 @@ Layout (mirrors madmom's BeatStateSpace / BarStateSpace):
 
 References
 ----------
-Krebs, Boeck & Widmer, "An Efficient State Space Model for Joint Tempo and Meter Tracking",
+Krebs, Böck & Widmer, "An Efficient State Space Model for Joint Tempo and Meter Tracking",
 ISMIR 2015 (state space + transition).
-Boeck, Krebs & Widmer, "Joint Beat and Downbeat Tracking with Recurrent Neural Networks",
+Böck, Krebs & Widmer, "Joint Beat and Downbeat Tracking with Recurrent Neural Networks",
 ISMIR 2016 (the {no-beat, beat, downbeat} observation classes).
 """
+from typing import Optional
+
 import numpy as np
 
-# The three Boeck 2016 observation classes. Every state emits via exactly one of them, so these index
+# The three Böck 2016 observation classes. Every state emits via exactly one of them, so these index
 # the columns of the [num_frames, 3] density array -- see rungs/r1_handcrafted_hmm.py.
 NO_BEAT = 0
 BEAT = 1
@@ -34,7 +36,8 @@ DOWNBEAT = 2
 
 class BarPointerStateSpace:
     def __init__(self, fps: float, min_bpm: float = 55.0, max_bpm: float = 215.0,
-                 beats_per_bar: int = 4, observation_lambda: int = 16, num_tempi: int = None):
+                 beats_per_bar: int = 4, observation_lambda: int = 16,
+                 num_tempi: Optional[int] = None):
         """num_tempi: None (default) models EVERY integer interval -- the exact model, and what the
         R1 certificate runs. An integer replicates madmom's shipped grid: log-spaced, quantized to
         unique integers (madmom's default is 60). Worth +0.002..+0.005 F in deployment; a model-
@@ -84,7 +87,7 @@ class BarPointerStateSpace:
                                                for beat in range(beats_per_bar)])
         self.state_interval_frames = np.tile(interval_of_each_state, beats_per_bar)
 
-        # --- Boeck 2016 observation classes over bar position (beat units) -----------------------
+        # --- Böck 2016 observation classes over bar position (beat units) -----------------------
         # A state counts as "on the beat" if it sits in the first 1/observation_lambda of a beat.
         beat_region_width = 1.0 / observation_lambda
         position_classes = np.full(self.num_states, NO_BEAT, dtype=np.int64)

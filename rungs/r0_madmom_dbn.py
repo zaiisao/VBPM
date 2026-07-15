@@ -1,7 +1,7 @@
-"""R0 -- Baseline A: the madmom bar-pointer DBN (Krebs/Boeck 2015).
+"""R0 -- Baseline A: the madmom bar-pointer DBN (Krebs/Böck 2015).
 
 Self-contained: it calls the official madmom DBNDownBeatTrackingProcessor directly and formats the
-input with the standard decorrelation convention (Boeck et al.):
+input with the standard decorrelation convention (Böck et al.):
 
     decorrelated = [ max(beat - downbeat, floor),  downbeat ]
 
@@ -15,7 +15,7 @@ our val cache: decorrelating is worth ~+0.06 F vs feeding raw activations -- not
 form's log(negative) nan corrupts the whole Viterbi path.) R0 is the literal, correct DBN baseline --
 the certificate R1 (our own PyTorch bar-pointer DBN) must reproduce.
 
-This follows the Beat This / Beat Transformer paradigm -- the joint bar-pointer DBN + Boeck
+This follows the Beat This / Beat Transformer paradigm -- the joint bar-pointer DBN + Böck
 decorrelation that both SOTA systems independently converged on. WaveBeat's separate-tracker approach
 is a different model class, considered and NOT adopted (unproven on our data). The two knobs let R0
 match each system's exact recipe; per our ablation they are near-equivalent, so the defaults are what
@@ -53,17 +53,12 @@ is cached at its own native rate.
 import numpy as np
 from madmom.features.downbeats import DBNDownBeatTrackingProcessor
 
+from rungs.base import Rung
+
 DOWNBEAT_POSITION_IN_BAR = 1        # madmom counts bar positions naturally: 1 = downbeat
 
 
-def _to_numpy(array_like) -> np.ndarray:
-    """Accept a numpy array or a (possibly CUDA) torch tensor."""
-    if hasattr(array_like, "detach"):
-        array_like = array_like.detach().cpu().numpy()
-    return np.ascontiguousarray(np.asarray(array_like, dtype=np.float64))
-
-
-class MadmomDBN:
+class MadmomDBN(Rung):
     """R0: the official madmom joint bar-pointer DBN, fed the standard decorrelated activation.
 
     Follows the Beat This / Beat Transformer paradigm; input_form and bounding match each system's
@@ -80,8 +75,17 @@ class MadmomDBN:
         min_bpm: float = 55.0,
         max_bpm: float = 215.0,
         beats_per_bar=(3, 4),
-        transition_lambda: int = 100
+        transition_lambda: int = 100,
+        observation_lambda: int = 16,
+        num_tempi: int = 60,
+        threshold: float = 0.05,
+        correct: bool = True
     ):
+        # num_tempi/threshold/correct default to madmom's shipped values (what Beat This / Beat
+        # Transformer run) -- exposed explicitly because they are decode heuristics, NOT the model:
+        # measured ~+0.006..+0.024 beat F over the bare model depending on the sample. Set
+        # num_tempi=None, threshold=0.0, correct=False to get the bare model, which R1 reproduces
+        # path- and score-identically.
         if input_form not in ("prob", "logit"):
             raise ValueError(f"input_form must be 'prob' or 'logit', got {input_form!r}")
 
@@ -96,7 +100,11 @@ class MadmomDBN:
             min_bpm=min_bpm,
             max_bpm=max_bpm,
             fps=fps,
-            transition_lambda=transition_lambda
+            transition_lambda=transition_lambda,
+            observation_lambda=observation_lambda,
+            num_tempi=num_tempi,
+            threshold=threshold,
+            correct=correct
         )
 
     def _bound(self, beat_activation, downbeat_activation):
@@ -104,46 +112,52 @@ class MadmomDBN:
         eps = self.eps
 
         if self.bounding == "clip":
-            return (np.clip(beat_activation, eps, 1 - eps),
-                    np.clip(downbeat_activation, eps, 1 - eps), eps)
-        if self.bounding == "squeeze":
-            return (beat_activation * (1 - eps) + eps / 2,
-                    downbeat_activation * (1 - eps) + eps / 2, eps / 2)
+            beat_activation = np.clip(beat_activation, eps, 1 - eps)
+            downbeat_activation = np.clip(downbeat_activation, eps, 1 - eps)
+            decorrelation_floor = eps
+        elif self.bounding == "squeeze":
+            beat_activation = beat_activation * (1 - eps) + eps / 2
+            downbeat_activation = downbeat_activation * (1 - eps) + eps / 2
+            decorrelation_floor = eps / 2
+        else:
+            # none (Beat Transformer); tiny floor for safety
+            decorrelation_floor = 1e-12
 
-        # none (Beat Transformer); tiny floor for safety
-        return beat_activation, downbeat_activation, 1e-12
+        return beat_activation, downbeat_activation, decorrelation_floor
 
-    def decode(self, activations) -> dict:
+    def _decode_activations(self, activations: np.ndarray) -> dict:
         """activations: [num_frames, 2] (beat, downbeat), in the form given by input_form.
 
-        Returns {'beats': seconds[N], 'downbeats': seconds[M]} -- the common deployment interface
-        every rung exposes; R0 fulfils it via madmom's joint bar-pointer DBN.
+        R0 fulfils the rung contract via madmom's joint bar-pointer DBN.
         """
-        activations = _to_numpy(activations)
-        if activations.ndim != 2 or activations.shape[1] < 2:
-            raise ValueError(f"expected [num_frames, 2] activations (beat, downbeat), "
-                             f"got {activations.shape}")
-
         beat_activation, downbeat_activation = activations[:, 0], activations[:, 1]
+
         if self.input_form == "logit":
             beat_activation = 1.0 / (1.0 + np.exp(-beat_activation))
             downbeat_activation = 1.0 / (1.0 + np.exp(-downbeat_activation))
 
+        # Decorrelate the two channels to satisfy madmom's observation model, which assumes
+        # beat + downbeat <= 1.0. Each feature extractor satisfies this constraint differently; thus,
+        # self._bound returns a bounded beat and downbeat activation pair based on the settings of
+        # self.bounding and self.eps.
         beat_activation, downbeat_activation, decorrelation_floor = self._bound(
-            beat_activation, downbeat_activation)
-        decorrelated_activations = np.stack(                             # columns now sum to <= 1
-            [np.maximum(beat_activation - downbeat_activation, decorrelation_floor),
-             downbeat_activation], axis=-1)
+            beat_activation, downbeat_activation
+        )
+
+        decorrelated_activations = self._decorrelate(
+            beat_activation, downbeat_activation, decorrelation_floor)
 
         # madmom returns [num_beats, 2]: (time in seconds, position in bar)
         beats_with_bar_positions = np.asarray(self._madmom_dbn(decorrelated_activations))
         if not beats_with_bar_positions.size:
-            return {"beats": np.array([]), "downbeats": np.array([])}
+            return self._empty_events()
+
+        is_downbeat = beats_with_bar_positions[:, 1] == 1
 
         beat_times = beats_with_bar_positions[:, 0]
-        is_downbeat = beats_with_bar_positions[:, 1] == DOWNBEAT_POSITION_IN_BAR
-        return {"beats": np.asarray(beat_times),
-                "downbeats": np.asarray(beats_with_bar_positions[is_downbeat, 0])}
+        downbeat_times = beats_with_bar_positions[is_downbeat, 0]
+
+        return {"beats": np.asarray(beat_times), "downbeats": np.asarray(downbeat_times)}
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ So we never materialize [num_states, num_states]. Measured at our real num_state
     structured  no matrix, K+M*V^2 =      36,920 ops/frame   -> 7,605x less work
 
 which is the difference between ~2 s and ~5-9 HOURS per song (hmmlearn/librosa, dense, both of which
-agree with this code on 100% of frames at that size -- see common/inference.py for the numbers).
+agree with this code on 100% of frames at that size -- see rungs/bar_pointer/inference.py for the numbers).
 
 Speed is NOT why this file exists: madmom's Cython HMM decodes the same topology in 1.04 s vs our
 1.95 s. GRADIENTS are why. And our 1.9x deficit is not intrinsic -- viterbi costs a flat ~122
@@ -26,7 +26,7 @@ SparseHMM (which IS sparse and differentiable, and agrees with this code on 100%
 loops `for j in range(n_states)` per frame in Python and takes ~4.9 hours per song. Here the +1
 advance makes the transition one gather plus one dense [M, V, V] max, so the segment-max never
 arises. madmom's Cython HMM runs this topology fast but gives no gradient, which R2-R4 need.
-See common/inference.py for the full library comparison.
+See rungs/bar_pointer/inference.py for the full library comparison.
 
 Certified against the dense DP in tests/test_structured_dp.py; the dense DP is itself certified
 against hmmlearn and torch-struct. Chain of certificates.
@@ -112,7 +112,7 @@ class StructuredBarPointerDP:
 
         With state_to_class [num_states] (long, on device), log_emission is the COMPACT
         [num_frames, num_classes] class-density table and we gather on the fly -- the full
-        [num_frames, num_states] array never exists. At Boeck's 3 classes that is 372 KB instead of
+        [num_frames, num_states] array never exists. At Böck's 3 classes that is 372 KB instead of
         2.08 GB per 3-min song (5,585x), and it is what makes batched decoding fit in GPU memory.
         Without state_to_class, log_emission is already per-state [num_frames, num_states].
 
