@@ -202,3 +202,7 @@ pyrightconfig.json
 
 # Dataset symlink (761GB external store)
 /dataset_store
+
+# machine-local
+.vscode/
+external/beatfm_repro/

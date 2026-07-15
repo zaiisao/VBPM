@@ -1,62 +1,66 @@
-# VBPM — Variational Bar Pointer Model for beat & downbeat tracking
+# VBPM — the rungs ladder
 
-A minimal, readable implementation of the generative **bar-pointer DVAE** derived from the *ELBO for
-DBN* paper, plus controlled **divergence flags** that ablate it to study *why* each design choice matters.
+Beat & downbeat tracking on frozen frontend activations, built as a ladder of models where each
+rung changes EXACTLY ONE thing relative to the rung below it. The goal: by the time the top rung
+(a learned, audio-conditioned model) beats the bottom rung (the published madmom baseline), every
+point of improvement is attributable to a named change.
 
-VBPM factorizes a song into three per-frame latents and reads beats/downbeats out of them
-geometrically (no DBN, decoder discarded at inference):
+(The previous VBPM incarnation — the bar-pointer DVAE and its ablation flags — is archived in
+`archive_2026-07-14/` and in git history at `43ecf34`, along with the old docs/, notebooks/ and
+experiments/.)
 
-| latent | distribution | meaning |
-|--------|--------------|---------|
-| meter `m` | Categorical | beats per bar |
-| bar phase `phi` | von Mises | angular position in the bar (wraps once per bar = a downbeat) |
-| log tempo `s` | Normal (LogNormal tempo) | bar-phase advance per frame |
+## The ladder
 
-Generative dynamics: `phi_t ~ vM(phi_{t-1} + exp(s_{t-1}), kappa)`, `s_t ~ N(s_{t-1}, sigma)`.
-At inference we **throw away the decoder** and piece beats/downbeats together from `phi`
-(`beats = (M·phi) wraps`, `downbeats = phi wraps`).
+| rung | model | factors | status |
+|------|-------|---------|--------|
+| R0 | madmom's bar-pointer DBN, exactly as Beat This / Beat Transformer use it | hand-set | done |
+| R1 | the same model on OUR engine (torch, differentiable) | hand-set | done, **certified ≡ R0** |
+| R2 | same, but the factors are learned by maximizing the exact forward log-likelihood | learned scalars/tables | next |
+| R3 | transitions conditioned on audio per frame | learned, audio-conditioned | — |
+| R4 | neural emission + transition (Neural HMM) | learned networks | — |
 
 ## Layout
+
 ```
-train.py            # entry: training loop (runs the VBPM model by default)
-evaluate.py         # entry: geometric read-out from z + leak test (real / shuffle / zero)
-losses.py           # ELBO (recon + KLs) + optional divergence losses
-config.py           # all flags; DEFAULTS = the VBPM model
-model/
-  bar_pointer_vae.py  # encoder, prior dynamics, rollout, decoder
-  latents.py          # von Mises / Normal / Categorical sampling + KL
-  readout.py          # phase -> beat/downbeat times; peak-pick; F-measure
-  divergences.py      # autocorrelation tempo head, geometric emission, Kalman phase filter
-data/
-  dataset.py          # cached-feature loading + batch sampling
-  targets.py          # ground-truth beats/tempo + sawtooth phase target
-  feature_extractor.py# modular frontend (cached default; Beat This for end-to-end)
-external/             # vendored upstream code (see external/README.md for provenance)
-cache/                # cached frontend features (gitignored, regenerable)
+rungs/
+  r0_madmom_dbn.py       # Baseline A: the official madmom DBN + the standard decorrelation
+  r1_handcrafted_hmm.py  # the same model rebuilt on our engine (the certificate rung)
+common/
+  state_space.py         # Krebs 2015 bar-pointer state space (interval i owns i states)
+  structured_dp.py       # THE ENGINE: exact forward + Viterbi, O(K + M*V^2)/frame, GPU, autograd
+  inference.py           # the readable dense reference the engine is certified against
+  readout.py             # MAP state path -> beat/downbeat times (shared by all rungs)
+  deployment.py          # model-independent decode lessons (threshold crop), off by default
+tests/
+  test_inference.py      # dense DP vs hmmlearn AND torch-struct (independent oracles)
+  test_structured_dp.py  # structured engine vs dense DP + compact emission + gradient checks
 ```
+
+## The certificate chain
+
+Nothing here is trusted by eye; every layer is machine-checked against something independent:
+
+1. `common/inference.py` (readable, textbook) ≡ **hmmlearn** ≡ **torch-struct** (LL to ~1e-14, paths exact)
+2. `common/structured_dp.py` (the engine) ≡ the dense reference (same model written out as a matrix)
+3. R1 on the engine ≡ **madmom**: identical Viterbi path AND identical path score, 25/25 val songs —
+   including {3,4} meter selection (25/25 same choice)
+4. R1 with madmom's shipped decode options (`num_tempi=60, threshold=0.05, correct=True`) ≡ R0
+   as shipped: **event-identical output**, 25/25 songs
+
+Point 4 means the R0-vs-R1 F difference under defaults (~0.02) is entirely madmom's three decode
+conveniences (fade-crop, peak-snap, tempo grid), each measured, none of them the model.
 
 ## Running
+
 ```bash
-python train.py                      # the VBPM model
-python train.py --num_steps 1500 \   # the working synthesis (each flag = one divergence)
-    --divergence_sawtooth_weight 0.5 \
-    --divergence_tempo_source autocorr \
-    --divergence_phase_update filter
+PYTHONPATH=. python tests/test_inference.py       # certify the dense reference vs two libraries
+PYTHONPATH=. python tests/test_structured_dp.py   # certify the engine vs the dense reference
+PYTHONPATH=. python rungs/r1_handcrafted_hmm.py   # synthetic smoke test
 ```
 
-## Ablation flags (all OFF by default → the VBPM model)
-Each flag isolates one departure so we can attribute behaviour to it:
+Environment: needs torch + madmom (+ hmmlearn/torch-struct/mir_eval for tests). Known-good local
+interpreter: `/home/sogang/mnt/db_2/anaconda3/envs/chart/bin/python` (madmom is a source checkout
+at `~/jaehoon/madmom`, built for py3.10 — the repo's own `.venv` is py3.8 and cannot import it).
 
-| flag | default | what turning it on does |
-|------|------------------|--------------------------|
-| `--divergence_phase_update` | `free` | `integrator` (phi=∫tempo) or `filter` (predict+correct) |
-| `--divergence_tempo_source` | `latent` | `autocorr`: compute tempo from features instead of inferring it |
-| `--divergence_decoder` | `mlp` | `geometric`: likelihood `beat~cos(M·phi)`, `downbeat~cos(phi)` |
-| `--divergence_sawtooth_weight` | `0.0` | add sawtooth phase supervision |
-| `--divergence_free_bits` | `0.0` | floor each KL (anti-collapse) |
-| `--divergence_beat_pos_weight` / `_downbeat_pos_weight` | `1.0` | reweight the reconstruction BCE |
-| `--divergence_beat_dropout` | `0.0` | hide beats from the encoder with this probability |
-| `--divergence_meter` | `latent` | `fixed`: hard-set meter to `beats_per_bar` |
-| `--divergence_end_to_end` | off | unfreeze the Beat This frontend (audio pipeline) |
-
-The decoder is used only as the training likelihood; **inference always reads beats from `phi`**.
+Activations are read from `cache/acts/*` records (`act2` [T,2] + `fps` + fold-honest targets);
+`fps` is a property of the cache record, never a constant.
