@@ -52,8 +52,9 @@ Nothing here is trusted by eye; every layer is machine-checked against something
 2. `rungs/bar_pointer/structured_dp.py` (the engine) ≡ the dense reference (same model written out as a matrix)
 3. R1 on the engine ≡ **madmom**: identical Viterbi path AND identical path score, 25/25 val songs —
    including {3,4} meter selection (25/25 same choice)
-4. R1 with madmom's shipped decode options (`num_tempi=60, threshold=0.05, correct=True`) ≡ R0
-   as shipped: **event-identical output**, 25/25 songs
+4. R1 with madmom's shipped decode options (`num_tempi=60, threshold=0.05, correct=True` — R1's
+   defaults) ≡ R0 as shipped: **event-identical output**, 25/25 songs. The bare model (certificate
+   configuration, what rung comparisons use) is the opt-out `num_tempi=None, threshold=0, correct=False`.
 
 Point 4 means the R0-vs-R1 F difference under defaults (~0.02) is entirely madmom's three decode
 conveniences (fade-crop, peak-snap, tempo grid), each measured, none of them the model.

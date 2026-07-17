@@ -1,10 +1,12 @@
 """Model-independent deployment lessons, shared by every rung.
 
 These are madmom's shipped decode conveniences (DBNDownBeatTrackingProcessor defaults), kept as
-OPTIONS because they measurably help deployment F and the lesson should outlive any one rung --
-but OFF by default, so rung-to-rung comparisons and the R1-vs-madmom certificate run on the bare
-model. Measured contributions (val, 25 songs, {3,4}): threshold +0.005 beat F, peak snap +0.014 on
-classical-heavy material (sign flips on tight pop/electronic -- genre-dependent, not free).
+OPTIONS because they measurably help deployment F and the lesson should outlive any one rung.
+They are ON by default in R1 (matching madmom-as-shipped); rung-to-rung comparisons and the
+R1-vs-madmom certificate must opt OUT to the bare model (threshold=0.0, correct=False,
+num_tempi=None). Measured contributions (val, 25 songs, {3,4}): threshold +0.005 beat F, peak
+snap +0.014 on classical-heavy material (sign flips on tight pop/electronic -- genre-dependent,
+not free).
 """
 import numpy as np
 

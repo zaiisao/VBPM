@@ -6,12 +6,14 @@ is set -- after which R0 -> R4 is a clean "hand-set vs learned bar-pointer, same
 R2+ change ONLY how the factors are produced.
 
 Status: R1 and a matched madmom decode the SAME Viterbi path (100% of frames, every song tested) and
-score identically to 4 decimals. "Matched" matters: madmom's DBNDownBeatTrackingProcessor defaults
-wrap this model in three decode heuristics R1 does not implement -- num_tempi=60 (a coarser
-log-spaced tempo grid), threshold=0.05 (crop to the main above-threshold segment) and correct=True
-(report the activation peak inside a beat region rather than the region entry). Those are worth
-~+0.006 beat F on our val set, essentially all of it threshold=0.05 cropping the fade-in/fade-out
-that only the Ballroom subset has. They are decode heuristics, not the model.
+score identically to 4 decimals. madmom's DBNDownBeatTrackingProcessor wraps the model in three
+decode heuristics -- num_tempi=60 (a coarser log-spaced tempo grid), threshold=0.05 (crop to the
+main above-threshold segment) and correct=True (report the activation peak inside a beat region
+rather than the region entry) -- and R1's DEFAULTS now match those shipped values, so out of the
+box R1 == R0 event-for-event. They are decode heuristics, not the model (~+0.006 beat F, almost all
+of it threshold=0.05 cropping Ballroom's fade-ins/outs); the BARE model -- what the certificate
+pins to a matched madmom and what rung-to-rung comparisons should run -- is the explicit opt-out
+num_tempi=None, threshold=0.0, correct=False.
 
 Everything here is HAND-SET; nothing is learned:
   state space : Krebs 2015 -- a tempo of i frames-per-beat owns exactly i states, so the pointer
@@ -43,18 +45,18 @@ class DBN2016(Rung):
                  beats_per_bar=(3, 4), observation_lambda: int = 16,
                  transition_lambda: int = 100, eps: float = 1e-5,
                  dtype: torch.dtype = torch.float64, device: str = "cuda",
-                 num_tempi: Optional[int] = None, threshold: float = 0.0, correct: bool = False):
+                 num_tempi: Optional[int] = 60, threshold: float = 0.05, correct: bool = True):
         """dtype defaults to float64 because R1's whole job is to reproduce madmom's MAP path. In
         float32 the score accumulated over ~20k frames drifts enough to lose it (measured: 0.12 nats
         worse than madmom on a Beethoven val song -- a strictly suboptimal decode, which Viterbi is
         not allowed to be). The cost is small: this DP is kernel-launch bound, not compute bound.
 
-        num_tempi: None = every integer interval (the exact model, what the certificate runs);
-        60 = madmom's shipped log-spaced grid (see rungs/bar_pointer/state_space.py).
-
-        threshold / correct set the INSTANCE defaults for decode()'s deployment options, so a
-        shipped-configured R1 can be built once and used through the same decode(activations) call
-        as every other rung (decode()'s own arguments still override per call).
+        num_tempi / threshold / correct default to madmom's SHIPPED values (60 / 0.05 / True), so a
+        default R1 reproduces R0 out of the box. The bare model -- every integer interval, no crop,
+        no peak snap; what the certificate runs and what rung comparisons should use -- is
+        num_tempi=None, threshold=0.0, correct=False (see rungs/bar_pointer/state_space.py and
+        rungs/deployment.py). threshold / correct set the INSTANCE defaults for decode()'s
+        deployment options; decode()'s own arguments still override per call.
 
         beats_per_bar: an int (single meter) or a collection -- madmom's shipped default is [3, 4].
         Multiple meters replicate madmom's MultiPatternStateSpace exactly: the union HMM is

@@ -19,9 +19,9 @@ def main():
     parser.add_argument("--checkpoint", default="final0",
                         help="frontend checkpoint (final0 is NOT fold-honest on training datasets)")
     parser.add_argument("--bar-pointer", default="2016_dbn", choices=sorted(BAR_POINTERS))
-    parser.add_argument("--shipped", action="store_true",
-                        help="madmom's shipped decode options (num_tempi=60, threshold=0.05, "
-                             "correct=True) instead of the bare model (2016_dbn only; "
+    parser.add_argument("--bare", action="store_true",
+                        help="the bare model: no decode heuristics (num_tempi=None, threshold=0, "
+                             "correct=False) instead of the shipped defaults (2016_dbn only; "
                              "madmom_dbn always runs as shipped)")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -29,8 +29,8 @@ def main():
     model_kwargs = {}
     if args.bar_pointer != "madmom_dbn":
         model_kwargs["device"] = args.device
-        if args.shipped:
-            model_kwargs.update(num_tempi=60, threshold=0.05, correct=True)
+        if args.bare:
+            model_kwargs.update(num_tempi=None, threshold=0.0, correct=False)
 
     frontend = build_frontend(args.frontend, checkpoint=args.checkpoint, device=args.device)
     tracker = Tracker(frontend, args.bar_pointer, **model_kwargs)
