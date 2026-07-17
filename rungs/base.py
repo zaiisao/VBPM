@@ -20,8 +20,13 @@ to the subclass:
                   transform -- R0 and R1 using different decorrelations would void the
                   certificate.
 
-Rung-specific knobs stay in the subclasses: R0's input_form/bounding exist to replicate each
-published system's exact recipe; R1's threshold/correct are deployment options on our own engine.
+The input contract is uniform: activation-consuming rungs receive PROBABILITIES -- whoever calls
+predict() converts logits first (the Tracker does it automatically in a pairing; sigmoid is
+sigmoid, so where it happens is not a modeling choice). The one genuine frontend-fidelity knob,
+`bounding` (clip/squeeze/none -- measured near-equivalent in F but NOT always event-neutral), is a
+base constructor parameter wired from the frontend by the Tracker for every activations-mode
+pairing. Rung-specific knobs stay in the subclasses (e.g. R1's threshold/correct deployment
+options).
 """
 from abc import ABC, abstractmethod
 
@@ -31,20 +36,28 @@ import numpy as np
 class Rung(ABC):
     """Base class for every rung. Subclasses implement _predict_features; predict() is final."""
 
-    # Frontend-owned properties this rung's CONSTRUCTOR consumes (besides fps, which every rung
-    # takes). Default: none -- the rung expects PROBABILITIES, and the Tracker sigmoids logit
-    # frontends on the way in. A rung that instead does its own form handling (R0 replicates each
-    # published recipe bit-exactly, bounding convention included) names the frontend properties it
-    # takes, and the Tracker passes them through instead of converting. This is what lets the
-    # Tracker stay generic: no per-rung special cases, the class declares its own contract.
-    FRONTEND_KWARGS: tuple = ()
-
     # How many channels this rung's predict() consumes. The HMM family reads exactly [T, 2]
     # (beat, downbeat) activations -- the frontend's FINAL layer. A latent-variable rung that
     # conditions on rich penultimate features instead declares its own count (e.g. 512) or None
     # for "any". The Tracker checks this against the frontend's output mode at construction, so a
     # frontend cut at the wrong depth fails loudly instead of predicting on garbage.
     INPUT_CHANNELS = 2      # int, or None for "any"
+
+    def __init__(self, fps: float, bounding: str = "clip", eps: float = 1e-5):
+        """Shared construction, uniform across ALL rungs -- no per-class wiring declarations.
+
+        fps: the frame rate of the incoming features (a property of the activations, never a
+        constant). bounding/eps: how an activation-consuming rung nudges probabilities off exact
+        0/1 before taking logs -- in a Tracker pairing, bounding is wired from the frontend's
+        PUBLISHED convention ("clip"/"squeeze"/"none", see the _bound recipes). Feature-consuming
+        rungs (INPUT_CHANNELS != 2) inherit the parameters and simply never use them.
+        """
+        if bounding not in ("clip", "squeeze", "none"):
+            raise ValueError(f"bounding must be 'clip', 'squeeze' or 'none', got {bounding!r}")
+
+        self.fps = fps
+        self.bounding = bounding
+        self.eps = eps
 
     def predict(self, features, **predict_options) -> dict:
         """features: [num_frames, INPUT_CHANNELS]. The common deployment interface.
@@ -78,20 +91,18 @@ class Rung(ABC):
     def _bound(self, beat_activation, downbeat_activation):
         """Bound activations off exact 0/1 and return the decorrelation floor to pair with them.
 
-        For activation-consuming rungs only (INPUT_CHANNELS=2): reads self.bounding ("clip",
-        "squeeze" or "none" -- each published system's convention, see rungs/r0) and self.eps,
-        which those rungs set in their constructors.
+        An activations-only helper (INPUT_CHANNELS=2 rungs). Reads self.bounding -- each published
+        system's convention ("clip", "squeeze" or "none", see rungs/r0 for the per-system table)
+        -- and self.eps, both declared and validated in the base constructor (the Tracker wires
+        bounding from the frontend).
         """
-        if self.INPUT_CHANNELS != 2:
-            raise TypeError(f"{type(self).__name__} does not consume [T, 2] activations; "
-                            f"_bound does not apply")
-        eps = self.eps
+        bounding, eps = self.bounding, self.eps
 
-        if self.bounding == "clip":
+        if bounding == "clip":
             beat_activation = np.clip(beat_activation, eps, 1 - eps)
             downbeat_activation = np.clip(downbeat_activation, eps, 1 - eps)
             decorrelation_floor = eps
-        elif self.bounding == "squeeze":
+        elif bounding == "squeeze":
             beat_activation = beat_activation * (1 - eps) + eps / 2
             downbeat_activation = downbeat_activation * (1 - eps) + eps / 2
             decorrelation_floor = eps / 2

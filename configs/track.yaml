@@ -1,8 +1,8 @@
 # Tracker composition for track.py: which frontend, which bar-pointer model, and their kwargs.
 # Everything except the audio path lives here. Each section's extra keys pass straight through to
 # that component's constructor (frontend: build_frontend kwargs; bar_pointer: the model's kwargs --
-# min_bpm, beats_per_bar, num_tempi, threshold, correct, ...). fps and the model's declared
-# FRONTEND_KWARGS are wired by the Tracker and must not appear here.
+# min_bpm, beats_per_bar, num_tempi, threshold, correct, ...). fps and bounding are wired by the
+# Tracker from the frontend and must not appear here.
 
 frontend:
   name: frontends.beat_this   # dotted module path; the module's Frontend subclass is loaded

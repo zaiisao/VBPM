@@ -17,21 +17,20 @@ the certificate R1 (our own PyTorch bar-pointer DBN) must reproduce.
 
 This follows the Beat This / Beat Transformer paradigm -- the joint bar-pointer DBN + Böck
 decorrelation that both SOTA systems independently converged on. WaveBeat's separate-tracker approach
-is a different model class, considered and NOT adopted (unproven on our data). The two knobs let R0
-match each system's exact recipe; per our ablation they are near-equivalent, so the defaults are what
-matter:
+is a different model class, considered and NOT adopted (unproven on our data).
 
-    input_form : "prob"  activations already in [0,1] (our cache act2)                    [DEFAULT]
-                 "logit" raw pre-sigmoid logits (Beat This / Beat Transformer) -> we sigmoid them
+Input contract (uniform across all rungs, see rungs/base.py): predict() receives PROBABILITY
+activations. A logit-emitting frontend is sigmoided by the caller (the Tracker in a pairing; by
+hand standalone) -- sigmoid is sigmoid, so where it happens changes nothing. The one knob that
+does replicate each published system's recipe is `bounding` (a base Rung parameter, wired from the
+frontend by the Tracker); per our ablation the conventions are near-equivalent in F but NOT always
+event-identical, so fidelity requires the published one:
+
     bounding   : "clip"    np.clip(x, eps, 1-eps)          (ours, WaveBeat)                [DEFAULT]
                  "squeeze" x*(1-eps) + eps/2               (Beat This)
-                 "none"    no clip (Beat Transformer). For logit input; unsafe on probs with exact 0/1
+                 "none"    no bounding (Beat Transformer). Unsafe on probs with exact 0/1
     eps        : bounds values off 0/1 and floors the decorrelation; 1e-5 (Beat This/ours) is a hair
                  better than 1e-8 (WaveBeat), but its exact value barely matters.
-
-  Beat This        = input_form="logit", bounding="squeeze"
-  Beat Transformer = input_form="logit", bounding="none"
-  our prob cache   = input_form="prob",  bounding="clip"    (the defaults)
 
 We deliberately leave madmom's OWN defaults untouched, because Beat This and Beat Transformer also
 call the processor with them -- so R0-as-published includes all three. They are deployment heuristics
@@ -61,19 +60,14 @@ DOWNBEAT_POSITION_IN_BAR = 1        # madmom counts bar positions naturally: 1 =
 class MadmomDBN(Rung):
     """R0: the official madmom joint bar-pointer DBN, fed the standard decorrelated activation.
 
-    Follows the Beat This / Beat Transformer paradigm; input_form and bounding match each system's
-    exact recipe (see module docstring). beats_per_bar=[3,4], min_bpm=55, max_bpm=215,
+    Follows the Beat This / Beat Transformer paradigm; `bounding` matches each system's exact
+    recipe (see module docstring). beats_per_bar=[3,4], min_bpm=55, max_bpm=215,
     transition_lambda=100 are the settings both SOTA trackers use -- a faithful baseline, not re-tuned.
     """
-
-    # R0 handles the frontend's native form itself (logit or prob, with the published bounding
-    # convention) -- the Tracker passes these through instead of sigmoiding. See Rung.FRONTEND_KWARGS.
-    FRONTEND_KWARGS = ("input_form", "bounding")
 
     def __init__(
         self,
         fps: float,
-        input_form: str = "prob",
         bounding: str = "clip",
         eps: float = 1e-5,
         min_bpm: float = 55.0,
@@ -90,15 +84,7 @@ class MadmomDBN(Rung):
         # measured ~+0.006..+0.024 beat F over the bare model depending on the sample. Set
         # num_tempi=None, threshold=0.0, correct=False to get the bare model, which R1 reproduces
         # path- and score-identically.
-        if input_form not in ("prob", "logit"):
-            raise ValueError(f"input_form must be 'prob' or 'logit', got {input_form!r}")
-
-        if bounding not in ("clip", "squeeze", "none"):
-            raise ValueError(f"bounding must be 'clip', 'squeeze' or 'none', got {bounding!r}")
-
-        self.input_form = input_form
-        self.bounding = bounding
-        self.eps = eps
+        super().__init__(fps=fps, bounding=bounding, eps=eps)
         self._madmom_dbn = DBNDownBeatTrackingProcessor(
             beats_per_bar=list(beats_per_bar),
             min_bpm=min_bpm,
@@ -113,20 +99,16 @@ class MadmomDBN(Rung):
 
     def _predict_features(self, activations: np.ndarray) -> dict:
         # For this rung features ARE [T, 2] activations (INPUT_CHANNELS=2); named accordingly.
-        """activations: [num_frames, 2] (beat, downbeat), in the form given by input_form.
+        """activations: [num_frames, 2] (beat, downbeat) PROBABILITIES (the uniform rung contract).
 
         R0 fulfils the rung contract via madmom's joint bar-pointer DBN.
         """
         beat_activation, downbeat_activation = activations[:, 0], activations[:, 1]
 
-        if self.input_form == "logit":
-            beat_activation = 1.0 / (1.0 + np.exp(-beat_activation))
-            downbeat_activation = 1.0 / (1.0 + np.exp(-downbeat_activation))
-
         # Decorrelate the two channels to satisfy madmom's observation model, which assumes
         # beat + downbeat <= 1.0. Each feature extractor satisfies this constraint differently; thus,
-        # self._bound returns a bounded beat and downbeat activation pair based on the settings of
-        # self.bounding and self.eps.
+        # self._bound returns a bounded beat and downbeat activation pair based on the given
+        # bounding convention (the base Rung parameter, frontend-wired by the Tracker) and eps.
         beat_activation, downbeat_activation, decorrelation_floor = self._bound(
             beat_activation, downbeat_activation
         )
@@ -171,16 +153,20 @@ if __name__ == "__main__":
         print(f"  mean inter-beat interval: {mean_inter_beat_interval:.3f}s  ->  "
               f"{60.0 / mean_inter_beat_interval:.1f} BPM  (expect ~120)")
 
-    # Verify the option matrix all runs and lands on ~the same answer (bounding is cosmetic; the logit
-    # path recovers the probs via sigmoid). 'none' on prob input can hit log(0) -> harmless -inf.
+    # Verify the bounding conventions all run and land on ~the same answer (near-equivalent in F,
+    # NOT always event-neutral -- which is why fidelity wires the published one). Rungs receive
+    # PROBABILITIES by contract: a logit source is sigmoided by the caller (the Tracker in a
+    # pairing; by hand here), so the logit row must reproduce the probability row exactly.
+    # 'none' on probs with exact 0/1 can hit log(0) -> harmless -inf.
     bounded = np.clip(activations, 1e-6, 1 - 1e-6)
     logit_activations = np.log(bounded / (1 - bounded))
-    print("\noption matrix (beats / downbeats -- should be ~equal across cells):")
+    sigmoided = 1.0 / (1.0 + np.exp(-logit_activations))
+    print("\nbounding matrix (beats / downbeats -- should be ~equal across cells):")
     with np.errstate(divide="ignore", invalid="ignore"), warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        for form, source_activations in (("prob", activations), ("logit", logit_activations)):
+        for source, source_activations in (("probability", activations),
+                                           ("sigmoid(logit)", sigmoided)):
             for bounding in ("clip", "squeeze", "none"):
-                events = MadmomDBN(fps=fps, input_form=form, bounding=bounding).predict(
-                    source_activations)
-                print(f"  input_form={form:5s} bounding={bounding:7s} -> "
+                events = MadmomDBN(fps=fps, bounding=bounding).predict(source_activations)
+                print(f"  source={source:14s} bounding={bounding:7s} -> "
                       f"{len(events['beats']):2d} / {len(events['downbeats']):2d}")

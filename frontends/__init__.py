@@ -25,7 +25,7 @@ class Frontend:
     """Interface. A frontend turns audio into [num_frames, num_channels] in its output mode."""
 
     OUTPUT_MODES: dict = {"activations": 2}
-    ACTIVATION_FORM: str = "prob"
+    ACTIVATION_FORM: str = "probability"
     BOUNDING: str = "clip"
 
     output: str = "activations"

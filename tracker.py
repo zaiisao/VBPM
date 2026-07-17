@@ -50,8 +50,7 @@ class Tracker:
 
     Every model kwarg (min_bpm, max_bpm, beats_per_bar, transition_lambda, observation_lambda,
     num_tempi, threshold, correct, ...) passes straight through to the model's constructor;
-    `fps` and the class's declared FRONTEND_KWARGS (e.g. R0's input_form/bounding) come from the
-    frontend and cannot be passed (that is the point).
+    `fps` and `bounding` come from the frontend and cannot be passed (that is the point).
     """
 
     def __init__(self, frontend: Frontend, bar_pointer: str = "madmom_dbn", **model_kwargs):
@@ -59,7 +58,7 @@ class Tracker:
             raise KeyError(f"unknown bar-pointer model {bar_pointer!r} (have: {sorted(BAR_POINTERS)})")
         model_class = BAR_POINTERS[bar_pointer]
 
-        for reserved in ("fps", *model_class.FRONTEND_KWARGS):
+        for reserved in ("fps", "bounding"):
             if reserved in model_kwargs:
                 raise ValueError(f"{reserved!r} comes from the frontend, don't pass it")
 
@@ -74,26 +73,18 @@ class Tracker:
                 f"[T, {frontend.num_channels}]")
 
         self.frontend = frontend
-        # Form conversion, driven by the class's declared contract (Rung.FRONTEND_KWARGS): a model
-        # that names "input_form" handles the frontend's native form itself (R0, replicating each
-        # published recipe), so its frontend kwargs pass through; every other model expects
-        # probabilities, so the Tracker sigmoids logit frontends once on the way in. (Measured
-        # equivalent: decorr+clip == decorr+squeeze to 4 decimals -- not a modeling choice.)
-        frontend_properties = {
-            "input_form": frontend.ACTIVATION_FORM,
-            "bounding": frontend.BOUNDING
-        }
-
-        for name in model_class.FRONTEND_KWARGS:
-            model_kwargs[name] = frontend_properties[name]
-
-        # activation_form (and the sigmoid) only applies to the "activations" output mode --
-        # rich features are not probabilities and pass through untouched.
+        # Uniform wiring -- the same two mode rules for EVERY rung, no per-class declarations:
+        #   1. Rungs receive PROBABILITY activations by contract (rungs/base.py), so the Tracker
+        #      sigmoids logit frontends once on the way in. Sigmoid is sigmoid -- where it happens
+        #      is not a modeling choice.
+        #   2. The bounding convention IS a modeling-fidelity choice (near-equivalent in F but NOT
+        #      always event-neutral -- see frontends/beat_this.py BOUNDING), so the frontend's
+        #      published convention is wired into the rung's base constructor parameter.
+        # Both are activations-mode facts; feature pipelines pass through untouched.
+        if frontend.output == "activations":
+            model_kwargs["bounding"] = frontend.BOUNDING
         self._should_convert_to_probabilities = (
-            frontend.output == "activations"
-            and "input_form" not in model_class.FRONTEND_KWARGS
-            and frontend.ACTIVATION_FORM == "logit"
-        )
+            frontend.output == "activations" and frontend.ACTIVATION_FORM == "logit")
 
         self.bar_pointer = model_class(fps=frontend.fps, **model_kwargs)
 

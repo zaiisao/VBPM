@@ -43,7 +43,7 @@ from rungs.base import Rung
 class DBN2016(Rung):
     def __init__(self, fps: float, min_bpm: float = 55.0, max_bpm: float = 215.0,
                  beats_per_bar=(3, 4), observation_lambda: int = 16,
-                 transition_lambda: int = 100, eps: float = 1e-5,
+                 transition_lambda: int = 100, bounding: str = "clip", eps: float = 1e-5,
                  dtype: torch.dtype = torch.float64, device: str = "cuda",
                  num_tempi: Optional[int] = 60, threshold: float = 0.05, correct: bool = True):
         """dtype defaults to float64 because R1's whole job is to reproduce madmom's MAP path. In
@@ -66,15 +66,16 @@ class DBN2016(Rung):
         constant -log(total states across meters) -- per-meter uniform would bias the comparison
         toward the smaller (3-beat) space by log(num_states ratio).
         """
+        super().__init__(fps=fps, bounding=bounding, eps=eps)
         self.threshold, self.correct = threshold, correct
-        self.bounding = "clip"      # R1's fixed recipe (unlike R0's frontend-declared one); feeds
-                                    # the shared Rung._bound
 
         if isinstance(beats_per_bar, (int, np.integer)):
             beats_per_bar = (int(beats_per_bar),)
         self.beats_per_bar = tuple(beats_per_bar)
+        if not self.beats_per_bar:
+            raise ValueError("beats_per_bar must name at least one meter, got an empty collection")
 
-        self.fps, self.eps, self.dtype, self.device = fps, eps, dtype, device
+        self.dtype, self.device = dtype, device
 
         self.state_spaces = [
             BarPointerStateSpace(fps, min_bpm, max_bpm, bpb,observation_lambda, num_tempi=num_tempi)
@@ -91,7 +92,8 @@ class DBN2016(Rung):
         total_states = sum(space.num_states for space in self.state_spaces)
         self.log_initial_distributions = [
             torch.full((space.num_states,), -float(np.log(total_states)), dtype=dtype, device=device)
-            for space in self.state_spaces]
+            for space in self.state_spaces
+        ]
 
         # One meter's tempo grid == every meter's (it depends only on the tempo range), so the
         # tempo transition is shared; built from the first DP.
@@ -106,11 +108,7 @@ class DBN2016(Rung):
             for space in self.state_spaces
         ]
 
-        # Single-meter conveniences (what the certificate and R2+ training use).
-        self.state_space = self.state_spaces[0]
-        self.dynamic_program = self.dynamic_programs[0]
-        self.log_initial_distribution = self.log_initial_distributions[0]
-        self.state_to_class = self.state_to_classes[0]
+        self.observation_lambda = observation_lambda
 
     def _log_class_densities(self, beat_activation: np.ndarray,
                              downbeat_activation: np.ndarray) -> torch.Tensor:
@@ -120,13 +118,15 @@ class DBN2016(Rung):
         state emits through exactly one class, so this table plus state_to_class IS the emission.
         """
         eps = self.eps
+
         beat_activation = np.clip(beat_activation, eps, 1 - eps)
         downbeat_activation = np.clip(downbeat_activation, eps, 1 - eps)
+
         # Decorrelate: the model needs mutually-exclusive classes, but the frontend's beat channel
         # fires on downbeats too, so beat + downbeat ~ 2 there and the no-beat density goes negative.
         beat_not_downbeat_activation = np.maximum(beat_activation - downbeat_activation, eps)
         # The no-beat probability is shared out over the observation_lambda - 1 non-beat states.
-        num_non_beat_states = self.state_space.observation_lambda - 1
+        num_non_beat_states = self.observation_lambda - 1
         no_beat_probability = 1.0 - beat_not_downbeat_activation - downbeat_activation
 
         # Deliberately NOT clipped, and madmom does not clip it either. A zero here means the frame
@@ -155,10 +155,13 @@ class DBN2016(Rung):
         """
         threshold = self.threshold if threshold is None else threshold
         correct = self.correct if correct is None else correct
+
         # The crop must see what the prediction sees: the decorrelated pair (madmom thresholds the
-        # combined activation it runs on, not the raw channels).
+        # combined activation it runs on, not the raw channels). _bound reads the base Rung
+        # bounding/eps (frontend-wired by the Tracker, "clip" standalone) -- same rule as every rung.
         beat_activation, downbeat_activation, decorrelation_floor = self._bound(
-            activations[:, 0], activations[:, 1])
+            activations[:, 0], activations[:, 1]
+        )
 
         decorrelated_activations = self._decorrelate(
             beat_activation, downbeat_activation, decorrelation_floor)
@@ -175,13 +178,18 @@ class DBN2016(Rung):
         # union-uniform initial constant.
         best = None
         for space, dp, log_init, state_to_class in zip(
-                self.state_spaces, self.dynamic_programs,
-                self.log_initial_distributions, self.state_to_classes):
+            self.state_spaces, self.dynamic_programs,
+            self.log_initial_distributions, self.state_to_classes
+        ):
             state_path, log_score = dp.viterbi(
                 log_init, self.log_tempo_transition, log_class_densities,
-                state_to_class=state_to_class, return_log_score=True)
+                state_to_class=state_to_class, return_log_score=True
+            )
+
             if best is None or log_score > best[0]:
                 best = (log_score, state_path.cpu().numpy(), space)
+
+        assert best is not None      # beats_per_bar is validated non-empty in __init__
         _, state_path, state_space = best
 
         return state_path_to_events(state_path, state_space, self.fps,
@@ -205,7 +213,8 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DBN2016(fps=fps, device=device)
-    print(model.state_space)
+    for space in model.state_spaces:
+        print(space)
     events = model.predict(activations)
     print(f"synthetic 120 BPM 4/4, 10 s (fps={fps:.1f}), device={device}:")
     print(f"  beats {len(events['beats'])} (expect ~20) | "
