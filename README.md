@@ -29,6 +29,8 @@ configs/
 frontends/
   __init__.py            # Frontend interface only (selection/pairing lives in tracker.py)
   beat_this.py           # wraps the OFFICIAL beat_this.inference.Audio2Frames (one script per frontend)
+  beat_transformer.py    # official Demixed_DilatedTransformerModel; Spleeter demix via subprocess
+  beat_transformer_demix.py  # the Spleeter 5-stem helper (RUNS in the analyze-smc env, not chart)
 rungs/
   base.py                # the Rung contract: predict() -> events, coercion, Böck decorrelation
   r0_madmom_dbn.py       # Baseline A: the official madmom DBN + the standard decorrelation

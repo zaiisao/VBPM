@@ -6,6 +6,9 @@
 
 frontend:
   name: frontends.beat_this   # dotted module path; the module's Frontend subclass is loaded
+                              # (alternative: frontends.beat_transformer -- co-designed WITH the
+                              # DBN; pair it with its shipped decode params on the bar_pointer:
+                              # observation_lambda: 6, num_tempi: null, threshold: 0.2)
   output: activations   # which layer the frontend is cut at: "activations" = final [T, 2]
                         # (beat, downbeat); frontends may offer richer modes (e.g. "features" =
                         # penultimate [T, 512], final linear head deleted) for latent rungs

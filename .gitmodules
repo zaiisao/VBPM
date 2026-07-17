@@ -4,3 +4,6 @@
 [submodule "external/MERT-v1-95M"]
 	path = external/MERT-v1-95M
 	url = https://huggingface.co/m-a-p/MERT-v1-95M
+[submodule "external/beat_transformer"]
+	path = external/beat_transformer
+	url = https://github.com/zhaojw1998/Beat-Transformer
