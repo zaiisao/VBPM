@@ -38,28 +38,32 @@ class Tracker:
 
     Every model kwarg (min_bpm, max_bpm, beats_per_bar, transition_lambda, observation_lambda,
     num_tempi, threshold, correct, ...) passes straight through to the model's constructor;
-    `fps` and `input_form` come from the frontend and cannot be passed (that is the point).
+    `fps` and the class's declared FRONTEND_KWARGS (e.g. R0's input_form/bounding) come from the
+    frontend and cannot be passed (that is the point).
     """
 
     def __init__(self, frontend: Frontend, bar_pointer: str = "madmom_dbn", **model_kwargs):
         if bar_pointer not in BAR_POINTERS:
             raise KeyError(f"unknown bar-pointer model {bar_pointer!r} (have: {sorted(BAR_POINTERS)})")
+        model_class = BAR_POINTERS[bar_pointer]
 
-        for reserved in ("fps", "input_form"):
+        for reserved in ("fps", *model_class.FRONTEND_KWARGS):
             if reserved in model_kwargs:
                 raise ValueError(f"{reserved!r} comes from the frontend, don't pass it")
 
         self.frontend = frontend
-        # R0 handles logits natively; R1 (and later rungs) take probabilities, so the Tracker
-        # sigmoids once on the way in. (Measured equivalent: decorr+clip == decorr+squeeze to 4
-        # decimals -- the form conversion is not a modeling choice.)
-        if bar_pointer == "madmom_dbn":
-            model_kwargs["input_form"] = frontend.activation_form
-            model_kwargs.setdefault("bounding", frontend.bounding)
-            self._sigmoid = False
-        else:
-            self._sigmoid = frontend.activation_form == "logit"
-        self.bar_pointer = BAR_POINTERS[bar_pointer](fps=frontend.fps, **model_kwargs)
+        # Form conversion, driven by the class's declared contract (Rung.FRONTEND_KWARGS): a model
+        # that names "input_form" handles the frontend's native form itself (R0, replicating each
+        # published recipe), so its frontend kwargs pass through; every other model expects
+        # probabilities, so the Tracker sigmoids logit frontends once on the way in. (Measured
+        # equivalent: decorr+clip == decorr+squeeze to 4 decimals -- not a modeling choice.)
+        frontend_properties = {"input_form": frontend.activation_form,
+                               "bounding": frontend.bounding}
+        for name in model_class.FRONTEND_KWARGS:
+            model_kwargs[name] = frontend_properties[name]
+        self._sigmoid = ("input_form" not in model_class.FRONTEND_KWARGS
+                         and frontend.activation_form == "logit")
+        self.bar_pointer = model_class(fps=frontend.fps, **model_kwargs)
 
     def track(self, signal, sample_rate: int) -> dict:
         """audio -> {'beats': seconds, 'downbeats': seconds}."""

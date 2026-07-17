@@ -31,6 +31,14 @@ import numpy as np
 class Rung(ABC):
     """Base class for every rung. Subclasses implement _decode_activations; decode() is final."""
 
+    # Frontend-owned properties this rung's CONSTRUCTOR consumes (besides fps, which every rung
+    # takes). Default: none -- the rung expects PROBABILITIES, and the Tracker sigmoids logit
+    # frontends on the way in. A rung that instead does its own form handling (R0 replicates each
+    # published recipe bit-exactly, bounding convention included) names the frontend properties it
+    # takes, and the Tracker passes them through instead of converting. This is what lets the
+    # Tracker stay generic: no per-rung special cases, the class declares its own contract.
+    FRONTEND_KWARGS: tuple = ()
+
     def decode(self, activations, **decode_options) -> dict:
         """activations: [num_frames, 2] (beat, downbeat). The common deployment interface.
 

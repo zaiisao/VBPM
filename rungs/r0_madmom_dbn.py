@@ -66,6 +66,10 @@ class MadmomDBN(Rung):
     transition_lambda=100 are the settings both SOTA trackers use -- a faithful baseline, not re-tuned.
     """
 
+    # R0 handles the frontend's native form itself (logit or prob, with the published bounding
+    # convention) -- the Tracker passes these through instead of sigmoiding. See Rung.FRONTEND_KWARGS.
+    FRONTEND_KWARGS = ("input_form", "bounding")
+
     def __init__(
         self,
         fps: float,
