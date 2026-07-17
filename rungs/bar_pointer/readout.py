@@ -3,7 +3,7 @@ or the ladder stops being a controlled comparison).
 """
 import numpy as np
 
-from rungs.bar_pointer.state_space import BEAT, DOWNBEAT
+from rungs.bar_pointer.state_space import BEAT
 
 
 def state_path_to_events(state_path, state_space, fps: float, snap_to_activations=None,
@@ -15,10 +15,13 @@ def state_path_to_events(state_path, state_space, fps: float, snap_to_activation
     entry into the downbeat region. The downbeat is also a beat, so it appears in both lists --
     matching R0/madmom, whose joint DBN likewise emits the downbeat as a beat with position 1.
 
-    Because bar position only ever increases, entering a beat region is exactly the frame where the
-    integer beat counter ticks over -- which is how madmom reads its own path off (its `correct=False`
-    branch, `np.diff(positions.astype(int))`). Verified equal: R1 and a matched madmom score
-    identically to 4 decimals.
+    Implemented madmom-literally (`np.diff(positions.astype(int)) != 0`, its `correct=False`
+    branch): a beat fires only where the integer beat counter CHANGES between frames, so frame 0
+    is NEVER a beat even when the path starts inside a beat region. That edge case is real --
+    measured on real songs, ~1 in 6 paths starts in-region, and an idealized "entry into region"
+    read-out (which counts frame 0) emitted one extra beat at t=0 on exactly those songs. NOTE the
+    asymmetry, faithful to madmom: its correct=True branch DOES count a region that starts at
+    frame 0 (see below); only correct=False cannot fire there.
 
     snap_to_activations: pass the [num_frames, 2] activations the model saw to instead report each
     beat at the strongest activation frame WITHIN its beat region (madmom's `correct=True`,
@@ -34,12 +37,11 @@ def state_path_to_events(state_path, state_space, fps: float, snap_to_activation
     is_in_beat_region = position_classes >= BEAT
 
     if snap_to_activations is None:
-        is_in_downbeat_region = position_classes == DOWNBEAT
-        entered_beat_region = is_in_beat_region & ~np.concatenate([[False], is_in_beat_region[:-1]])
-        entered_downbeat_region = (is_in_downbeat_region
-                                   & ~np.concatenate([[False], is_in_downbeat_region[:-1]]))
-        beat_frames = np.where(entered_beat_region)[0]
-        downbeat_frames = np.where(entered_downbeat_region)[0]
+        # madmom's correct=False read-out, op for op: beat where the integer beat counter changes
+        # between consecutive frames; downbeat where the counter lands on beat 0 of the bar.
+        integer_positions = state_space.state_positions[np.asarray(state_path)].astype(int)
+        beat_frames = np.nonzero(np.diff(integer_positions))[0] + 1
+        downbeat_frames = beat_frames[integer_positions[beat_frames] == 0]
     else:
         # madmom's correct=True: for each contiguous beat region of the path, report the frame with
         # the strongest activation (flat argmax over both columns, hence the // 2).

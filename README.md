@@ -52,11 +52,15 @@ Nothing here is trusted by eye; every layer is machine-checked against something
 
 1. `rungs/bar_pointer/inference.py` (readable, textbook) ≡ **hmmlearn** ≡ **torch-struct** (LL to ~1e-14, paths exact)
 2. `rungs/bar_pointer/structured_dp.py` (the engine) ≡ the dense reference (same model written out as a matrix)
-3. R1 on the engine ≡ **madmom**: identical Viterbi path AND identical path score, 25/25 val songs —
-   including {3,4} meter selection (25/25 same choice)
-4. R1 with madmom's shipped deployment options (`num_tempi=60, threshold=0.05, correct=True` — R1's
-   defaults) ≡ R0 as shipped: **event-identical output**, 25/25 songs. The bare model (certificate
-   configuration, what rung comparisons use) is the opt-out `num_tempi=None, threshold=0, correct=False`.
+3. R1 on the engine ≡ **madmom**: per-meter Viterbi path agreement 1.0 vs madmom's own
+   `hmm.viterbi`, scores to ~1e-4 (madmom's observation densities are float32, ours float64), and
+   {3,4} meter selection agrees (margins are hundreds of nats, far beyond the float gap)
+4. R1 ≡ R0 **event-identical** — re-certified 2026-07-17 on the live 50 fps Beat This pipeline
+   (squeeze bounding), 30 songs across ballroom/beatles/gtzan/hainsworth/hjdb: **30/30 shipped**
+   (`num_tempi=60, threshold=0.05, correct=True`, R1's defaults) and **30/30 bare** (the opt-out
+   `num_tempi=None, threshold=0, correct=False`, the rung-comparison configuration). Caveat: on
+   degenerate constant-background synthetics, score-tie plateaus can split one frame apart between
+   float32 and float64 — the certificate is a real-song claim.
 
 Point 4 means the R0-vs-R1 F difference under defaults (~0.02) is entirely madmom's three deployment
 conveniences (fade-crop, peak-snap, tempo grid), each measured, none of them the model.

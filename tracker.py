@@ -39,9 +39,11 @@ def build_frontend(module_path: str, **kwargs) -> Frontend:
     frontend_classes = [obj for obj in vars(module).values()
                         if isinstance(obj, type) and issubclass(obj, Frontend)
                         and obj is not Frontend and obj.__module__ == module.__name__]
+
     if len(frontend_classes) != 1:
         raise ImportError(f"{module_path!r} must define exactly one Frontend subclass, "
                           f"found {[cls.__name__ for cls in frontend_classes]}")
+
     return frontend_classes[0](**kwargs)
 
 
@@ -83,8 +85,9 @@ class Tracker:
         # Both are activations-mode facts; feature pipelines pass through untouched.
         if frontend.output == "activations":
             model_kwargs["bounding"] = frontend.BOUNDING
-        self._should_convert_to_probabilities = (
-            frontend.output == "activations" and frontend.ACTIVATION_FORM == "logit")
+
+        self._should_convert_to_probabilities = \
+            frontend.output == "activations" and frontend.ACTIVATION_FORM == "logit"
 
         self.bar_pointer = model_class(fps=frontend.fps, **model_kwargs)
 

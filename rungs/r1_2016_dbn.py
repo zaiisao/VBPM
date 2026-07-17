@@ -5,8 +5,18 @@ CERTIFICATE: if R1 reproduces R0, our inference is validated on a real model and
 is set -- after which R0 -> R4 is a clean "hand-set vs learned bar-pointer, same inference" axis.
 R2+ change ONLY how the factors are produced.
 
-Status: R1 and a matched madmom find the SAME Viterbi path (100% of frames, every song tested) and
-score identically to 4 decimals. madmom's DBNDownBeatTrackingProcessor wraps the model in three
+Status (re-certified 2026-07-17, live Beat This 50 fps, squeeze bounding, 30 songs across
+ballroom/beatles/gtzan/hainsworth/hjdb): event-identical to R0 30/30 shipped AND 30/30 bare;
+per-meter Viterbi path agreement 1.0 against madmom's own hmm.viterbi; scores match to ~1e-4
+(madmom computes observation densities in float32, we in float64 -- ~6e-8/frame). That float gap
+is visible ONLY on degenerate inputs: constant-background synthetic click tracks create huge
+score-tie plateaus where the two implementations may pick equal-score paths shifted by one frame.
+Real activations break the ties; the certificate is a real-song claim.
+The re-certification caught and fixed two real divergences: (1) the correct=False read-out
+emitted a beat at frame 0 when the path starts inside a beat region (madmom's np.diff read-out
+cannot fire there -- see rungs/bar_pointer/readout.py); (2) _log_class_densities hardcoded clip,
+diverging from R0 under bounding="squeeze".
+madmom's DBNDownBeatTrackingProcessor wraps the model in three
 deployment heuristics -- num_tempi=60 (a coarser log-spaced tempo grid), threshold=0.05 (crop to the
 main above-threshold segment) and correct=True (report the activation peak inside a beat region
 rather than the region entry) -- and R1's DEFAULTS now match those shipped values, so out of the
@@ -71,6 +81,7 @@ class DBN2016(Rung):
 
         if isinstance(beats_per_bar, (int, np.integer)):
             beats_per_bar = (int(beats_per_bar),)
+
         self.beats_per_bar = tuple(beats_per_bar)
         if not self.beats_per_bar:
             raise ValueError("beats_per_bar must name at least one meter, got an empty collection")
@@ -78,7 +89,7 @@ class DBN2016(Rung):
         self.dtype, self.device = dtype, device
 
         self.state_spaces = [
-            BarPointerStateSpace(fps, min_bpm, max_bpm, bpb,observation_lambda, num_tempi=num_tempi)
+            BarPointerStateSpace(fps, min_bpm, max_bpm, bpb, observation_lambda, num_tempi=num_tempi)
             for bpb in self.beats_per_bar
         ]
 
@@ -117,14 +128,16 @@ class DBN2016(Rung):
         Returns [num_frames, 3] -- one column per observation class (NO_BEAT, BEAT, DOWNBEAT). Every
         state emits through exactly one class, so this table plus state_to_class IS the emission.
         """
-        eps = self.eps
-
-        beat_activation = np.clip(beat_activation, eps, 1 - eps)
-        downbeat_activation = np.clip(downbeat_activation, eps, 1 - eps)
+        # Bound with the instance's convention (was a hardcoded clip -- which silently diverged
+        # from R0 under bounding="squeeze": measured, single-meter events differed on real songs).
+        beat_activation, downbeat_activation, decorrelation_floor = self._bound(
+            beat_activation, downbeat_activation)
 
         # Decorrelate: the model needs mutually-exclusive classes, but the frontend's beat channel
         # fires on downbeats too, so beat + downbeat ~ 2 there and the no-beat density goes negative.
-        beat_not_downbeat_activation = np.maximum(beat_activation - downbeat_activation, eps)
+        beat_not_downbeat_activation = np.maximum(
+            beat_activation - downbeat_activation, decorrelation_floor)
+
         # The no-beat probability is shared out over the observation_lambda - 1 non-beat states.
         num_non_beat_states = self.observation_lambda - 1
         no_beat_probability = 1.0 - beat_not_downbeat_activation - downbeat_activation
