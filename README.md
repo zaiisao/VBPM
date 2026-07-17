@@ -23,6 +23,7 @@ experiments/.)
 
 ```
 tracker.py               # by-name registries (frontends + bar-pointer models) + Tracker glue, above both packages
+track.py                 # CLI inference: python track.py song.wav --frontend ... --bar-pointer ...
 frontends/
   __init__.py            # Frontend interface only (selection/pairing lives in tracker.py)
   beat_this.py           # wraps the OFFICIAL beat_this.inference.Audio2Frames (one script per frontend)
