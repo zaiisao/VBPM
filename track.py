@@ -1,46 +1,41 @@
-"""CLI inference: python track.py song.wav [--frontend beat_this] [--bar-pointer 2016_dbn].
+"""CLI inference: python track.py song.wav [--config configs/track.yaml].
 
+The audio path is the only positional input; the whole tracker composition -- frontend, bar-pointer
+model, and every kwarg of each -- comes from the config YAML (see configs/track.yaml, the default).
 Prints one event per line ("<seconds>  beat" / "<seconds>  DOWNBEAT"). This is deliberately just
-argument parsing around tracker.py's definitions -- training and evaluation build their Trackers
-from the same registries; this script is only the run-it-on-a-file entry point.
+file loading around tracker.py's definitions -- training and evaluation build their Trackers from
+the same build_tracker_from_config.
 """
 import argparse
+from pathlib import Path
 
 import numpy as np
 import soundfile
+import yaml
 
-from tracker import BAR_POINTERS, Tracker, build_frontend
+from tracker import build_tracker_from_config
+
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "track.yaml"
 
 
 def main():
     parser = argparse.ArgumentParser(description="Track beats/downbeats: frontend x bar-pointer model.")
     parser.add_argument("audio", help="path to an audio file (anything soundfile reads)")
-    parser.add_argument("--frontend", default="beat_this", help="frontend name (build_frontend)")
-    parser.add_argument("--checkpoint", default="final0",
-                        help="frontend checkpoint (final0 is NOT fold-honest on training datasets)")
-    parser.add_argument("--bar-pointer", default="2016_dbn", choices=sorted(BAR_POINTERS))
-    parser.add_argument("--bare", action="store_true",
-                        help="the bare model: no decode heuristics (num_tempi=None, threshold=0, "
-                             "correct=False) instead of the shipped defaults (2016_dbn only; "
-                             "madmom_dbn always runs as shipped)")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG),
+                        help="tracker composition YAML (default: configs/track.yaml)")
     args = parser.parse_args()
 
-    model_kwargs = {}
-    if args.bar_pointer != "madmom_dbn":
-        model_kwargs["device"] = args.device
-        if args.bare:
-            model_kwargs.update(num_tempi=None, threshold=0.0, correct=False)
-
-    frontend = build_frontend(args.frontend, checkpoint=args.checkpoint, device=args.device)
-    tracker = Tracker(frontend, args.bar_pointer, **model_kwargs)
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+    tracker = build_tracker_from_config(config)
 
     signal, sample_rate = soundfile.read(args.audio, dtype="float32")
     if signal.ndim > 1:
         signal = signal.mean(axis=1)
+
     events = tracker.track(signal, sample_rate)
 
-    downbeats = set(np.round(events["downbeats"], 6))
+    downbeats = set(np.round(events["downbeats"], decimals=6))
     for t in events["beats"]:
         print(f"{t:10.3f}  {'DOWNBEAT' if round(float(t), 6) in downbeats else 'beat'}")
 

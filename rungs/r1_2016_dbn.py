@@ -132,7 +132,7 @@ class DBN2016(Rung):
         return torch.from_numpy(log_class_densities).to(dtype=self.dtype, device=self.device)
 
     @torch.no_grad()
-    def _decode_activations(self, activations: np.ndarray, threshold: Optional[float] = None,
+    def _decode_features(self, activations: np.ndarray, threshold: Optional[float] = None,
                             correct: Optional[bool] = None) -> dict:
         """activations: [num_frames, 2] probabilities (beat, downbeat).
 

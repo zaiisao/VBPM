@@ -2,7 +2,7 @@
 
 A rung is a deployable beat/downbeat tracker with ONE public entry point:
 
-    decode(activations, **decode_options) -> {'beats': seconds[N], 'downbeats': seconds[M]}
+    decode(features, **decode_options) -> {'beats': seconds[N], 'downbeats': seconds[M]}
 
 so evaluate.py can score every rung identically and rung comparisons are always apples-to-apples.
 The base class owns what is common to ALL rungs -- the deployment interface, input coercion and
@@ -29,7 +29,7 @@ import numpy as np
 
 
 class Rung(ABC):
-    """Base class for every rung. Subclasses implement _decode_activations; decode() is final."""
+    """Base class for every rung. Subclasses implement _decode_features; decode() is final."""
 
     # Frontend-owned properties this rung's CONSTRUCTOR consumes (besides fps, which every rung
     # takes). Default: none -- the rung expects PROBABILITIES, and the Tracker sigmoids logit
@@ -39,29 +39,41 @@ class Rung(ABC):
     # Tracker stay generic: no per-rung special cases, the class declares its own contract.
     FRONTEND_KWARGS: tuple = ()
 
-    def decode(self, activations, **decode_options) -> dict:
-        """activations: [num_frames, 2] (beat, downbeat). The common deployment interface.
+    # How many channels this rung's decode() consumes. The HMM family reads exactly [T, 2]
+    # (beat, downbeat) activations -- the frontend's FINAL layer. A latent-variable rung that
+    # conditions on rich penultimate features instead declares its own count (e.g. 512) or None
+    # for "any". The Tracker checks this against the frontend's output mode at construction, so a
+    # frontend cut at the wrong depth fails loudly instead of decoding garbage.
+    INPUT_CHANNELS = 2      # int, or None for "any"
 
-        decode_options are forwarded to the subclass (e.g. R1's threshold/correct overrides);
-        rungs without per-call options accept none.
+    def decode(self, features, **decode_options) -> dict:
+        """features: [num_frames, INPUT_CHANNELS]. The common deployment interface.
+
+        For the HMM family (INPUT_CHANNELS=2) that is (beat, downbeat) activations; a
+        latent-variable rung consumes whatever width it declared. decode_options are forwarded to
+        the subclass (e.g. R1's threshold/correct overrides); rungs without per-call options
+        accept none.
         """
-        activations = self._coerce_activations(activations)
-        return self._decode_activations(activations, **decode_options)
+        features = self._coerce_features(features)
+        return self._decode_features(features, **decode_options)
 
     @abstractmethod
-    def _decode_activations(self, activations: np.ndarray, **decode_options) -> dict:
-        """activations is a validated float64 numpy [num_frames, 2]. Return the events dict."""
+    def _decode_features(self, features: np.ndarray, **decode_options) -> dict:
+        """features is a validated float64 numpy [num_frames, INPUT_CHANNELS]. Return the events
+        dict."""
 
-    @staticmethod
-    def _coerce_activations(activations) -> np.ndarray:
-        """Accept a numpy array or a (possibly CUDA) torch tensor; validate the [T, 2] shape."""
-        if hasattr(activations, "detach"):
-            activations = activations.detach().cpu().numpy()
-        activations = np.ascontiguousarray(np.asarray(activations, dtype=np.float64))
-        if activations.ndim != 2 or activations.shape[1] < 2:
-            raise ValueError(f"expected [num_frames, 2] activations (beat, downbeat), "
-                             f"got {activations.shape}")
-        return activations
+    @classmethod
+    def _coerce_features(cls, features) -> np.ndarray:
+        """Accept a numpy array or a (possibly CUDA) torch tensor; validate the shape against the
+        class's declared INPUT_CHANNELS (None = any channel count)."""
+        if hasattr(features, "detach"):
+            features = features.detach().cpu().numpy()
+        features = np.ascontiguousarray(np.asarray(features, dtype=np.float64))
+        if features.ndim != 2 or (cls.INPUT_CHANNELS is not None
+                                  and features.shape[1] != cls.INPUT_CHANNELS):
+            raise ValueError(f"expected [num_frames, {cls.INPUT_CHANNELS or 'any'}] features, "
+                             f"got {features.shape}")
+        return features
 
     @staticmethod
     def _decorrelate(beat_activation: np.ndarray, downbeat_activation: np.ndarray,

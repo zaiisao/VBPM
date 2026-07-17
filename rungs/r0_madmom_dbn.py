@@ -129,7 +129,8 @@ class MadmomDBN(Rung):
 
         return beat_activation, downbeat_activation, decorrelation_floor
 
-    def _decode_activations(self, activations: np.ndarray) -> dict:
+    def _decode_features(self, activations: np.ndarray) -> dict:
+        # For this rung features ARE [T, 2] activations (INPUT_CHANNELS=2); named accordingly.
         """activations: [num_frames, 2] (beat, downbeat), in the form given by input_form.
 
         R0 fulfils the rung contract via madmom's joint bar-pointer DBN.
