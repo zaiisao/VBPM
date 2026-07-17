@@ -3,7 +3,7 @@
 so evaluate.py can score every rung identically.
 
     r0_madmom_dbn   Baseline A -- literal madmom DBN (black box)          [tractable]
-    r1 ...          handcrafted bar-pointer HMM in our framework           [tractable]
+    r1 ...          the Böck 2016 DBN rebuilt in our framework             [tractable]
     r2 ...          + learn parametric factors by exact forward            [tractable]
     r3 ...          + audio-conditioned scales / meter transitions         [tractable]
     r4 ...          full neural HMM (MLP transition + emission)            [tractable]

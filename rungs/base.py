@@ -21,7 +21,7 @@ to the subclass:
                   certificate.
 
 Rung-specific knobs stay in the subclasses: R0's input_form/bounding exist to replicate each
-published system's exact recipe; R1's threshold/correct are deployment options on our own decoder.
+published system's exact recipe; R1's threshold/correct are deployment options on our own engine.
 """
 from abc import ABC, abstractmethod
 

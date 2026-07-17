@@ -140,8 +140,13 @@ class StructuredBarPointerDP:
 
     @torch.no_grad()
     def viterbi(self, log_initial_distribution, log_tempo_transition, log_emission,
-                state_to_class=None) -> torch.Tensor:
-        """Exact MAP state path [num_frames] (long).
+                state_to_class=None, return_log_score: bool = False):
+        """Exact MAP state path [num_frames] (long); with return_log_score, (path, MAP log score).
+
+        The score is what multi-meter decoding compares: madmom's multi-pattern model stacks one
+        bar per meter block-diagonally with NO cross-meter transitions, so decoding the union
+        equals decoding each meter separately and keeping the higher-scoring path -- PROVIDED both
+        runs use the same initial-distribution constant (see r1's shared -log(total states)).
 
         log_emission: [num_frames, num_states], or [num_frames, num_classes] with state_to_class
         (see _emission_row).
@@ -178,7 +183,10 @@ class StructuredBarPointerDP:
             slot = self.first_state_slot[state]
             state = int(chosen_previous_flat[frame, slot]) if slot >= 0 else state - 1
             state_path[frame - 1] = state
-        return torch.from_numpy(state_path).to(self.device)
+        state_path = torch.from_numpy(state_path).to(self.device)
+        if return_log_score:
+            return state_path, float(log_best_score.max())
+        return state_path
 
     def dense_transition(self, log_tempo_transition) -> torch.Tensor:
         """The SAME transition written out as a dense [num_states, num_states] -- only for

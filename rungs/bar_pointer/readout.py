@@ -20,7 +20,7 @@ def state_path_to_events(state_path, state_space, fps: float, snap_to_activation
     branch, `np.diff(positions.astype(int))`). Verified equal: R1 and a matched madmom score
     identically to 4 decimals.
 
-    snap_to_activations: pass the [num_frames, 2] activations the decoder saw to instead report each
+    snap_to_activations: pass the [num_frames, 2] activations the decode saw to instead report each
     beat at the strongest activation frame WITHIN its beat region (madmom's `correct=True`,
     behavior-copied down to the flat argmax over both columns). A deployment lesson, not the model:
     the Viterbi region entry can sit a frame or two off the perceptual onset, and on soft-onset

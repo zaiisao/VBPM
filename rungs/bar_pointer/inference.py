@@ -24,7 +24,7 @@ names out -- `log_A` and `log_B` are impossible to tell apart at a glance):
     log_emission             : [num_frames, num_states]      log p(obs_t | z_t = k)             (B)
 
 forward_log_likelihood is differentiable -- it is the training objective for R2+ (maximize the exact
-marginal by gradient ascent). viterbi is the deployment decoder. Both are EXACT because the model is
+marginal by gradient ascent). viterbi is the deployment decode. Both are EXACT because the model is
 finite + Markov + factorized; that is the whole premise of the ladder.
 
 WHY NOT A LIBRARY? Not for lack of one, and not for correctness: FOUR independent libraries compute

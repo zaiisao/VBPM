@@ -22,13 +22,14 @@ experiments/.)
 ## Layout
 
 ```
+tracker.py               # by-name registries (frontends + bar-pointer models) + Tracker glue, above both packages
 frontends/
-  __init__.py            # Frontend interface + decoder registry + Tracker (frontend x decoder glue)
+  __init__.py            # Frontend interface only (selection/pairing lives in tracker.py)
   beat_this.py           # wraps the OFFICIAL beat_this.inference.Audio2Frames (one script per frontend)
 rungs/
   base.py                # the Rung contract: decode() -> events, coercion, Böck decorrelation
   r0_madmom_dbn.py       # Baseline A: the official madmom DBN + the standard decorrelation
-  r1_handcrafted_hmm.py  # the same model rebuilt on our engine (the certificate rung)
+  r1_2016_dbn.py         # the same model rebuilt on our engine (the certificate rung)
   deployment.py          # model-independent decode lessons (threshold crop), off by default
   bar_pointer/           # the shared R1-R4 chassis (rungs change ONLY how factors are produced)
     state_space.py       # Krebs 2015 bar-pointer state space (interval i owns i states)
@@ -61,7 +62,7 @@ conveniences (fade-crop, peak-snap, tempo grid), each measured, none of them the
 ```bash
 PYTHONPATH=. python tests/test_inference.py       # certify the dense reference vs two libraries
 PYTHONPATH=. python tests/test_structured_dp.py   # certify the engine vs the dense reference
-PYTHONPATH=. python rungs/r1_handcrafted_hmm.py   # synthetic smoke test
+PYTHONPATH=. python rungs/r1_2016_dbn.py   # synthetic smoke test
 ```
 
 Environment: needs torch + madmom (+ hmmlearn/torch-struct/mir_eval for tests). Known-good local

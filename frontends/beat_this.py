@@ -10,8 +10,8 @@ Properties of what this emits:
     interpolate the logits onto another grid (our activation caches historically use
     86.1328125 = 22050/256, so cached and live activations line up frame for frame).
   * activations are LOGITS (activation_form="logit"): Beat This's own DBN path feeds
-    sigmoid(logits) to madmom, and the Tracker applies the same conversion where a decoder wants
-    probabilities.
+    sigmoid(logits) to madmom, and the Tracker applies the same conversion where a bar-pointer
+    model wants probabilities.
 
 Checkpoints (all cached locally under ~/.cache/torch/hub/checkpoints/):
   * "final0" -- trained on everything except GTZAN. Fine for deployment and demos; NOT fold-honest
@@ -67,10 +67,10 @@ class BeatThisFrontend(Frontend):
 
 
 if __name__ == "__main__":
-    # Smoke test: a synthetic 120 BPM 4/4 click track through frontend -> both decoders.
+    # Smoke test: a synthetic 120 BPM 4/4 click track through frontend -> both bar-pointer models.
     import numpy as np
 
-    from frontends import Tracker
+    from tracker import Tracker
 
     SR, SECONDS, BPM = 22050, 12, 120.0
     signal = np.zeros(SR * SECONDS, dtype=np.float32)
@@ -87,11 +87,11 @@ if __name__ == "__main__":
     activations = frontend.activations(signal, SR)
     print(f"activations: {tuple(activations.shape)} (expect ~{SECONDS * 50} frames)")
 
-    for decoder in ("madmom_dbn", "bar_pointer_hmm"):
-        kwargs = {} if decoder == "madmom_dbn" else {"device": device, "beats_per_bar": 4}
-        events = Tracker(frontend, decoder, **kwargs).track(signal, SR)
+    for bar_pointer in ("madmom_dbn", "2016_dbn"):
+        kwargs = {} if bar_pointer == "madmom_dbn" else {"device": device}
+        events = Tracker(frontend, bar_pointer, **kwargs).track(signal, SR)
         n_beats, n_downbeats = len(events["beats"]), len(events["downbeats"])
         ibi = float(np.diff(events["beats"]).mean()) if n_beats > 1 else float("nan")
-        print(f"  {decoder:16s}: {n_beats:3d} beats (expect ~{SECONDS * 2}), "
+        print(f"  {bar_pointer:16s}: {n_beats:3d} beats (expect ~{SECONDS * 2}), "
               f"{n_downbeats:2d} downbeats (expect ~{SECONDS // 2}), "
               f"mean IBI {ibi:.3f}s -> {60.0 / ibi:.1f} BPM (expect ~120)")

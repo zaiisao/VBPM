@@ -28,7 +28,7 @@ from typing import Optional
 import numpy as np
 
 # The three Böck 2016 observation classes. Every state emits via exactly one of them, so these index
-# the columns of the [num_frames, 3] density array -- see rungs/r1_handcrafted_hmm.py.
+# the columns of the [num_frames, 3] density array -- see rungs/r1_2016_dbn.py.
 NO_BEAT = 0
 BEAT = 1
 DOWNBEAT = 2

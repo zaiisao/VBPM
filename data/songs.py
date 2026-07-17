@@ -10,7 +10,7 @@ This module is the data half of that: it enumerates songs as (stem, dataset, fol
 beats_path) from
     dataset_store/beat_this_annotations/<dataset>/           the official annotations + splits
     dataset_store/beat_tracking_db1/.../labeled_data/<dir>/data/   local audio
-and parses the .beats files. It deliberately knows nothing about frontends or decoders.
+and parses the .beats files. It deliberately knows nothing about frontends or bar-pointer models.
 
 Fold-honesty (standing directive): `fold` is the Beat This CV fold this song is HELD OUT of, read
 from the official 8-folds.split. Any evaluation on song s must use checkpoint fold{s.fold}; final0

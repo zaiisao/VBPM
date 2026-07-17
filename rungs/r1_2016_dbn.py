@@ -1,4 +1,4 @@
-"""R1 -- Baseline A in OUR framework: the Krebs bar-pointer HMM, hand-set factors, our inference.
+"""R1 -- Baseline A in OUR framework: the Böck 2016 DBN, hand-set factors, our inference.
 
 The same model R0 runs (madmom's DBN), rebuilt on our own code and decoded with our own DP. THE
 CERTIFICATE: if R1 reproduces R0, our inference is validated on a real model and the ladder's anchor
@@ -16,7 +16,8 @@ that only the Ballroom subset has. They are decode heuristics, not the model.
 Everything here is HAND-SET; nothing is learned:
   state space : Krebs 2015 -- a tempo of i frames-per-beat owns exactly i states, so the pointer
                 advances exactly +1 state per frame (see rungs/bar_pointer/state_space.py for why a uniform
-                grid fails).
+                grid fails). Multi-meter (madmom's default [3, 4]) as in Böck 2016: one bar per
+                meter, no cross-meter transitions, best Viterbi score wins (see __init__).
   transition  : deterministic advance inside a beat; madmom's exponential tempo mix at beat
                 boundaries, exp(-transition_lambda |ratio - 1|), row-normalized.
   emission    : Böck 2016's mutually-exclusive {no-beat, beat, downbeat} observation model on the
@@ -37,9 +38,9 @@ from rungs.bar_pointer.structured_dp import StructuredBarPointerDP
 from rungs.base import Rung
 
 
-class HandcraftedBarPointerHMM(Rung):
+class DBN2016(Rung):
     def __init__(self, fps: float, min_bpm: float = 55.0, max_bpm: float = 215.0,
-                 beats_per_bar: int = 4, observation_lambda: int = 16,
+                 beats_per_bar=(3, 4), observation_lambda: int = 16,
                  transition_lambda: int = 100, eps: float = 1e-5,
                  dtype: torch.dtype = torch.float64, device: str = "cuda",
                  num_tempi: Optional[int] = None, threshold: float = 0.0, correct: bool = False):
@@ -54,25 +55,49 @@ class HandcraftedBarPointerHMM(Rung):
         threshold / correct set the INSTANCE defaults for decode()'s deployment options, so a
         shipped-configured R1 can be built once and used through the same decode(activations) call
         as every other rung (decode()'s own arguments still override per call).
+
+        beats_per_bar: an int (single meter) or a collection -- madmom's shipped default is [3, 4].
+        Multiple meters replicate madmom's MultiPatternStateSpace exactly: the union HMM is
+        block-diagonal with NO cross-meter transitions, so decoding it equals decoding each meter
+        separately and keeping the higher-scoring Viterbi path. The one wiring subtlety: madmom's
+        initial distribution is uniform over the UNION, so every meter's decode must use the SAME
+        constant -log(total states across meters) -- per-meter uniform would bias the comparison
+        toward the smaller (3-beat) space by log(num_states ratio).
         """
         self.threshold, self.correct = threshold, correct
-        self.state_space = BarPointerStateSpace(fps, min_bpm, max_bpm, beats_per_bar,
-                                                observation_lambda, num_tempi=num_tempi)
-        self.dynamic_program = StructuredBarPointerDP(self.state_space, device=device, dtype=dtype)
+        if isinstance(beats_per_bar, (int, np.integer)):
+            beats_per_bar = (int(beats_per_bar),)
+        self.beats_per_bar = tuple(beats_per_bar)
         self.fps, self.eps, self.dtype, self.device = fps, eps, dtype, device
 
-        self.log_initial_distribution = torch.full(
-            (self.state_space.num_states,),
-            -float(np.log(self.state_space.num_states)),
-            dtype=dtype, device=device
-        )
+        self.state_spaces = [BarPointerStateSpace(fps, min_bpm, max_bpm, bpb,
+                                                  observation_lambda, num_tempi=num_tempi)
+                             for bpb in self.beats_per_bar]
+        self.dynamic_programs = [StructuredBarPointerDP(space, device=device, dtype=dtype)
+                                 for space in self.state_spaces]
+        # Uniform over the union of all meters' states (madmom's initial distribution) -- the shared
+        # constant that makes cross-meter score comparison valid.
+        total_states = sum(space.num_states for space in self.state_spaces)
+        self.log_initial_distributions = [
+            torch.full((space.num_states,), -float(np.log(total_states)), dtype=dtype, device=device)
+            for space in self.state_spaces]
 
-        self.log_tempo_transition = self.dynamic_program.build_log_tempo_transition(transition_lambda)
+        # One meter's tempo grid == every meter's (it depends only on the tempo range), so the
+        # tempo transition is shared; built from the first DP.
+        self.log_tempo_transition = self.dynamic_programs[0].build_log_tempo_transition(
+            transition_lambda)
 
         # The DP gathers each state's class density on the fly from this map -- the per-state
         # [num_frames, num_states] emission (2.08 GB per 3-min song) never exists; only the
         # [num_frames, 3] class table (372 KB) does.
-        self.state_to_class = torch.from_numpy(self.state_space.position_classes).to(device)
+        self.state_to_classes = [torch.from_numpy(space.position_classes).to(device)
+                                 for space in self.state_spaces]
+
+        # Single-meter conveniences (what the certificate and R2+ training use).
+        self.state_space = self.state_spaces[0]
+        self.dynamic_program = self.dynamic_programs[0]
+        self.log_initial_distribution = self.log_initial_distributions[0]
+        self.state_to_class = self.state_to_classes[0]
 
     def _log_class_densities(self, beat_activation: np.ndarray,
                              downbeat_activation: np.ndarray) -> torch.Tensor:
@@ -117,7 +142,7 @@ class HandcraftedBarPointerHMM(Rung):
         """
         threshold = self.threshold if threshold is None else threshold
         correct = self.correct if correct is None else correct
-        # The crop must see what the decoder sees: the decorrelated pair (madmom thresholds the
+        # The crop must see what the decode sees: the decorrelated pair (madmom thresholds the
         # combined activation it decodes, not the raw channels).
         eps = self.eps
         beat_activation = np.clip(activations[:, 0], eps, 1 - eps)
@@ -134,11 +159,21 @@ class HandcraftedBarPointerHMM(Rung):
         activations = activations[first_frame:first_frame + len(decorrelated_activations)]
         log_class_densities = self._log_class_densities(activations[:, 0], activations[:, 1])
 
-        state_path = self.dynamic_program.viterbi(
-            self.log_initial_distribution, self.log_tempo_transition, log_class_densities,
-            state_to_class=self.state_to_class).cpu().numpy()
+        # One Viterbi per meter; keep the best-scoring path (== decoding madmom's block-diagonal
+        # multi-pattern union, see __init__). Scores are comparable because every meter shares the
+        # union-uniform initial constant.
+        best = None
+        for space, dp, log_init, state_to_class in zip(
+                self.state_spaces, self.dynamic_programs,
+                self.log_initial_distributions, self.state_to_classes):
+            state_path, log_score = dp.viterbi(
+                log_init, self.log_tempo_transition, log_class_densities,
+                state_to_class=state_to_class, return_log_score=True)
+            if best is None or log_score > best[0]:
+                best = (log_score, state_path.cpu().numpy(), space)
+        _, state_path, state_space = best
 
-        return state_path_to_events(state_path, self.state_space, self.fps,
+        return state_path_to_events(state_path, state_space, self.fps,
                                     snap_to_activations=decorrelated_activations if correct else None,
                                     first_frame=first_frame)
 
@@ -158,7 +193,7 @@ if __name__ == "__main__":
     activations[beat_frames[::4], 1] = 0.92
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = HandcraftedBarPointerHMM(fps=fps, device=device)
+    model = DBN2016(fps=fps, device=device)
     print(model.state_space)
     events = model.decode(activations)
     print(f"synthetic 120 BPM 4/4, 10 s (fps={fps:.1f}), device={device}:")
