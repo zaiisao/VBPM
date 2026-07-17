@@ -1,6 +1,6 @@
 """Model-independent deployment lessons, shared by every rung.
 
-These are madmom's shipped decode conveniences (DBNDownBeatTrackingProcessor defaults), kept as
+These are madmom's shipped deployment conveniences (DBNDownBeatTrackingProcessor defaults), kept as
 OPTIONS because they measurably help deployment F and the lesson should outlive any one rung.
 They are ON by default in R1 (matching madmom-as-shipped); rung-to-rung comparisons and the
 R1-vs-madmom certificate must opt OUT to the bare model (threshold=0.0, correct=False,
@@ -18,7 +18,7 @@ def threshold_crop(activations: np.ndarray, threshold: float):
     the DBN cannot hallucinate beats in dead air (fade-ins/outs -- on our val data this fires almost
     exclusively on Ballroom's 30-second excerpts).
 
-    Returns (cropped_activations, first_frame) -- add first_frame back to any frame index decoded
+    Returns (cropped_activations, first_frame) -- add first_frame back to any frame index read
     from the cropped array. Empty crop (nothing reaches threshold) returns (empty, 0).
     """
     if not threshold:

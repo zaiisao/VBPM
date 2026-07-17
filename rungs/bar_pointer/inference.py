@@ -7,7 +7,7 @@ plain-English statement of what that engine computes, and the oracle that certif
 (tests/test_structured_dp.py builds the same model both ways and compares).
 
 It earns its place by being the only differentiable dense reference we have, so it can certify the
-FORWARD/gradient path that R2+ train through -- hmmlearn and librosa decode but do not give
+FORWARD/gradient path that R2+ train through -- hmmlearn and librosa produce a path but do not give
 gradients. The time-varying form below is likewise a reference: R3's audio-conditioned transition
 will have to be a structured [num_frames-1, num_tempi, num_tempi] tempo transition, because a dense
 [num_frames-1, num_states, num_states] would be 17.41 TB for one song.
@@ -24,7 +24,7 @@ names out -- `log_A` and `log_B` are impossible to tell apart at a glance):
     log_emission             : [num_frames, num_states]      log p(obs_t | z_t = k)             (B)
 
 forward_log_likelihood is differentiable -- it is the training objective for R2+ (maximize the exact
-marginal by gradient ascent). viterbi is the deployment decode. Both are EXACT because the model is
+marginal by gradient ascent). viterbi is the deployment path finder. Both are EXACT because the model is
 finite + Markov + factorized; that is the whole premise of the ladder.
 
 WHY NOT A LIBRARY? Not for lack of one, and not for correctness: FOUR independent libraries compute

@@ -15,7 +15,7 @@ So we never materialize [num_states, num_states]. Measured at our real num_state
 which is the difference between ~2 s and ~5-9 HOURS per song (hmmlearn/librosa, dense, both of which
 agree with this code on 100% of frames at that size -- see rungs/bar_pointer/inference.py for the numbers).
 
-Speed is NOT why this file exists: madmom's Cython HMM decodes the same topology in 1.04 s vs our
+Speed is NOT why this file exists: madmom's Cython HMM runs the same topology in 1.04 s vs our
 1.95 s. GRADIENTS are why. And our 1.9x deficit is not intrinsic -- viterbi costs a flat ~122
 us/frame at num_states=952 and at num_states=16756 alike (17.6x the ops, 1.00x the time), so we are
 bound by Python dispatch and kernel launches, not arithmetic.
@@ -41,7 +41,7 @@ class StructuredBarPointerDP:
     def __init__(self, state_space, device: str = "cuda", dtype: torch.dtype = torch.float64):
         """dtype: float64 for decoding (R1 must match madmom's MAP exactly -- float32 accumulation
         over ~20k frames loses it; measured 0.12 nats worse than madmom's path on a val song, i.e. a
-        strictly suboptimal decode). float32 is fine for R2+ TRAINING, where 0.12 nats is noise.
+        strictly suboptimal Viterbi path). float32 is fine for R2+ TRAINING, where 0.12 nats is noise.
         """
         self.state_space = state_space
         self.device = device
@@ -80,7 +80,7 @@ class StructuredBarPointerDP:
         jumps to exactly 0 -- at transition_lambda=100 that is 2504 of 5041 entries -- and a zero
         means FORBIDDEN, so it must map to -inf. This line used to read log(p + 1e-30), which mapped
         every forbidden jump to a merely-expensive -69.1 instead. Viterbi then bought them: on a
-        Liszt val song our decode took a transition madmom assigns probability zero (61.5% path
+        Liszt val song our Viterbi path took a transition madmom assigns probability zero (61.5% path
         agreement, an illegal jump at frame 8861, path score -inf under madmom's own factors).
         With true -inf, R1 reproduces madmom's path and score exactly.
 

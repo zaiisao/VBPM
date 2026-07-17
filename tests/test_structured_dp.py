@@ -92,8 +92,8 @@ def main():
     print(f"grad to compact class table: {class_logits.grad.abs().sum().item():.3e}")
 
     # the advance must be exactly +1 state per frame inside a block (the Krebs property)
-    decoded_positions = state_space.state_positions[structured_path]
-    print(f"decoded bar position spans {decoded_positions.min():.2f}..{decoded_positions.max():.2f} "
+    path_positions = state_space.state_positions[structured_path]
+    print(f"path bar position spans {path_positions.min():.2f}..{path_positions.max():.2f} "
           f"beat units (should sweep 0..{state_space.beats_per_bar})")
 
     # gradients flow through the structured forward (the R2+ objective). R2+ parameterize the tempo

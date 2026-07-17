@@ -2,7 +2,7 @@
 
 A rung is a deployable beat/downbeat tracker with ONE public entry point:
 
-    decode(features, **decode_options) -> {'beats': seconds[N], 'downbeats': seconds[M]}
+    predict(features, **predict_options) -> {'beats': seconds[N], 'downbeats': seconds[M]}
 
 so evaluate.py can score every rung identically and rung comparisons are always apples-to-apples.
 The base class owns what is common to ALL rungs -- the deployment interface, input coercion and
@@ -17,7 +17,7 @@ to the subclass:
                   [P(beat-not-downbeat), P(downbeat)] pair the bar-pointer observation model
                   assumes (it computes the no-beat mass as 1 - beat - downbeat). Shared here
                   because EVERY rung that emits through that observation model needs the identical
-                  transform -- R0 and R1 decoding different decorrelations would void the
+                  transform -- R0 and R1 using different decorrelations would void the
                   certificate.
 
 Rung-specific knobs stay in the subclasses: R0's input_form/bounding exist to replicate each
@@ -29,7 +29,7 @@ import numpy as np
 
 
 class Rung(ABC):
-    """Base class for every rung. Subclasses implement _decode_features; decode() is final."""
+    """Base class for every rung. Subclasses implement _predict_features; predict() is final."""
 
     # Frontend-owned properties this rung's CONSTRUCTOR consumes (besides fps, which every rung
     # takes). Default: none -- the rung expects PROBABILITIES, and the Tracker sigmoids logit
@@ -39,26 +39,26 @@ class Rung(ABC):
     # Tracker stay generic: no per-rung special cases, the class declares its own contract.
     FRONTEND_KWARGS: tuple = ()
 
-    # How many channels this rung's decode() consumes. The HMM family reads exactly [T, 2]
+    # How many channels this rung's predict() consumes. The HMM family reads exactly [T, 2]
     # (beat, downbeat) activations -- the frontend's FINAL layer. A latent-variable rung that
     # conditions on rich penultimate features instead declares its own count (e.g. 512) or None
     # for "any". The Tracker checks this against the frontend's output mode at construction, so a
-    # frontend cut at the wrong depth fails loudly instead of decoding garbage.
+    # frontend cut at the wrong depth fails loudly instead of predicting on garbage.
     INPUT_CHANNELS = 2      # int, or None for "any"
 
-    def decode(self, features, **decode_options) -> dict:
+    def predict(self, features, **predict_options) -> dict:
         """features: [num_frames, INPUT_CHANNELS]. The common deployment interface.
 
         For the HMM family (INPUT_CHANNELS=2) that is (beat, downbeat) activations; a
-        latent-variable rung consumes whatever width it declared. decode_options are forwarded to
+        latent-variable rung consumes whatever width it declared. predict_options are forwarded to
         the subclass (e.g. R1's threshold/correct overrides); rungs without per-call options
         accept none.
         """
         features = self._coerce_features(features)
-        return self._decode_features(features, **decode_options)
+        return self._predict_features(features, **predict_options)
 
     @abstractmethod
-    def _decode_features(self, features: np.ndarray, **decode_options) -> dict:
+    def _predict_features(self, features: np.ndarray, **predict_options) -> dict:
         """features is a validated float64 numpy [num_frames, INPUT_CHANNELS]. Return the events
         dict."""
 
@@ -74,6 +74,32 @@ class Rung(ABC):
             raise ValueError(f"expected [num_frames, {cls.INPUT_CHANNELS or 'any'}] features, "
                              f"got {features.shape}")
         return features
+
+    def _bound(self, beat_activation, downbeat_activation):
+        """Bound activations off exact 0/1 and return the decorrelation floor to pair with them.
+
+        For activation-consuming rungs only (INPUT_CHANNELS=2): reads self.bounding ("clip",
+        "squeeze" or "none" -- each published system's convention, see rungs/r0) and self.eps,
+        which those rungs set in their constructors.
+        """
+        if self.INPUT_CHANNELS != 2:
+            raise TypeError(f"{type(self).__name__} does not consume [T, 2] activations; "
+                            f"_bound does not apply")
+        eps = self.eps
+
+        if self.bounding == "clip":
+            beat_activation = np.clip(beat_activation, eps, 1 - eps)
+            downbeat_activation = np.clip(downbeat_activation, eps, 1 - eps)
+            decorrelation_floor = eps
+        elif self.bounding == "squeeze":
+            beat_activation = beat_activation * (1 - eps) + eps / 2
+            downbeat_activation = downbeat_activation * (1 - eps) + eps / 2
+            decorrelation_floor = eps / 2
+        else:
+            # none (Beat Transformer); tiny floor for safety
+            decorrelation_floor = 1e-12
+
+        return beat_activation, downbeat_activation, decorrelation_floor
 
     @staticmethod
     def _decorrelate(beat_activation: np.ndarray, downbeat_activation: np.ndarray,

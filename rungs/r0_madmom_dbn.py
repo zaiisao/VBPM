@@ -34,7 +34,7 @@ matter:
   our prob cache   = input_form="prob",  bounding="clip"    (the defaults)
 
 We deliberately leave madmom's OWN defaults untouched, because Beat This and Beat Transformer also
-call the processor with them -- so R0-as-published includes all three. They are decode heuristics
+call the processor with them -- so R0-as-published includes all three. They are deployment heuristics
 wrapped around the DBN, and R1 implements none of them:
     num_tempi=60    a coarser log-spaced tempo grid (vs all 71 integer intervals here)
     threshold=0.05  crop to the main above-threshold segment before decoding
@@ -42,7 +42,7 @@ wrapped around the DBN, and R1 implements none of them:
 Measured on our val set they are worth ~+0.006 beat F over the bare model, almost all of it
 threshold=0.05 cropping fade-in/fade-out -- which only the Ballroom subset has (74/85 songs; every
 other dataset ~0%). correct=True actually costs us -0.0014. So the R1-vs-R0 gap is these heuristics,
-not our inference: against a MATCHED madmom, R1 decodes an identical Viterbi path.
+not our inference: against a MATCHED madmom, R1 produces an identical Viterbi path.
 
 fps: REQUIRED and frontend-specific -- a property of the activations, never a global constant, and a
 wrong fps mis-scales every DBN tempo. Pass record['fps'] from the cache. Native rates differ by model
@@ -86,7 +86,7 @@ class MadmomDBN(Rung):
         correct: bool = True
     ):
         # num_tempi/threshold/correct default to madmom's shipped values (what Beat This / Beat
-        # Transformer run) -- exposed explicitly because they are decode heuristics, NOT the model:
+        # Transformer run) -- exposed explicitly because they are deployment heuristics, NOT the model:
         # measured ~+0.006..+0.024 beat F over the bare model depending on the sample. Set
         # num_tempi=None, threshold=0.0, correct=False to get the bare model, which R1 reproduces
         # path- and score-identically.
@@ -111,25 +111,7 @@ class MadmomDBN(Rung):
             correct=correct
         )
 
-    def _bound(self, beat_activation, downbeat_activation):
-        """Bound activations off exact 0/1 and return the decorrelation floor to pair with them."""
-        eps = self.eps
-
-        if self.bounding == "clip":
-            beat_activation = np.clip(beat_activation, eps, 1 - eps)
-            downbeat_activation = np.clip(downbeat_activation, eps, 1 - eps)
-            decorrelation_floor = eps
-        elif self.bounding == "squeeze":
-            beat_activation = beat_activation * (1 - eps) + eps / 2
-            downbeat_activation = downbeat_activation * (1 - eps) + eps / 2
-            decorrelation_floor = eps / 2
-        else:
-            # none (Beat Transformer); tiny floor for safety
-            decorrelation_floor = 1e-12
-
-        return beat_activation, downbeat_activation, decorrelation_floor
-
-    def _decode_features(self, activations: np.ndarray) -> dict:
+    def _predict_features(self, activations: np.ndarray) -> dict:
         # For this rung features ARE [T, 2] activations (INPUT_CHANNELS=2); named accordingly.
         """activations: [num_frames, 2] (beat, downbeat), in the form given by input_form.
 
@@ -180,7 +162,7 @@ if __name__ == "__main__":
     activations[beat_frames, 0] = 0.9
     activations[beat_frames[::4], 1] = 0.92
 
-    events = MadmomDBN(fps=fps).decode(activations)
+    events = MadmomDBN(fps=fps).predict(activations)
     print(f"synthetic 120 BPM 4/4, 10 s (fps={fps:.1f}), probability activations (defaults):")
     print(f"  detected beats:     {len(events['beats']):2d}   (expect ~20)")
     print(f"  detected downbeats: {len(events['downbeats']):2d}   (expect ~5)")
@@ -198,7 +180,7 @@ if __name__ == "__main__":
         warnings.simplefilter("ignore")
         for form, source_activations in (("prob", activations), ("logit", logit_activations)):
             for bounding in ("clip", "squeeze", "none"):
-                events = MadmomDBN(fps=fps, input_form=form, bounding=bounding).decode(
+                events = MadmomDBN(fps=fps, input_form=form, bounding=bounding).predict(
                     source_activations)
                 print(f"  input_form={form:5s} bounding={bounding:7s} -> "
                       f"{len(events['beats']):2d} / {len(events['downbeats']):2d}")

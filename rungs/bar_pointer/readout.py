@@ -13,14 +13,14 @@ def state_path_to_events(state_path, state_space, fps: float, snap_to_activation
 
     A beat is the ENTRY into any beat region (position class BEAT or DOWNBEAT); a downbeat is the
     entry into the downbeat region. The downbeat is also a beat, so it appears in both lists --
-    matching R0/madmom, whose joint decode likewise emits the downbeat as a beat with position 1.
+    matching R0/madmom, whose joint DBN likewise emits the downbeat as a beat with position 1.
 
     Because bar position only ever increases, entering a beat region is exactly the frame where the
     integer beat counter ticks over -- which is how madmom reads its own path off (its `correct=False`
     branch, `np.diff(positions.astype(int))`). Verified equal: R1 and a matched madmom score
     identically to 4 decimals.
 
-    snap_to_activations: pass the [num_frames, 2] activations the decode saw to instead report each
+    snap_to_activations: pass the [num_frames, 2] activations the model saw to instead report each
     beat at the strongest activation frame WITHIN its beat region (madmom's `correct=True`,
     behavior-copied down to the flat argmax over both columns). A deployment lesson, not the model:
     the Viterbi region entry can sit a frame or two off the perceptual onset, and on soft-onset

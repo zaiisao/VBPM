@@ -24,14 +24,12 @@ not in YAML, until we have enough frontends to need config files again.
 class Frontend:
     """Interface. A frontend turns audio into [num_frames, num_channels] in its output mode."""
 
-    OUTPUT_MODES: dict = {"activations": 2}   # mode -> num_channels; subclasses add their own
-                                              # (e.g. "features": 512 for a penultimate-layer cut)
-    output: str = "activations"     # the constructed instance's mode (a key of OUTPUT_MODES)
-    fps: float = None               # the output frame rate -- bar-pointer models build on this
-    ACTIVATION_FORM: str = "prob"   # "prob" or "logit" -- what activations() returns; meaningful
-                                    # only in the "activations" mode (features are not probabilities)
-    BOUNDING: str = "clip"          # the frontend's PUBLISHED bounding convention (see rungs/r0);
-                                    # wired into the DBN so our pipeline == the published one
+    OUTPUT_MODES: dict = {"activations": 2}
+    ACTIVATION_FORM: str = "prob"
+    BOUNDING: str = "clip"
+
+    output: str = "activations"
+    fps: float
 
     @property
     def name(self) -> str:
@@ -39,6 +37,7 @@ class Frontend:
         dotted-path loader): frontends.beat_this -> "beat_this". Never declared per class.
         When the module runs as a script (__main__), fall back to its file stem."""
         module_name = type(self).__module__.rsplit(".", 1)[-1]
+
         if module_name == "__main__":
             import inspect
             from pathlib import Path
@@ -46,6 +45,7 @@ class Frontend:
                 return Path(inspect.getfile(type(self))).stem
             except TypeError:        # class defined interactively; nothing better to derive
                 pass
+
         return module_name
 
     @property

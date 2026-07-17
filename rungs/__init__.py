@@ -1,5 +1,5 @@
 """The A -> B -> C ladder. Each rung exposes the same deployment interface:
-    decode(...) -> {'beats': seconds, 'downbeats': seconds}
+    predict(...) -> {'beats': seconds, 'downbeats': seconds}
 so evaluate.py can score every rung identically.
 
     r0_madmom_dbn   Baseline A -- literal madmom DBN (black box)          [tractable]

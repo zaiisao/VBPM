@@ -30,10 +30,10 @@ frontends/
   __init__.py            # Frontend interface only (selection/pairing lives in tracker.py)
   beat_this.py           # wraps the OFFICIAL beat_this.inference.Audio2Frames (one script per frontend)
 rungs/
-  base.py                # the Rung contract: decode() -> events, coercion, Böck decorrelation
+  base.py                # the Rung contract: predict() -> events, coercion, Böck decorrelation
   r0_madmom_dbn.py       # Baseline A: the official madmom DBN + the standard decorrelation
   r1_2016_dbn.py         # the same model rebuilt on our engine (the certificate rung)
-  deployment.py          # model-independent decode lessons (threshold crop), off by default
+  deployment.py          # model-independent deployment lessons (threshold crop), off by default
   bar_pointer/           # the shared R1-R4 chassis (rungs change ONLY how factors are produced)
     state_space.py       # Krebs 2015 bar-pointer state space (interval i owns i states)
     structured_dp.py     # THE ENGINE: exact forward + Viterbi, O(K + M*V^2)/frame, GPU, autograd
@@ -54,11 +54,11 @@ Nothing here is trusted by eye; every layer is machine-checked against something
 2. `rungs/bar_pointer/structured_dp.py` (the engine) ≡ the dense reference (same model written out as a matrix)
 3. R1 on the engine ≡ **madmom**: identical Viterbi path AND identical path score, 25/25 val songs —
    including {3,4} meter selection (25/25 same choice)
-4. R1 with madmom's shipped decode options (`num_tempi=60, threshold=0.05, correct=True` — R1's
+4. R1 with madmom's shipped deployment options (`num_tempi=60, threshold=0.05, correct=True` — R1's
    defaults) ≡ R0 as shipped: **event-identical output**, 25/25 songs. The bare model (certificate
    configuration, what rung comparisons use) is the opt-out `num_tempi=None, threshold=0, correct=False`.
 
-Point 4 means the R0-vs-R1 F difference under defaults (~0.02) is entirely madmom's three decode
+Point 4 means the R0-vs-R1 F difference under defaults (~0.02) is entirely madmom's three deployment
 conveniences (fade-crop, peak-snap, tempo grid), each measured, none of them the model.
 
 ## Running
@@ -76,7 +76,7 @@ at `~/jaehoon/madmom`, built for py3.10 — the repo's own `.venv` is py3.8 and 
 NO ACTIVATION CACHES (decision 2026-07-15): activations are computed live through `frontends/`,
 so there is exactly one code path from audio to activations and live == eval by construction. The
 old `cache/acts/*` records were produced by a second, retired pipeline (different chunking/padding;
-activations correlate ~0.97 with the live path, decodes agree to mean |dF| 0.005 — measured, but
+activations correlate ~0.97 with the live path, predictions agree to mean |dF| 0.005 — measured, but
 never certified). `data/songs.py` enumerates the data: 2,304 songs live (1,305 across
 ballroom/beatles/hainsworth/hjdb with official 8-fold assignments + 999 GTZAN test-only);
 run `python data/songs.py` for the coverage report, including which annotated datasets lack

@@ -100,9 +100,14 @@ class Tracker:
     def track(self, signal, sample_rate: int) -> dict:
         """audio -> {'beats': seconds, 'downbeats': seconds}."""
         features = self.frontend.get_features(signal, sample_rate)
+
         if self._should_convert_to_probabilities:
+            # JA: In this case, features is a tensor or array of shape [num_frames, 2]
+            # (beat, downbeat) logits, in which case we need to convert to probabilities before
+            # passing it to the bar-pointer model
             features = 1.0 / (1.0 + np.exp(-np.asarray(features, dtype=np.float64)))
-        return self.bar_pointer.decode(features)
+
+        return self.bar_pointer.predict(features)
 
 
 def build_tracker_from_config(config: dict) -> Tracker:

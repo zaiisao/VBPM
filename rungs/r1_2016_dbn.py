@@ -1,16 +1,16 @@
 """R1 -- Baseline A in OUR framework: the Böck 2016 DBN, hand-set factors, our inference.
 
-The same model R0 runs (madmom's DBN), rebuilt on our own code and decoded with our own DP. THE
+The same model R0 runs (madmom's DBN), rebuilt on our own code and run through our own DP. THE
 CERTIFICATE: if R1 reproduces R0, our inference is validated on a real model and the ladder's anchor
 is set -- after which R0 -> R4 is a clean "hand-set vs learned bar-pointer, same inference" axis.
 R2+ change ONLY how the factors are produced.
 
-Status: R1 and a matched madmom decode the SAME Viterbi path (100% of frames, every song tested) and
+Status: R1 and a matched madmom find the SAME Viterbi path (100% of frames, every song tested) and
 score identically to 4 decimals. madmom's DBNDownBeatTrackingProcessor wraps the model in three
-decode heuristics -- num_tempi=60 (a coarser log-spaced tempo grid), threshold=0.05 (crop to the
+deployment heuristics -- num_tempi=60 (a coarser log-spaced tempo grid), threshold=0.05 (crop to the
 main above-threshold segment) and correct=True (report the activation peak inside a beat region
 rather than the region entry) -- and R1's DEFAULTS now match those shipped values, so out of the
-box R1 == R0 event-for-event. They are decode heuristics, not the model (~+0.006 beat F, almost all
+box R1 == R0 event-for-event. They are deployment heuristics, not the model (~+0.006 beat F, almost all
 of it threshold=0.05 cropping Ballroom's fade-ins/outs); the BARE model -- what the certificate
 pins to a matched madmom and what rung-to-rung comparisons should run -- is the explicit opt-out
 num_tempi=None, threshold=0.0, correct=False.
@@ -48,35 +48,44 @@ class DBN2016(Rung):
                  num_tempi: Optional[int] = 60, threshold: float = 0.05, correct: bool = True):
         """dtype defaults to float64 because R1's whole job is to reproduce madmom's MAP path. In
         float32 the score accumulated over ~20k frames drifts enough to lose it (measured: 0.12 nats
-        worse than madmom on a Beethoven val song -- a strictly suboptimal decode, which Viterbi is
+        worse than madmom on a Beethoven val song -- a strictly suboptimal Viterbi path, which Viterbi is
         not allowed to be). The cost is small: this DP is kernel-launch bound, not compute bound.
 
         num_tempi / threshold / correct default to madmom's SHIPPED values (60 / 0.05 / True), so a
         default R1 reproduces R0 out of the box. The bare model -- every integer interval, no crop,
         no peak snap; what the certificate runs and what rung comparisons should use -- is
         num_tempi=None, threshold=0.0, correct=False (see rungs/bar_pointer/state_space.py and
-        rungs/deployment.py). threshold / correct set the INSTANCE defaults for decode()'s
-        deployment options; decode()'s own arguments still override per call.
+        rungs/deployment.py). threshold / correct set the INSTANCE defaults for predict()'s
+        deployment options; predict()'s own arguments still override per call.
 
         beats_per_bar: an int (single meter) or a collection -- madmom's shipped default is [3, 4].
         Multiple meters replicate madmom's MultiPatternStateSpace exactly: the union HMM is
         block-diagonal with NO cross-meter transitions, so decoding it equals decoding each meter
         separately and keeping the higher-scoring Viterbi path. The one wiring subtlety: madmom's
-        initial distribution is uniform over the UNION, so every meter's decode must use the SAME
+        initial distribution is uniform over the UNION, so every meter's Viterbi search must use the SAME
         constant -log(total states across meters) -- per-meter uniform would bias the comparison
         toward the smaller (3-beat) space by log(num_states ratio).
         """
         self.threshold, self.correct = threshold, correct
+        self.bounding = "clip"      # R1's fixed recipe (unlike R0's frontend-declared one); feeds
+                                    # the shared Rung._bound
+
         if isinstance(beats_per_bar, (int, np.integer)):
             beats_per_bar = (int(beats_per_bar),)
         self.beats_per_bar = tuple(beats_per_bar)
+
         self.fps, self.eps, self.dtype, self.device = fps, eps, dtype, device
 
-        self.state_spaces = [BarPointerStateSpace(fps, min_bpm, max_bpm, bpb,
-                                                  observation_lambda, num_tempi=num_tempi)
-                             for bpb in self.beats_per_bar]
-        self.dynamic_programs = [StructuredBarPointerDP(space, device=device, dtype=dtype)
-                                 for space in self.state_spaces]
+        self.state_spaces = [
+            BarPointerStateSpace(fps, min_bpm, max_bpm, bpb,observation_lambda, num_tempi=num_tempi)
+            for bpb in self.beats_per_bar
+        ]
+
+        self.dynamic_programs = [
+            StructuredBarPointerDP(space, device=device, dtype=dtype)
+            for space in self.state_spaces
+        ]
+
         # Uniform over the union of all meters' states (madmom's initial distribution) -- the shared
         # constant that makes cross-meter score comparison valid.
         total_states = sum(space.num_states for space in self.state_spaces)
@@ -86,14 +95,16 @@ class DBN2016(Rung):
 
         # One meter's tempo grid == every meter's (it depends only on the tempo range), so the
         # tempo transition is shared; built from the first DP.
-        self.log_tempo_transition = self.dynamic_programs[0].build_log_tempo_transition(
-            transition_lambda)
+        self.log_tempo_transition = \
+            self.dynamic_programs[0].build_log_tempo_transition(transition_lambda)
 
         # The DP gathers each state's class density on the fly from this map -- the per-state
         # [num_frames, num_states] emission (2.08 GB per 3-min song) never exists; only the
         # [num_frames, 3] class table (372 KB) does.
-        self.state_to_classes = [torch.from_numpy(space.position_classes).to(device)
-                                 for space in self.state_spaces]
+        self.state_to_classes = [
+            torch.from_numpy(space.position_classes).to(device)
+            for space in self.state_spaces
+        ]
 
         # Single-meter conveniences (what the certificate and R2+ training use).
         self.state_space = self.state_spaces[0]
@@ -121,7 +132,7 @@ class DBN2016(Rung):
         # Deliberately NOT clipped, and madmom does not clip it either. A zero here means the frame
         # CANNOT be a non-beat state; flooring it to log(eps/15) = -14.2 downgrades an impossibility
         # to an improbability, and Viterbi will buy it -- measured on a Ballroom val song where this
-        # fires on just 5 frames: 92.07% path agreement and a 0.0187-nat SUBOPTIMAL decode. Safe
+        # fires on just 5 frames: 92.07% path agreement and a 0.0187-nat SUBOPTIMAL Viterbi path. Safe
         # because decorrelation guarantees no_beat_probability >= 0 (so the worst case is
         # log(0) = -inf, never log(negative) = nan), and the beat/downbeat classes are floored at
         # eps and therefore always finite, so no frame can be -inf in all three classes.
@@ -132,24 +143,22 @@ class DBN2016(Rung):
         return torch.from_numpy(log_class_densities).to(dtype=self.dtype, device=self.device)
 
     @torch.no_grad()
-    def _decode_features(self, activations: np.ndarray, threshold: Optional[float] = None,
+    def _predict_features(self, activations: np.ndarray, threshold: Optional[float] = None,
                             correct: Optional[bool] = None) -> dict:
         """activations: [num_frames, 2] probabilities (beat, downbeat).
 
         threshold / correct: madmom's shipped deployment lessons (crop dead air before decoding /
         report beats at activation peaks), behavior-copied, named as madmom names them. None falls
-        back to the instance defaults (constructor), which are OFF: the bare model is what the
-        certificate pins to madmom and what rung comparisons use. Turn BOTH on with num_tempi=60 to
-        reproduce R0-as-shipped (verified event-identical, 25/25). See rungs/deployment.py.
+        back to the instance defaults (constructor), which are madmom's SHIPPED values; the bare
+        model -- what the certificate pins to madmom and what rung comparisons use -- is the
+        explicit opt-out (threshold=0.0, correct=False). See rungs/deployment.py.
         """
         threshold = self.threshold if threshold is None else threshold
         correct = self.correct if correct is None else correct
-        # The crop must see what the decode sees: the decorrelated pair (madmom thresholds the
-        # combined activation it decodes, not the raw channels).
-        eps = self.eps
-        beat_activation = np.clip(activations[:, 0], eps, 1 - eps)
-        downbeat_activation = np.clip(activations[:, 1], eps, 1 - eps)
-        decorrelation_floor = eps    # clip bounding pairs with an eps floor, as in R0's "clip" recipe
+        # The crop must see what the prediction sees: the decorrelated pair (madmom thresholds the
+        # combined activation it runs on, not the raw channels).
+        beat_activation, downbeat_activation, decorrelation_floor = self._bound(
+            activations[:, 0], activations[:, 1])
 
         decorrelated_activations = self._decorrelate(
             beat_activation, downbeat_activation, decorrelation_floor)
@@ -197,7 +206,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = DBN2016(fps=fps, device=device)
     print(model.state_space)
-    events = model.decode(activations)
+    events = model.predict(activations)
     print(f"synthetic 120 BPM 4/4, 10 s (fps={fps:.1f}), device={device}:")
     print(f"  beats {len(events['beats'])} (expect ~20) | "
           f"downbeats {len(events['downbeats'])} (expect ~5)")
