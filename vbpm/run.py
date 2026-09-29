@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from .config import load_config
-from .variants import base as hooks_base
 from .scoring.evaluation import (evaluate, print_table, scoring_records,
                                  trajectory_health)
 from .data.dataset import split_songs
@@ -34,7 +33,7 @@ def _seed_worker(_worker_id: int) -> None:
 
 
 def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
-          val_set=None, select: str = "none", init_from: str = None):
+          val_set=None, select: str = "none", init_from: str = None, save_dir=None):
     """One seed: run the controls, then fit the objective the hooks define.
 
     ``select`` names a CHECKPOINT RULE, declared before the run rather than chosen
@@ -54,9 +53,7 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
 
     if init_from:
         blob = torch.load(init_from, map_location="cpu", weights_only=False)
-        report = model.load_state_dict(
-            {k: v for k, v in blob["model"].items()
-             if k not in hooks_base.RETIRED_KEYS}, strict=False)
+        report = model.load_state_dict(blob["model"], strict=False)
         frontend._audio2frames.model.load_state_dict(blob["frontend"])
         print(f"warm start from {init_from}\n"
               f"  fresh parameters: {sorted(report.missing_keys)}\n"
@@ -87,8 +84,8 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
             y = raw["y"].to(device, non_blocking=True)
 
             extra = {"raw": raw} if getattr(model, "wants_raw", False) else {}
-            if cfg.meters:
-                extra["cls"] = raw["cls"].to(device, non_blocking=True)
+            extra["cls"] = raw["cls"].to(device, non_blocking=True)
+            extra["has_downbeats"] = raw["has_downbeats"].to(device, non_blocking=True)
             out = model(h, mask, y, pos_weight=cfg.pos_weight, **extra)
 
             # per-frame normalisation and beta-annealed loss; reported elbo is beta=1.
@@ -143,7 +140,7 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
             print(f"            select[{select}] {score:.4f}  "
                   f"best {best['score']:.4f} @ epoch {best['epoch']}", flush=True)
 
-        gain = getattr(hooks_base.emission_of(model), "b", None)
+        gain = getattr(model.emission_model, "b", None)
         b_note = "" if gain is None else f"  b {float(gain):5.2f}"
         adv, kap, perr, cov = health / steps
         res, kloff = anchor / steps
@@ -155,6 +152,13 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
               f"phase_err {perr:5.3f} (chance 1.571)  circle {cov:5.1%}  "
               f"|g| {gnorm / steps:8.2f}{a_note}",
               flush=True)
+
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": model.state_dict(),
+                        "frontend": frontend._audio2frames.model.state_dict(),
+                        "config": vars(cfg), "seed": seed, "epoch": epoch},
+                       save_dir / f"seed{seed}_epoch{epoch:02d}.pt")
 
     if best["state"] is not None:
         model.load_state_dict(best["state"])
@@ -220,8 +224,8 @@ def main() -> None:
           f"per epoch, rejects {len(train_set.rejects)}")
 
     model = train(train_set, frontend, device, cfg, hooks, args.seed, args.workers,
-                  val_set=val_set, select=args.select,
-                  init_from=args.init_from)
+                  val_set=val_set, select=args.select, init_from=args.init_from,
+                  save_dir=pathlib.Path(args.save_dir) if args.save_dir else None)
 
     if getattr(model, "_selected", None) is None and args.select != "none":
         pass

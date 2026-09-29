@@ -4,7 +4,7 @@ from __future__ import annotations
 import dataclasses
 import math
 
-from .constants import (KAPPA_PHYSICAL, TEMPO_PRIOR_MU, TEMPO_PRIOR_SIGMA,
+from .constants import (PRIOR_PHASE_KAPPA, TEMPO_PRIOR_MU, TEMPO_PRIOR_SIGMA,
                         TEMPO_WALK_SIGMA)
 
 
@@ -17,10 +17,9 @@ class EmissionSpec:
     dim: int = 64
     positional: bool = False
     bump_kappa: float = 20.0
-    fit_init: bool = False
     frozen: bool = False
     floor: float = 0.0
-    beat_channel: bool = False
+    nested: bool = False
 
 
 @dataclasses.dataclass
@@ -28,14 +27,14 @@ class WalkSpec:
     """p(phi_t | phi_t-1): the tempo walk's law and the phase prior's tightness."""
 
     kind: str = "gauss"
-    kappa_physical: float = KAPPA_PHYSICAL
+    prior_phase_kappa: float = PRIOR_PHASE_KAPPA
     kappa_gate: bool = False
     tempo_mu: float = TEMPO_PRIOR_MU
     tempo_sigma: float = TEMPO_PRIOR_SIGMA
     walk_sigma: float = TEMPO_WALK_SIGMA
 
     def __post_init__(self):
-        self.kappa_physical = float(self.kappa_physical)
+        self.prior_phase_kappa = float(self.prior_phase_kappa)
         self.kappa_gate = bool(self.kappa_gate)
         self.tempo_mu = float(self.tempo_mu)
         self.tempo_sigma = float(self.tempo_sigma)
@@ -95,7 +94,7 @@ class RateSpec:
     lo: float = 0.020
     hi: float = 0.200
     per_bar: bool = True
-    meters: tuple = ()
+    meters: tuple = (2, 3, 4, 5, 6, 7, 8)
     meter_prior: str = "corpus"
     posterior: str = "categorical"
     resid: float = 0.0

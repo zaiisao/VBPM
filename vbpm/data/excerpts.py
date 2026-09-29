@@ -95,7 +95,8 @@ class ExcerptDataset(torch.utils.data.Dataset):
             mask = np.pad(mask, (0, pad))
 
         return {"input": window, "y": targets["y"], "cls": targets["cls"],
-                "mask": mask, "beat_times": targets["beat_times"],
+                "mask": mask, "has_downbeats": np.float32(len(downbeat_times) > 0),
+                "beat_times": targets["beat_times"],
                 "t0": np.float32(start / self.fps), "fps": np.float32(self.fps),
                 "downbeat_times": targets["downbeat_times"],
                 "anchors": targets["anchors"],
@@ -154,7 +155,7 @@ def collate_excerpts(batch: list) -> dict:
     out = {}
     for key in ("input", "y", "cls", "mask"):
         out[key] = torch.from_numpy(np.stack([item[key] for item in batch]))
-    for key in ("t0", "fps"):
+    for key in ("t0", "fps", "has_downbeats"):
         out[key] = torch.tensor([item[key] for item in batch])
     for key in ("downbeat_times", "beat_times", "anchors", "dataset", "song_id"):
         out[key] = [item[key] for item in batch]

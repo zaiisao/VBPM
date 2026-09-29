@@ -124,7 +124,7 @@
     "minimum": 1.0,
     "description": "window length. Below ~45 s the ELBO cannot separate tracking the truth from coasting on a constant period (crop-horizon root cause)."
   },
-  "kappa_physical": {
+  "prior_phase_kappa": {
     "type": "number",
     "default": 383.0,
     "minimum": 0.0,
@@ -199,15 +199,33 @@
     "default": false,
     "description": "q reads the labels as well as the audio, and a second audio-only network becomes the conditional prior p_eta(z | x). The note's asymmetry: x is in every factor, b only in the posterior. Deployment then reads the prior, since b is absent at inference."
   },
-  "emission_fit_init": {
-    "type": "boolean",
-    "default": false,
-    "description": "initialise the emission's offset, gain and decay scales at the maximum-likelihood fit of p(y|phi) measured on the train folds, instead of at the scoring tolerance."
-  },
   "emission_frozen": {
     "type": "boolean",
     "default": false,
     "description": "hold the emission's offset, gain and decay scales fixed at their initial values; the rest of the model still trains."
+  },
+  "bar_walk_sigma": {
+    "type": "number",
+    "default": 0.02,
+    "minimum": 0.0,
+    "description": "sd of the Gaussian walk on log-rate BETWEEN BARS, the only place the rate may move. Per-frame walk laws are all refuted (audit 2026-08-19); a bar-gated increment is the law the bar-gated chain already assumed, priced continuously instead of through a 36-atom grid."
+  },
+  "delta_rel": {
+    "type": "number",
+    "default": 0.35,
+    "minimum": 0.0,
+    "description": "cap on the per-frame phase correction as a fraction of the current rate; the cap enters q and its KL alike, so it restricts the family without breaking the bound."
+  },
+  "kappa_q_min": {
+    "type": "number",
+    "default": 0.01,
+    "minimum": 0.0,
+    "description": "floor on the posterior concentration of a phase step, so a diffuse step stays numerically finite."
+  },
+  "emission_nested": {
+    "type": "boolean",
+    "default": false,
+    "description": "factorise the class emission as p(beat | phi, m) * p(downbeat | beat, phi) with a Bernoulli per factor, instead of a softmax over {N, B, D}. A downbeat is then a beat rather than its exclusive alternative, so the beat channel is rewarded at phase 0 instead of losing there to the downbeat class."
   },
   "emission_floor": {
     "type": "number",
@@ -222,8 +240,8 @@
   },
   "meters": {
     "type": "array",
-    "default": [],
-    "description": "beats-per-bar values the chain enumerates; empty keeps the downbeat-only model. Meter joins rate in the state and may change only at a wrapping phase transition."
+    "default": [2, 3, 4, 5, 6, 7, 8],
+    "description": "beats-per-bar values the chain enumerates; at least one is required. Meter joins rate in the state and may change only at a wrapping phase transition."
   },
   "meter_prior": {
     "type": "string",

@@ -73,7 +73,7 @@ def e1_rank_one(cfg, model, frontend, device, songs):
         for raw, records in crops(cfg, model, songs) if False else crops(cfg, frontend, songs):
             h = frontend.forward_features(raw["input"])
             mask = raw["mask"].to(device)
-            feats = model.encoder.features(h, mask)
+            feats = model.encoder(h, mask)
             log_psi = torch.log_softmax(model.psi_head(feats), dim=-1)
             for i, rec in enumerate(records):
                 if rec is None:

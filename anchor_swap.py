@@ -62,7 +62,7 @@ class V1AnchorK(VBPM):
                              torch.atan2(torch.sin(shifts), torch.cos(shifts)))
 
     def slot_logits(self, h, mu, mask=None):
-        trunk = self.encoder.features(h)
+        trunk = self.encoder(h)
         w = torch.ones(mu.shape, device=mu.device) if mask is None else mask
         pooled = (trunk * w.unsqueeze(-1)).sum(1) / w.sum(1, keepdim=True).clamp(min=1.0)
         return self.k_head(pooled)

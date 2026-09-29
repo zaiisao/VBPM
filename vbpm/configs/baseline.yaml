@@ -14,8 +14,6 @@ variant: vbpm
 emission: triangle
 target_tol_frames: 0
 
-ar_rate_lo: 0.012
-ar_rate_hi: 0.200
 chain_rate_grid: 36
 
 excerpt_seconds: 30.0
@@ -24,5 +22,6 @@ epochs: 24
 lr: 3.0e-4
 beta_warmup: 0
 pos_weight: 1.0
-kappa_physical: 383.0
+prior_phase_kappa: 383.0
 frontend_lr_scale: 0.0
+meters: [3, 4]

@@ -54,25 +54,6 @@ def defaults() -> dict:
     return {key: spec["default"] for key, spec in schema().items()}
 
 
-HOOKS = ("build_model", "optimizer", "objective", "on_epoch")
-
-
-def _hooks(module):
-    """The variant's hooks, falling back to base for the ones it does not override."""
-    from .variants import base
-
-    def pick(name):
-        if hasattr(module, name):
-            return getattr(module, name)
-        fallback = getattr(base, name, None)
-        assert fallback is not None, f"{module.__name__} must define the {name} hook"
-        return fallback
-
-    return SimpleNamespace(__name__=module.__name__,
-                           DEFAULTS=getattr(module, "DEFAULTS", {}),
-                           **{name: pick(name) for name in HOOKS})
-
-
 def load_config(path: str, overrides: list[str] = ()):
     """YAML + --set overrides -> (cfg namespace, hooks module)."""
     recipe = yaml.safe_load(pathlib.Path(path).read_text()) or {}
@@ -81,14 +62,12 @@ def load_config(path: str, overrides: list[str] = ()):
         recipe[key.strip().replace("-", "_")] = yaml.safe_load(value)
 
     mainline = schema()
-    module = importlib.import_module(
-        f"vbpm.variants.{recipe.get('variant', mainline['variant']['default'])}")
-    hooks = _hooks(module)
+    hooks = importlib.import_module("vbpm.model")
     known = {key: spec["default"] for key, spec in mainline.items()}
-    known |= getattr(module, "DEFAULTS", {})
+    known |= hooks.DEFAULTS
     unknown = set(recipe) - set(known)
-    assert not unknown, f"unknown config keys {sorted(unknown)} (typo? variant key?)"
+    assert not unknown, f"unknown config keys {sorted(unknown)} (typo?)"
     for key, value in recipe.items():
-        if key in mainline:            # variant keys stay the variant module's business
+        if key in mainline:
             check(key, value, mainline[key])
     return SimpleNamespace(**(known | recipe)), hooks

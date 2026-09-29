@@ -121,12 +121,14 @@ def null_times(crop, kind: str, rng):
     return crop["t0"] + offset + np.arange(0.0, max(duration, 0.0), period)
 
 
-def rule_g_times(mu, mask, raw, meter=None):
-    """Rule-g event TIMES per crop; ``meter`` scales the phase to read BEATS."""
-    phase = mu if meter is None else mu * meter.reshape(-1, 1)
-    wraps = [w.cpu().numpy() for w in downbeat_times(phase, mask)]
-    return [wraps[i][wraps[i] < len(c["y"]) - 1] / c["fps"] + c["t0"]
-            for i, c in enumerate(raw)]
+def event_times(flags, crossing, raw):
+    """Event TIMES per crop from the path's own crossings, interpolated within the frame."""
+    return [crossing[i][flags[i]].cpu().numpy() for i in range(len(raw))]
+
+
+def crop_times(frames, raw):
+    """Frame positions -> seconds, dropping events past each crop's last valid frame."""
+    return [f[f < len(c["y"]) - 1] / c["fps"] + c["t0"] for f, c in zip(frames, raw)]
 
 
 def scoring_records(raw) -> list:
@@ -166,12 +168,14 @@ def evaluate(model, dataset, frontend, device, batch_size: int, seed: int = 0):
             h = frontend.forward_features(raw["input"]).clone()
             mask = raw["mask"].to(device, non_blocking=True)
 
-            mu = model.infer_phase(h, mask)[keep]
-            times = rule_g_times(mu, mask[keep], crops)
-            meter = model.infer_meter(h, mask)
-            beats = (None if meter is None else
-                     rule_g_times(mu, mask[keep], crops, meter=meter[keep]))
-            probs = model.emission_probs(h, mask)[keep].cpu().numpy()
+            path = model.infer_path(h, mask)
+            mu = path["phi_path"][keep]
+            crossing = path["crossing"][keep]
+            times = crop_times(event_times(path["is_downbeat"][keep], crossing, crops), crops)
+            beats = crop_times(event_times(path["is_beat"][keep], crossing, crops), crops)
+            probs = model.emission_probs(h, mask, path)[keep].cpu().numpy()
+            beats_per_bar = path["meter_path"] @ model.meter_values
+            meter = (beats_per_bar * mask).sum(1) / mask.sum(1).clamp(min=1.0)
 
             # the peak picker and the nulls need a bar period; take the model's OWN
             # inferred tempo, the only period left in the pipeline now that delta is gone

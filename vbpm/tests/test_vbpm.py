@@ -443,35 +443,42 @@ def test_smooth_marginals_match_brute_force_enumeration():
     from vbpm.specs import RateSpec, WalkSpec
 
     _seed()
-    C, N, T = 2, 4, 4
-    prior = PriorModel(RateSpec(grid=C, lo=0.05, hi=0.12),
+    C, N, T, METERS = 2, 3, 3, (3, 4)
+    M = len(METERS)
+    prior = PriorModel(RateSpec(grid=C, lo=0.05, hi=0.12, meters=METERS),
                        WalkSpec(kappa_physical=3.0), n_grid=N).double()
     post = PosteriorModel(8, 8, prior, n_harm=1).double()
     evidence = torch.randn(1, T, N, dtype=torch.float64) * 0.7
     log_q_rate0 = torch.log_softmax(torch.randn(1, C, dtype=torch.float64), -1)
+    log_q_meter = torch.log_softmax(torch.randn(1, M, dtype=torch.float64), -1)
 
-    q_phase, q_rate, _, log_z = post.smooth(evidence, log_q_rate0, prior)
+    q_phase, q_rate, q_meter, log_z = post.smooth(evidence, log_q_rate0, prior,
+                                                  log_q_meter)
 
     p0 = torch.softmax(prior.rate_log_prior, 0)
-    total, marginal = 0.0, torch.zeros(T, C, N, dtype=torch.float64)
-    for path in itertools.product(range(C * N), repeat=T):
-        states = [(k // N, k % N) for k in path]
-        c0, n0 = states[0]
-        w = (float(p0[c0]) * float(log_q_rate0[0, c0].exp()) / N
+    pm0 = torch.softmax(prior.meter_log_prior, 0)
+    total, marginal = 0.0, torch.zeros(T, M, C, N, dtype=torch.float64)
+    for path in itertools.product(range(M * C * N), repeat=T):
+        states = [(k // (C * N), (k // N) % C, k % N) for k in path]
+        u0, c0, n0 = states[0]
+        w = (float(pm0[u0]) * float(log_q_meter[0, u0].exp())
+             * float(p0[c0]) * float(log_q_rate0[0, c0].exp()) / N
              * float(evidence[0, 0, n0].exp()))
         for t in range(1, T):
-            (c, m), (d, n) = states[t - 1], states[t]
-            step = (prior.k_stay[c, m, n] * (c == d)
-                    + prior.k_wrap[c, m, n] * prior.switch[c, d])
-            w *= float(step) * float(evidence[0, t, n].exp())
+            (u, c, i), (v, d, j) = states[t - 1], states[t]
+            step = (prior.k_stay[c, i, j] * (c == d) * (u == v)
+                    + prior.k_wrap[c, i, j] * prior.switch[c, d]
+                    * prior.meter_switch[u, v])
+            w *= float(step) * float(evidence[0, t, j].exp())
         total += w
-        for t, (c, n) in enumerate(states):
-            marginal[t, c, n] += w
+        for t, (u, c, n) in enumerate(states):
+            marginal[t, u, c, n] += w
 
     assert float(log_z[0]) == pytest.approx(math.log(total), abs=1e-6)
     ref = marginal / total
-    assert torch.allclose(q_phase[0], ref.sum(1), atol=1e-12)
-    assert torch.allclose(q_rate[0], ref.sum(2), atol=1e-12)
+    assert torch.allclose(q_phase[0], ref.sum(2), atol=1e-12)
+    assert torch.allclose(q_rate[0], ref.sum((1, 3)), atol=1e-12)
+    assert torch.allclose(q_meter[0], ref.sum((2, 3)), atol=1e-12)
 
 
 def test_emission_loglik_is_the_bernoulli_it_claims():
@@ -486,7 +493,7 @@ def test_emission_loglik_is_the_bernoulli_it_claims():
     mask = torch.ones(2, 30, dtype=torch.float64)
     mask[1, -5:] = 0.0
 
-    ours = emission.loglik(y, mask, grid)
+    ours = emission.bernoulli_loglik(emission(grid), y, mask)
     logits = emission(grid)[None, None].expand(2, 30, 128)
     reference = -torch.nn.functional.binary_cross_entropy_with_logits(
         logits, y[..., None].expand(2, 30, 128), reduction="none") * mask[..., None]

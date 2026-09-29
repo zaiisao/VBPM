@@ -98,7 +98,7 @@ def main():
                                + list(model.psi_head.parameters()), lr=1e-3)
     for _ in range(args.fit_steps):
         opt_fit.zero_grad()
-        feats = model.encoder.features(h, mask)
+        feats = model.encoder(h, mask)
         loss = torch.nn.functional.cross_entropy(
             model.psi_head(feats)[0], target)
         loss.backward()
