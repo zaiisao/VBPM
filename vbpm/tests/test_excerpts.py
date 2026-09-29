@@ -1,6 +1,5 @@
 """Excerpt dataset: window draws, target math, padding, collate — frontend-free."""
 import numpy as np
-import torch
 
 from vbpm.data.excerpts import (ExcerptDataset, collate_excerpts,
                                     input_cache_path)
@@ -147,14 +146,3 @@ def test_construction_computes_and_reuses_the_input_cache(tmp_path):
 # ---------------------------------------------------------------------------
 # The no-oracle contract: delta reaches the model from AUDIO, never annotations.
 # ---------------------------------------------------------------------------
-
-def test_estimated_period_recovers_a_planted_bar():
-    from vbpm.data.tempo import estimate_bar_period
-
-    activation = torch.zeros(2, 2250)
-    activation[0, ::100] = 1.0                                 # 2.0 s
-    activation[1, ::75] = 1.0                                  # 1.5 s
-    activation += 0.02
-    period = estimate_bar_period(activation, torch.ones(2, 2250), 50.0)
-    assert abs(float(period[0]) - 2.0) < 0.05
-    assert abs(float(period[1]) - 1.5) < 0.05

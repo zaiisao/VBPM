@@ -2,20 +2,13 @@
 from __future__ import annotations
 
 import math
-from typing import NamedTuple
 
 import torch
 from torch import nn
 
-from .constants import (EMISSION_FIT_A, EMISSION_FIT_B, EMISSION_FIT_TAU,
-                        EMISSION_FIT_TAU_BACK, FPS, METER0_SHARE, METER_SONG_SHARE,
-                        METER_STAY, TEMPO0_BPM, TEMPO0_BPM_SD, TWO_PI)
-from .specs import EmissionSpec, RateSpec, WalkSpec
+from .constants import FPS, METER0_SHARE, TEMPO0_BPM, TEMPO0_BPM_SD, TWO_PI
+from .specs import EmissionSpec, WalkSpec
 from .vonmises import sample_vonmises, sample_vonmises_icdf
-
-N_HARM = 12             # band limit of the recognition potentials
-GAMMA = 0.0363          # corpus median per-bar |dlog rate|, the Cauchy scale
-N_GRID = 128            # quadrature nodes on the phase circle
 
 
 def sinusoidal_encoding(length: int, dim: int) -> torch.Tensor:
@@ -60,32 +53,6 @@ class Encoder(nn.Module):
             h = h + self.pe[:h.shape[1]]
 
         return self.blocks(h, src_key_padding_mask=pad)
-
-
-class Marginals(NamedTuple):
-    """What forward-backward returns: per-frame beliefs and the log normaliser."""
-
-    q_phase: torch.Tensor
-    q_rate: torch.Tensor
-    q_meter: torch.Tensor
-    log_z: torch.Tensor
-
-
-class Posterior(NamedTuple):
-    """The recognition potentials and the marginals they induce through the chain."""
-
-    evidence: torch.Tensor
-    log_q_rate0: torch.Tensor
-    log_q_meter: torch.Tensor | None
-    q_phase: torch.Tensor
-    q_rate: torch.Tensor
-    q_meter: torch.Tensor
-    log_z: torch.Tensor
-
-    @property
-    def phase_marginal(self):
-        """[B,T,N]: q_phase with the meter axis summed out."""
-        return self.q_phase.sum(2)
 
 
 class PosteriorModel(nn.Module):

@@ -1,21 +1,4 @@
 {
-  "variant": {
-    "type": "string",
-    "default": "base",
-    "description": "hooks module under vbpm.variants that owns the model; base is tutorial 7 (encoder-deployed, no conditional prior). A new recipe is a new module plus a new config, never a flag in run.py."
-  },
-  "emission": {
-    "type": "string",
-    "default": "triangle",
-    "enum": [
-      "cosine",
-      "triangle",
-      "laplace",
-      "alaplace",
-      "bump"
-    ],
-    "description": "p(y | phi) shape. cosine is the tutorial's own a + b cos(phi); triangle is the symmetric tent, non-zero across the whole bar; laplace replaces a rectangular window's far edge with an exponential tail, keeping band's asymmetry while restoring a gradient at every phase, and its decay length is a continuous parameter rather than an integer width; alaplace gives that decay a second, independent scale running backward from the onset, which removes laplace's late bias -- the tent and the one-sided band are the two corners of this family -- and lets the data set the asymmetry; bump is the von Mises-shaped narrow peak whose width is emission_bump_kappa."
-  },
   "emission_layers": {
     "type": "integer",
     "default": 2,
@@ -27,38 +10,11 @@
     "default": false,
     "description": "transformer emission only: add positional encoding, letting the emission read FRAME INDEX as well as phase."
   },
-  "emission_bump_kappa": {
-    "type": "number",
-    "default": 20.0,
-    "minimum": 0.001,
-    "description": "bump emission only: concentration of the peak. The bump is exp(kappa (cos phi - 1)), so its half-width is about sqrt(2/kappa) radians of bar phase."
-  },
   "target_tol_frames": {
     "type": "integer",
     "default": 0,
     "minimum": 0,
     "description": "half-width in frames of the framewise target y. 0 is the tutorial's own b (eq 55): one frame per downbeat, at which point the two emission_recon terms are identical by construction. Widening it smears one downbeat over 2n+1 frames, which no longer is b."
-  },
-  "chain_bins": {
-    "type": "integer",
-    "default": 96,
-    "minimum": 8,
-    "description": "schain only: phase cells. Bin width is one bar / chain_bins, so it bounds placement resolution; 96 is about 21 ms on a 2 s bar."
-  },
-  "chain_rate_grid": {
-    "type": "integer",
-    "default": 24,
-    "minimum": 1,
-    "description": "schain only: enumerated rate candidates, log-spaced. Each runs its own chain, so cost is linear in this."
-  },
-  "chain_posterior": {
-    "type": "string",
-    "default": "chain",
-    "enum": [
-      "chain",
-      "frames"
-    ],
-    "description": "schain only: chain is the structured posterior; frames is the factorised control that switches the coupling off while keeping everything else identical."
   },
   "epochs": {
     "type": "integer",
@@ -106,18 +62,6 @@
     "minimum": 0,
     "description": "epochs to ramp beta linearly from beta_start to beta_end; 0 disables annealing."
   },
-  "emission_sharpness": {
-    "type": "number",
-    "default": 0.0,
-    "minimum": 0.0,
-    "description": "scheduled floor on the emission amplitude b (closed-form emissions only); 0 leaves b free."
-  },
-  "sharpness_warmup": {
-    "type": "integer",
-    "default": 30,
-    "minimum": 1,
-    "description": "epochs over which the emission_sharpness floor ramps in."
-  },
   "excerpt_seconds": {
     "type": "number",
     "default": 45.0,
@@ -129,32 +73,6 @@
     "default": 383.0,
     "minimum": 0.0,
     "description": "concentration of the physical prior's increment law: the DRIFT TAX. Real tempo wobble is heavy-tailed, so lowering this cuts the KL price of expressing drift."
-  },
-  "tempo_prior_mu": {
-    "type": "number",
-    "default": -2.6827,
-    "description": "mean of p(log dotphi_1), the ONLY term pricing tempo LEVEL (the walk prices changes, not the level, so a random walk is indifferent to which octave it sits in). Refit on train folds: 1665 songs, mean log bar rate -2.6827 = 1.84 s per bar. The shipped -2.5028 (1.53 s) put the octave flip point at 2.17 s, so songs slower than that were pushed to 2x."
-  },
-  "tempo_prior_sigma": {
-    "type": "number",
-    "default": 0.3903,
-    "minimum": 0.01,
-    "description": "sd of p(log dotphi_1), refit on the same train folds (shipped 0.5005). Narrower makes the level prior more opinionated, which moves the octave flip point out to 2.60 s."
-  },
-  "walk_sigma": {
-    "type": "number",
-    "default": 0.00212,
-    "minimum": 1e-06,
-    "description": "per-frame sd of the tempo walk: how much log tempo may change between adjacent frames. One number for every song, which the corpus says it cannot be -- per-song variability spans 20x (hjdb 0.005 to asap 0.077 per bar) and is a stable property of a performance (split-half r 0.81). Held-out fit favours a per-song scale by +2.2 nats/step over any global value, and heavy tails by only +0.9."
-  },
-  "phase_init": {
-    "type": "string",
-    "default": "anchor",
-    "enum": [
-      "anchor",
-      "uniform"
-    ],
-    "description": "where phi_1 comes from. anchor takes the closed-form circular mean of the encoder's evidence channel folded under the mean ramp -- the read-out that carried 82% of the anchor jump. uniform draws it at random, which leaves nothing anchoring placement and was committed at 89cb1f7 as an explicit null."
   },
   "frontend": {
     "type": "string",
@@ -177,79 +95,9 @@
     "default": false,
     "description": "clip each parameter tensor against cfg.clip separately instead of one pooled norm (which one tensor dominated, throttling all others). Changes the log's |g|: pooled norm when false, largest single-tensor norm when true."
   },
-  "lambda_distill": {
-    "type": "number",
-    "default": 1.0,
-    "minimum": 0.0,
-    "description": "psi only: weight on KL(q || p_psi), the term that buys transfer to the deployed prior. It used to enter hardcoded at 1.0 while lambda_prior weighted only prior_anchor -- measured at init, distill was 355 nats/frame against recon 0.11 and prior_anchor 2.5, so ~99% of the objective was untunable and every past lambda_prior sweep moved the wrong term."
-  },
-  "lambda_tempo": {
-    "type": "number",
-    "default": 0.0,
-    "minimum": 0.0,
-    "description": "psi only: weight on an explicit log-dotphi distillation, mean-squared (log dotphi_p - log dotphi_q). 0 reproduces the old behaviour. Motivation: in a transfer experiment against a known teacher on input where the tempo is trivially readable, the ANCHOR converged every run (0.000-0.015 of a bar) while the RATE was a lottery (0.08%-60.9%, median ~25%) at every kappa from 0.1 to 383 -- through a phase density a tempo error only arrives as accumulated phase."
-  },
-  "phi0_posterior": {
-    "type": "boolean",
-    "default": false,
-    "description": "q(phi_0) comes from its own boundary head instead of the anchor's point mass. The note's eq (7): the first latent is a von Mises like every other frame, so the initial KL is finite and closed form and the chain has something for later evidence to reweight."
-  },
-  "posterior_reads_b": {
-    "type": "boolean",
-    "default": false,
-    "description": "q reads the labels as well as the audio, and a second audio-only network becomes the conditional prior p_eta(z | x). The note's asymmetry: x is in every factor, b only in the posterior. Deployment then reads the prior, since b is absent at inference."
-  },
-  "emission_frozen": {
-    "type": "boolean",
-    "default": false,
-    "description": "hold the emission's offset, gain and decay scales fixed at their initial values; the rest of the model still trains."
-  },
-  "bar_walk_sigma": {
-    "type": "number",
-    "default": 0.02,
-    "minimum": 0.0,
-    "description": "sd of the Gaussian walk on log-rate BETWEEN BARS, the only place the rate may move. Per-frame walk laws are all refuted (audit 2026-08-19); a bar-gated increment is the law the bar-gated chain already assumed, priced continuously instead of through a 36-atom grid."
-  },
-  "delta_rel": {
-    "type": "number",
-    "default": 0.35,
-    "minimum": 0.0,
-    "description": "cap on the per-frame phase correction as a fraction of the current rate; the cap enters q and its KL alike, so it restricts the family without breaking the bound."
-  },
-  "kappa_q_min": {
-    "type": "number",
-    "default": 0.01,
-    "minimum": 0.0,
-    "description": "floor on the posterior concentration of a phase step, so a diffuse step stays numerically finite."
-  },
-  "emission_nested": {
-    "type": "boolean",
-    "default": false,
-    "description": "factorise the class emission as p(beat | phi, m) * p(downbeat | beat, phi) with a Bernoulli per factor, instead of a softmax over {N, B, D}. A downbeat is then a beat rather than its exclusive alternative, so the beat channel is rewarded at phase 0 instead of losing there to the downbeat class."
-  },
-  "emission_floor": {
-    "type": "number",
-    "default": 0.0,
-    "minimum": 0.0,
-    "description": "probability that a downbeat annotation is drawn from a phase-independent background rather than from the emission's shape, which bounds what a misplaced downbeat can cost; 0 is the plain Bernoulli emission."
-  },
-  "tempo_per_bar": {
-    "type": "boolean",
-    "default": true,
-    "description": "the rate may change at a wrapping phase transition, paying the wrapped-Cauchy cost on log-rate; false makes the switch the identity, so one rate carries the whole window -- the rigid control."
-  },
   "meters": {
     "type": "array",
     "default": [2, 3, 4, 5, 6, 7, 8],
     "description": "beats-per-bar values the chain enumerates; at least one is required. Meter joins rate in the state and may change only at a wrapping phase transition."
-  },
-  "meter_prior": {
-    "type": "string",
-    "default": "corpus",
-    "enum": [
-      "uniform",
-      "corpus"
-    ],
-    "description": "p(m): corpus is the song-weighted share measured over 4,900 songs in sixteen corpora -- 0.831 on m=4, 0.012 on m=8. uniform is available as an ablation, and charges nothing for a meter the corpus almost never contains."
   }
 }

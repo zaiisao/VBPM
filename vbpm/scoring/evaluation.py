@@ -9,7 +9,6 @@ import torch
 
 from ..data.excerpts import collate_excerpts
 from ..constants import TWO_PI
-from ..readout import downbeat_times
 
 TOLERANCE_S = 0.070
 

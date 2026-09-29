@@ -156,16 +156,6 @@ class VBPM(nn.Module):
         return self.draws_to_paths(self.prior_model.sample(h, mask), mask)
 
     @torch.no_grad()
-    def infer_phase(self, h, mask=None):
-        """[B, T] deployed phase path."""
-        return self.infer_path(h, mask)["phi_path"]
-
-    @torch.no_grad()
-    def infer_meter(self, h, mask=None):
-        """[B, T] deployed beats-per-bar, held per bar."""
-        return self.infer_path(h, mask)["meter_path"] @ self.meter_values
-
-    @torch.no_grad()
     def emission_probs(self, h, mask=None, path=None):
         """Per-frame downbeat probability along the deployed path."""
         if mask is None:
@@ -179,8 +169,7 @@ class VBPM(nn.Module):
 def build_model(cfg, input_dim: int) -> VBPM:
     """One VBPM from a config."""
     emission = EmissionSpec(layers=cfg.emission_layers, positional=cfg.emission_positional)
-    walk = WalkSpec(prior_phase_kappa=cfg.prior_phase_kappa, tempo_mu=cfg.tempo_prior_mu,
-                    tempo_sigma=cfg.tempo_prior_sigma, walk_sigma=cfg.walk_sigma)
+    walk = WalkSpec(prior_phase_kappa=cfg.prior_phase_kappa)
     return VBPM(input_dim, meters=tuple(cfg.meters), emission=emission, walk=walk)
 
 

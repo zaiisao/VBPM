@@ -49,11 +49,6 @@ def schema() -> dict:
     return loaded
 
 
-def defaults() -> dict:
-    """{key: default} for the mainline -- the schema with the prose stripped off."""
-    return {key: spec["default"] for key, spec in schema().items()}
-
-
 def load_config(path: str, overrides: list[str] = ()):
     """YAML + --set overrides -> (cfg namespace, hooks module)."""
     recipe = yaml.safe_load(pathlib.Path(path).read_text()) or {}

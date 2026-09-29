@@ -118,14 +118,6 @@ def sample_vonmises(kappa: torch.Tensor, max_rounds: int = 64) -> torch.Tensor:
     return angle.to(kappa.dtype)
 
 
-def second_resultant(kappa: torch.Tensor) -> torch.Tensor:
-    """A_2(kappa) = I_2/I_0 = E[cos 2(phi - mu)] under vM(mu, kappa)."""
-    a1 = mean_resultant(kappa)
-    return torch.where(kappa < 0.1,
-                       kappa * kappa / 8.0,
-                       1.0 - (2.0 / kappa.clamp(min=1e-12)) * a1)
-
-
 TWO_PI = 2.0 * math.pi
 VM_NODES = 512
 
