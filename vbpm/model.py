@@ -37,7 +37,7 @@ class VBPM(nn.Module):
     def draws_to_paths(self, draw, mask):
         """Paths from one draw: tempo held between beats, meter held between downbeats."""
         phi0, phase_draw = draw["phase0"], draw["phase"]
-        tempo_draw, meter_draw = draw["tempo"], draw["meter"]
+        log_tempo_draw, meter_draw = draw["log_tempo"], draw["meter"]
 
         B, T = phase_draw.shape
         batch_idx = torch.arange(B, device=mask.device)
@@ -47,7 +47,7 @@ class VBPM(nn.Module):
         phase_step = torch.cat([torch.zeros_like(phase_step[:, :1]), phase_step[:, 1:]], 1)
 
         phi_path = phi0[:, None].expand(B, T).clone()
-        tempo_path = tempo_draw[:, :1].expand(B, T).clone()
+        log_tempo_path = log_tempo_draw[:, :1].expand(B, T).clone()
         meter_path = meter_draw[:, :1].expand(B, T, -1).clone()
         is_beat = torch.zeros(B, T, dtype=torch.bool, device=mask.device)
         is_downbeat = torch.zeros(B, T, dtype=torch.bool, device=mask.device)
@@ -55,7 +55,7 @@ class VBPM(nn.Module):
 
         seg_start = torch.zeros(B, dtype=torch.long, device=mask.device)
         seg_phi_start = phi0
-        seg_tempo = tempo_draw[:, 0]
+        seg_log_tempo = log_tempo_draw[:, 0]
         seg_meter = meter_draw[:, 0]
         active = torch.ones(B, dtype=torch.bool, device=mask.device)
 
@@ -64,7 +64,7 @@ class VBPM(nn.Module):
                 break
 
             ahead = frames[None, :] > seg_start[:, None]
-            steps = (seg_tempo[:, None] * mask + phase_step) * ahead
+            steps = (seg_log_tempo.exp()[:, None] * mask + phase_step) * ahead
             seg_phi = seg_phi_start[:, None] + torch.cumsum(steps, 1)
 
             beat_spacing = TWO_PI / (seg_meter @ self.meter_values)
@@ -79,7 +79,7 @@ class VBPM(nn.Module):
 
             in_seg = ahead & (frames[None, :] <= seg_end[:, None]) & active[:, None]
             phi_path = torch.where(in_seg, seg_phi, phi_path)
-            tempo_path = torch.where(in_seg, seg_tempo[:, None], tempo_path)
+            log_tempo_path = torch.where(in_seg, seg_log_tempo[:, None], log_tempo_path)
             meter_path = torch.where(in_seg[..., None], seg_meter[:, None, :], meter_path)
 
             downbeat = crossed & (beat_index * beat_spacing >= TWO_PI - 1e-4)
@@ -91,14 +91,14 @@ class VBPM(nn.Module):
             is_downbeat[batch_idx[downbeat], seg_end[downbeat]] = True
 
             seg_phi_start = seg_phi[batch_idx, seg_end]
-            new_tempo = seg_tempo + tempo_draw[batch_idx, seg_end]
-            seg_tempo = torch.where(crossed, new_tempo, seg_tempo)
+            new_log_tempo = seg_log_tempo + log_tempo_draw[batch_idx, seg_end]
+            seg_log_tempo = torch.where(crossed, new_log_tempo, seg_log_tempo)
             new_meter = meter_draw[batch_idx, seg_end]
             seg_meter = torch.where(downbeat[:, None], new_meter, seg_meter)
             seg_start = seg_end
             active = crossed
 
-        return {"phi_path": phi_path, "tempo_path": tempo_path, "meter_path": meter_path,
+        return {"phi_path": phi_path, "log_tempo_path": log_tempo_path, "meter_path": meter_path,
                 "is_beat": is_beat, "is_downbeat": is_downbeat, "crossing": crossing}
 
     def kl(self, h, mask, q_phi, path):
@@ -115,15 +115,16 @@ class VBPM(nn.Module):
                                p["phase"].expand_as(phase_mu))
         kl_phase = (kl_phase * live).sum(1)
 
-        q_tempo0_mu, q_tempo0_sigma = q_phi["tempo0"]
+        q_log_tempo0_mu, q_log_tempo0_sigma = q_phi["log_tempo0"]
         p_tempo0_mu, p_tempo0_sigma = p["tempo0"]
-        kl_tempo0_by_meter = gaussian_kl(q_tempo0_mu[:, None], q_tempo0_sigma[:, None],
+        kl_tempo0_by_meter = gaussian_kl(q_log_tempo0_mu[:, None], q_log_tempo0_sigma[:, None],
                                          p_tempo0_mu, p_tempo0_sigma)
         kl_tempo0 = (q_phi["log_meter0"].exp() * kl_tempo0_by_meter).sum(-1)
 
-        q_change_mu, q_change_sigma = q_phi["tempo"]
+        q_log_tempo_change_mu, q_log_tempo_change_sigma = q_phi["log_tempo"]
         p_change_mu, p_change_sigma = p["tempo"]
-        kl_tempo = gaussian_kl(q_change_mu, q_change_sigma, p_change_mu, p_change_sigma)
+        kl_tempo = gaussian_kl(q_log_tempo_change_mu, q_log_tempo_change_sigma,
+                               p_change_mu, p_change_sigma)
         kl_tempo = (kl_tempo * path["is_beat"]).sum(1)
 
         q_meter0 = q_phi["log_meter0"].exp()
@@ -140,7 +141,7 @@ class VBPM(nn.Module):
         draw, q_phi = self.posterior_model(h, cls, mask, tau=self.tau)
         path = self.draws_to_paths(draw, mask)
 
-        recon = self.emission_model.loglik(path["phi_path"], path["tempo_path"],
+        recon = self.emission_model.loglik(path["phi_path"], path["log_tempo_path"],
                                            path["meter_path"], cls, mask, has_downbeats)
         kl = self.kl(h, mask, q_phi, path)
         elbo = recon - kl
@@ -162,9 +163,10 @@ class VBPM(nn.Module):
             mask = torch.ones(h.shape[:2], device=h.device, dtype=h.dtype)
         if path is None:
             path = self.infer_path(h, mask)
-        logits = self.emission_model(path["phi_path"], path["tempo_path"],
+        logits = self.emission_model(path["phi_path"], path["log_tempo_path"],
                                      path["meter_path"], mask)
         return torch.softmax(logits, -1)[..., 2]
+
 
 def build_model(cfg, input_dim: int) -> VBPM:
     """One VBPM from a config."""

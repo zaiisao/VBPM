@@ -6,7 +6,8 @@ import math
 import torch
 from torch import nn
 
-from .constants import FPS, METER0_SHARE, TEMPO0_BPM, TEMPO0_BPM_SD, TWO_PI
+from .constants import (FPS, KAPPA_Q_MIN, LOG_TEMPO0, LOG_TEMPO_CHANGE_SD, METER0_SHARE,
+                        TEMPO0_BPM, TEMPO0_BPM_SD, TWO_PI)
 from .specs import EmissionSpec, WalkSpec
 from .vonmises import sample_vonmises, sample_vonmises_icdf
 
@@ -76,19 +77,21 @@ class PosteriorModel(nn.Module):
         self.encoder = Encoder(input_dim + 3, d_model, use_pe=encoder_pe)
         self.phase0_head = nn.Linear(d_model, 3)
         self.phase_head = nn.Linear(d_model, 3)
-        self.tempo0_head = nn.Linear(d_model, 2)
-        self.tempo_head = nn.Linear(d_model, 2)
+        self.log_tempo0_head = nn.Linear(d_model, 2)
+        self.log_tempo_head = nn.Linear(d_model, 2)
         self.meter0_head = nn.Linear(d_model, len(prior.meters))
         self.meter_head = nn.Linear(d_model, len(prior.meters))
 
-        for head in (self.phase0_head, self.phase_head, self.tempo0_head, self.tempo_head,
-                     self.meter0_head, self.meter_head):
+        for head in (self.phase0_head, self.phase_head, self.log_tempo0_head,
+                     self.log_tempo_head, self.meter0_head, self.meter_head):
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
+        mix_mu, mix_sd = log_tempo0_mixture(prior.meters)
         with torch.no_grad():
-            self.phase0_head.bias[0] = 1.0
-            self.phase_head.bias[0] = 1.0
-
+            self.phase0_head.bias.copy_(torch.tensor([1.0, 0.0, inverse_softplus(KAPPA_Q_MIN)]))
+            self.phase_head.bias.copy_(torch.tensor([1.0, 0.0, float(prior.phase_kappa_raw)]))
+            self.log_tempo0_head.bias.copy_(torch.tensor([mix_mu, inverse_softplus(mix_sd)]))
+            self.log_tempo_head.bias[1] = inverse_softplus(LOG_TEMPO_CHANGE_SD)
 
     def forward(self, h, labels, mask, tau=1.0):
         """q's parameters and one draw of every latent, all read from (h, labels)."""
@@ -103,11 +106,11 @@ class PosteriorModel(nn.Module):
         phase_mu = torch.atan2(phase_sin, phase_cos)
         phase_kappa = nn.functional.softplus(phase_kappa_raw)
 
-        tempo0_mu, tempo0_sigma_raw = self.tempo0_head(feats[:, 0]).unbind(-1)
-        tempo0_sigma = nn.functional.softplus(tempo0_sigma_raw)
+        log_tempo0_mu, log_tempo0_sigma_raw = self.log_tempo0_head(feats[:, 0]).unbind(-1)
+        log_tempo0_sigma = nn.functional.softplus(log_tempo0_sigma_raw)
 
-        tempo_change_mu, tempo_change_sigma_raw = self.tempo_head(feats).unbind(-1)
-        tempo_change_sigma = nn.functional.softplus(tempo_change_sigma_raw)
+        log_tempo_change_mu, log_tempo_change_sigma_raw = self.log_tempo_head(feats).unbind(-1)
+        log_tempo_change_sigma = nn.functional.softplus(log_tempo_change_sigma_raw)
 
         meter0_logits = self.meter0_head(feats[:, 0])
         meter_logits = self.meter_head(feats)
@@ -119,20 +122,21 @@ class PosteriorModel(nn.Module):
         phase0_draw = phase0_mu + sample_vonmises_icdf(phase0_kappa)
         phase_draw = phase_mu + sample_vonmises_icdf(phase_kappa)
 
-        tempo_draw = tempo_change_mu + torch.randn_like(tempo_change_mu) * tempo_change_sigma
-        tempo0_draw = tempo0_mu + torch.randn_like(tempo0_mu) * tempo0_sigma
-        tempo_draw = torch.cat([tempo0_draw[:, None], tempo_draw[:, 1:]], 1)
+        log_tempo_draw = (log_tempo_change_mu
+                          + torch.randn_like(log_tempo_change_mu) * log_tempo_change_sigma)
+        log_tempo0_draw = log_tempo0_mu + torch.randn_like(log_tempo0_mu) * log_tempo0_sigma
+        log_tempo_draw = torch.cat([log_tempo0_draw[:, None], log_tempo_draw[:, 1:]], 1)
 
         meter_draw = nn.functional.gumbel_softmax(meter_logits, tau=tau, hard=True)
         meter0_draw = nn.functional.gumbel_softmax(meter0_logits, tau=tau, hard=True)
         meter_draw = torch.cat([meter0_draw[:, None], meter_draw[:, 1:]], 1)
 
-        draw = {"phase0": phase0_draw, "phase": phase_draw, "tempo": tempo_draw,
+        draw = {"phase0": phase0_draw, "phase": phase_draw, "log_tempo": log_tempo_draw,
                 "meter": meter_draw}
 
         q_phi = {"phase0": (phase0_mu, phase0_kappa), "phase": (phase_mu, phase_kappa),
-                 "tempo0": (tempo0_mu, tempo0_sigma),
-                 "tempo": (tempo_change_mu, tempo_change_sigma),
+                 "log_tempo0": (log_tempo0_mu, log_tempo0_sigma),
+                 "log_tempo": (log_tempo_change_mu, log_tempo_change_sigma),
                  "log_meter0": log_meter0, "log_meter": log_meter}
 
         return draw, q_phi
@@ -157,18 +161,18 @@ class EmissionModel(nn.Module):
         if spec.positional:
             self.register_buffer("pe", sinusoidal_encoding(max_len, spec.dim))
 
-    def forward(self, phi, tempo, meter, mask):
+    def forward(self, phi, log_tempo, meter, mask):
         """[B, T, 3] logits over {non-beat, beat, downbeat} from the whole path."""
-        z = torch.cat([phi.cos()[..., None], phi.sin()[..., None], tempo[..., None], meter], -1)
+        z = torch.cat([phi.cos()[..., None], phi.sin()[..., None], log_tempo[..., None], meter], -1)
         x = self.proj(z)
         if self.spec.positional:
             x = x + self.pe[:x.shape[1]]
         x = self.blocks(x, src_key_padding_mask=mask <= 0)
         return self.out(x)
 
-    def loglik(self, phi, tempo, meter, labels, mask, has_downbeats=None):
+    def loglik(self, phi, log_tempo, meter, labels, mask, has_downbeats=None):
         """[B]: log p(labels | path) summed over valid frames."""
-        logp = torch.log_softmax(self(phi, tempo, meter, mask), -1)
+        logp = torch.log_softmax(self(phi, log_tempo, meter, mask), -1)
 
         if has_downbeats is not None:
             union = torch.logaddexp(logp[..., 1], logp[..., 2])
@@ -188,6 +192,16 @@ def gaussian_kl(mu_q, sigma_q, mu_p, sigma_p):
 def inverse_softplus(x: float) -> float:
     """The raw value whose softplus is x."""
     return x + math.log(-math.expm1(-x))
+
+
+def log_tempo0_mixture(meters) -> tuple[float, float]:
+    """(mean, sd) of the starting log tempo, mixed over meters by their starting shares."""
+    share0 = torch.tensor([METER0_SHARE[m] for m in meters])
+    mu0 = torch.tensor([LOG_TEMPO0[m][0] for m in meters])
+    sd0 = torch.tensor([LOG_TEMPO0[m][1] for m in meters])
+    mix_mu = float((share0 * mu0).sum())
+    mix_sd = float(((share0 * (sd0 ** 2 + mu0 ** 2)).sum() - mix_mu ** 2).sqrt())
+    return mix_mu, mix_sd
 
 
 class PriorModel(nn.Module):
@@ -259,4 +273,4 @@ class PriorModel(nn.Module):
         tempo = tempo_change_mu + torch.randn_like(tempo_change_mu) * tempo_change_sigma
         tempo[:, 0] = tempo0_mu + torch.randn_like(tempo0_mu) * tempo0_sigma
         meter = nn.functional.one_hot(meter_idx, R).to(h.dtype)
-        return {"phase0": phase0, "phase": phase, "tempo": tempo, "meter": meter}
+        return {"phase0": phase0, "phase": phase, "log_tempo": tempo, "meter": meter}
