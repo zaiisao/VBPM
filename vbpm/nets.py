@@ -6,10 +6,11 @@ import math
 import torch
 from torch import nn
 
-from .constants import (CLASS_FREQ, LOG_TEMPO0, LOG_TEMPO_CHANGE_SCALE, LOG_TEMPO_CHANGE_SD_Q0,
-                        METER0_SHARE, METER_TRANSITION, Q_FEATURE_SCALE, Q_LOG_TEMPO0_SD,
-                        Q_LOG_TEMPO_CHANGE_UNIT, Q_METER0_LOGIT, Q_PHASE0_KAPPA, TWO_PI)
-from .specs import EmissionSpec, WalkSpec
+from .constants import (CLASS_RATE_PER_SECOND, LOG_TEMPO0_PER_SECOND, LOG_TEMPO_CHANGE_SCALE,
+                        LOG_TEMPO_CHANGE_SD_Q0, METER0_SHARE, METER_TRANSITION, Q_FEATURE_SCALE,
+                        Q_LOG_TEMPO0_SD, Q_LOG_TEMPO_CHANGE_UNIT, Q_METER0_LOGIT, Q_PHASE0_KAPPA,
+                        TWO_PI)
+from .specs import EmissionSpec, PosteriorSpec, PriorSpec
 from .util.positional_encoding import sinusoidal_encoding
 from .util.softplus import inverse_softplus
 from .util.vonmises import sample_vonmises_icdf
@@ -23,10 +24,8 @@ class Encoder(nn.Module):
     """
 
     def __init__(self, input_dim: int, d_model: int = 128, heads: int = 4, layers: int = 2,
-                 max_len: int = 4096, use_pe: bool = False):
+                 max_len: int = 4096):
         super().__init__()
-        self.d_model = d_model
-        self.use_pe = use_pe
 
         self.proj = nn.Linear(input_dim, d_model)
         layer = nn.TransformerEncoderLayer(d_model, heads, dim_feedforward=4 * d_model,
@@ -34,16 +33,13 @@ class Encoder(nn.Module):
                                            batch_first=True, norm_first=False)
         self.blocks = nn.TransformerEncoder(layer, layers)
 
-        if use_pe:
-            self.register_buffer("pe", sinusoidal_encoding(max_len, d_model))
+        self.register_buffer("pe", sinusoidal_encoding(max_len, d_model), persistent=False)
 
     def forward(self, h, mask=None):
         """[B, T, D] -> [B, T, d_model]: the trunk shared by every head."""
         pad = None if mask is None else (mask <= 0)
 
-        h = self.proj(h) * math.sqrt(self.d_model)
-        if self.use_pe:
-            h = h + self.pe[:h.shape[1]]
+        h = self.proj(h) + self.pe[:h.shape[1]]
 
         return self.blocks(h, src_key_padding_mask=pad)
 
@@ -62,26 +58,26 @@ class PosteriorModel(nn.Module):
     registered twice.
     """
 
-    def __init__(self, input_dim: int, d_model: int, prior: "PriorModel",
-                 encoder_pe: bool = False):
+    def __init__(self, input_dim: int, meters, fps: int, spec: PosteriorSpec):
         super().__init__()
+        self.meters = tuple(int(m) for m in meters)
+        self.fps = fps
+        self.d_model = d_model = spec.d_model
 
-        n_meters = len(prior.meters)
-        state_dim = 4 + n_meters
+        n_meters = len(self.meters)
+        state_dim = 3 + n_meters
 
-        self.meters = prior.meters
-        self.register_buffer("meter_values", torch.tensor(prior.meters, dtype=torch.float32),
+        self.register_buffer("meter_values", torch.tensor(self.meters, dtype=torch.float32),
                              persistent=False)
-        self.encoder = Encoder(input_dim + 3, d_model, use_pe=encoder_pe)
+        self.encoder = Encoder(input_dim + 3, d_model)
 
         self.phase_head = nn.Linear(d_model + state_dim, 3)
         self.log_tempo_head = nn.Linear(d_model + state_dim, 2)
         self.meter_head = nn.Linear(d_model + state_dim, n_meters)
 
-        self.init_heads(prior, d_model)
-
-    def init_heads(self, prior, d_model):
+    def init_heads(self, prior):
         """Set every head so that q starts at the prior's values."""
+        d_model = self.d_model
         feature_weight_sd = 0.01
         for head in (self.phase_head, self.log_tempo_head, self.meter_head):
             nn.init.zeros_(head.weight)
@@ -98,7 +94,7 @@ class PosteriorModel(nn.Module):
             self.phase_head.bias[2] = phase_log_kappa
             self.log_tempo_head.weight[0] = 0.0
             self.log_tempo_head.bias[1] = tempo_change_sd_raw
-            self.meter_head.weight[:, d_model + 4:] = meter_stay_logits
+            self.meter_head.weight[:, d_model + 3:] = meter_stay_logits
 
     def forward(self, h, labels, mask, tau=1.0):
         """q's initial-state parameters and draws, and the context the per-frame step reads."""
@@ -120,7 +116,6 @@ class PosteriorModel(nn.Module):
 
         draw = {"phase0": phase0_draw, "log_tempo": log_tempo_draw, "meter": meter_draw}
         q_phi = {"phase0": (phase0_mu, phase0_kappa), "feats": feats,
-                 "label_beats": self.label_beat_position(labels),
                  "log_tempo0": (log_tempo0_mu, log_tempo0_sigma), "log_meter0": log_meter0}
         return draw, q_phi
 
@@ -130,7 +125,7 @@ class PosteriorModel(nn.Module):
         device = labels.device
         phase0_mu = torch.zeros(B, device=device)
         phase0_kappa = torch.full((B,), 0.01, device=device)
-        mix_mu, mix_sd = log_tempo0_mixture(self.meters)
+        mix_mu, mix_sd = log_tempo0_mixture(self.meters, self.fps)
         log_tempo0_mu = torch.full((B,), mix_mu, device=device)
         log_tempo0_sigma = torch.full((B,), mix_sd, device=device)
         meter0_logits = torch.tensor([METER0_SHARE[m] for m in self.meters],
@@ -158,29 +153,10 @@ class PosteriorModel(nn.Module):
 
         return (phase0_mu, phase0_kappa), (log_tempo0_mu, log_tempo0_sigma), meter0_logits
 
-    def label_beat_position(self, labels):
-        """[B, T] beats elapsed at each frame by the annotations; NaN where there are too few."""
-        B, T = labels.shape
-        frames = torch.arange(T, device=labels.device, dtype=torch.float32)
-        position = torch.full((B, T), float("nan"), device=labels.device)
-        for b in range(B):
-            beats = torch.nonzero(labels[b] > 0).flatten().float()
-            if len(beats) < 2:
-                continue
-            count = torch.arange(len(beats), device=labels.device, dtype=torch.float32)
-            index = torch.searchsorted(beats, frames).clamp(1, len(beats) - 1)
-            left, right = beats[index - 1], beats[index]
-            position[b] = count[index - 1] + (frames - left) / (right - left)
-        return position
-
-    def step(self, feats_k, label_beats_k, pred, tempo_drift, meter):
-        """q's frame-k factors from c_k, the sampled state, and its drift from the annotations."""
-        beats_per_bar = meter @ self.meter_values
-        sampled_beats = pred * beats_per_bar / TWO_PI
-        drift = torch.remainder(label_beats_k - sampled_beats + 0.5, 1.0) - 0.5
-        drift = torch.nan_to_num(drift, nan=0.0)
+    def step(self, feats_k, pred, tempo_drift, meter):
+        """q's frame-k factors from c_k and the sampled state."""
         state = torch.cat([pred.cos()[:, None], pred.sin()[:, None], tempo_drift[:, None],
-                           drift[:, None], meter], -1)
+                           meter], -1)
         inputs = torch.cat([feats_k, state], -1)
         scaled_inputs = torch.cat([Q_FEATURE_SCALE * feats_k, state], -1)
         phase_cos, phase_sin, phase_log_kappa = self.phase_head(scaled_inputs).unbind(-1)
@@ -193,7 +169,7 @@ class PosteriorModel(nn.Module):
 class EmissionModel(nn.Module):
     """p(labels | z): a Transformer over the latent sequence (tutorial 9.6)."""
 
-    def __init__(self, spec: EmissionSpec, meters, max_len: int = 4096):
+    def __init__(self, meters, fps: int, spec: EmissionSpec, max_len: int = 4096):
         super().__init__()
         self.spec = spec
 
@@ -204,7 +180,8 @@ class EmissionModel(nn.Module):
         self.blocks = nn.TransformerEncoder(layer, spec.layers)
         self.out = nn.Linear(spec.dim, 3)
         with torch.no_grad():
-            self.out.bias.copy_(torch.tensor(CLASS_FREQ).log())
+            beat, downbeat = (rate / fps for rate in CLASS_RATE_PER_SECOND)
+            self.out.bias.copy_(torch.tensor([1.0 - beat - downbeat, beat, downbeat]).log())
 
         if spec.positional:
             self.register_buffer("pe", sinusoidal_encoding(max_len, spec.dim))
@@ -225,11 +202,11 @@ class EmissionModel(nn.Module):
         return (ll * mask).sum(1)
 
 
-def log_tempo0_mixture(meters) -> tuple[float, float]:
+def log_tempo0_mixture(meters, fps: int) -> tuple[float, float]:
     """(mean, sd) of the starting log tempo, mixed over meters by their starting shares."""
     share0 = torch.tensor([METER0_SHARE[m] for m in meters])
-    mu0 = torch.tensor([LOG_TEMPO0[m][0] for m in meters])
-    sd0 = torch.tensor([LOG_TEMPO0[m][1] for m in meters])
+    mu0 = torch.tensor([LOG_TEMPO0_PER_SECOND[m][0] - math.log(fps) for m in meters])
+    sd0 = torch.tensor([LOG_TEMPO0_PER_SECOND[m][1] for m in meters])
     mix_mu = float((share0 * mu0).sum())
     mix_sd = float(((share0 * (sd0 ** 2 + mu0 ** 2)).sum() - mix_mu ** 2).sqrt())
     return mix_mu, mix_sd
@@ -238,17 +215,20 @@ def log_tempo0_mixture(meters) -> tuple[float, float]:
 class PriorModel(nn.Module):
     """p(path | x): audio-read phase0 and tempo0, bar-pointer transitions."""
 
-    def __init__(self, input_dim: int, meters, walk: WalkSpec):
+    def __init__(self, input_dim: int, meters, fps: int, spec: PriorSpec):
         super().__init__()
         self.meters = tuple(int(m) for m in meters)
+        self.fps = fps
 
         unknown = [m for m in self.meters if m not in METER0_SHARE]
         assert not unknown, f"no starting share for meters {unknown}"
+        log_fps = math.log(fps)
         self.register_buffer("log_tempo0_mu",
-                             torch.tensor([LOG_TEMPO0[m][0] for m in self.meters]),
+                             torch.tensor([LOG_TEMPO0_PER_SECOND[m][0] - log_fps
+                                           for m in self.meters]),
                              persistent=False)
         self.register_buffer("log_tempo0_sigma",
-                             torch.tensor([LOG_TEMPO0[m][1] for m in self.meters]),
+                             torch.tensor([LOG_TEMPO0_PER_SECOND[m][1] for m in self.meters]),
                              persistent=False)
         self.register_buffer("log_meter0",
                              torch.tensor([METER0_SHARE[m] for m in self.meters]).log(),
@@ -259,7 +239,8 @@ class PriorModel(nn.Module):
                                            for a in self.meters]).log(),
                              persistent=False)
 
-        self.phase_log_kappa = nn.Parameter(torch.tensor(math.log(walk.prior_phase_kappa)))
+        self.phase_log_kappa = nn.Parameter(
+            torch.tensor(math.log(spec.phase_kappa_per_second * fps)))
         self.log_tempo_change_log_scale = nn.Parameter(
             torch.tensor(math.log(LOG_TEMPO_CHANGE_SCALE)))
 

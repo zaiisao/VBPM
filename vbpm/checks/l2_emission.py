@@ -126,7 +126,7 @@ def main():
     train_songs = [train_songs[i] for i in rng.permutation(len(train_songs))[:args.train_songs]]
     val_songs = [val_songs[i] for i in rng.permutation(len(val_songs))[:args.held_songs]]
 
-    paths = VBPM(input_dim=8).to(device)
+    paths = VBPM(input_dim=8, fps=FPS).to(device)
     train_w = [w for s in train_songs for w in windows(s, frames, args.windows, rng)]
     held_w = [w for s in val_songs for w in windows(s, frames, args.windows, rng)]
     print(f"windows: train {len(train_w)}  held-out {len(held_w)}", flush=True)
@@ -149,7 +149,7 @@ def main():
     freq = torch.bincount(train_cls.flatten(), minlength=3).float() / train_cls.numel()
 
     def fresh():
-        emission = EmissionModel(EmissionSpec(), METERS).to(device)
+        emission = EmissionModel(METERS, FPS, EmissionSpec()).to(device)
         if args.init == "random":
             with torch.no_grad():
                 torch.nn.init.kaiming_uniform_(emission.out.weight, a=math.sqrt(5))

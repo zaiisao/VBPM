@@ -41,7 +41,7 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
     is known to be monotone.
     """
     torch.manual_seed(seed)
-    model = hooks.build_model(cfg, frontend.num_channels).to(device)
+    model = hooks.build_model(cfg, frontend.num_channels, frontend.output_fps).to(device)
 
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=workers,

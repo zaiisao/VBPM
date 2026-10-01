@@ -56,9 +56,9 @@
     "minimum": 1.0,
     "description": "window length. Below ~45 s the ELBO cannot separate tracking the truth from coasting on a constant period (crop-horizon root cause)."
   },
-  "prior_phase_kappa": {
+  "prior_phase_kappa_per_second": {
     "type": "number",
-    "default": 383.0,
+    "default": 7.66,
     "minimum": 0.0,
     "description": "concentration of the physical prior's increment law: the DRIFT TAX. Real tempo wobble is heavy-tailed, so lowering this cuts the KL price of expressing drift."
   },

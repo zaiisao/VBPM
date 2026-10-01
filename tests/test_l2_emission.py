@@ -69,7 +69,7 @@ def _recon(emission, inputs, cls):
 @pytest.fixture(scope="module")
 def corpus():
     torch.manual_seed(0)
-    paths = VBPM(input_dim=8)
+    paths = VBPM(input_dim=8, fps=FPS)
     songs = [_song(seed) for seed in range(24)]
     train, held = songs[:18], songs[18:]
     train_inputs = _stack([_replay(paths, d) for d, _, _ in train])
@@ -79,9 +79,9 @@ def corpus():
     perturbed = {}
     for name in _perturbations(*held[0][::2]):
         perturbed[name] = _stack([_replay(paths, _perturbations(d, m)[name]) for d, _, m in held])
-    teacher = _train(EmissionModel(EmissionSpec(), (3, 4)), train_inputs, train_cls)
+    teacher = _train(EmissionModel((3, 4), FPS, EmissionSpec()), train_inputs, train_cls)
     shuffled = [torch.roll(x, 1, 0) for x in train_inputs]
-    control = _train(EmissionModel(EmissionSpec(), (3, 4)), shuffled, train_cls)
+    control = _train(EmissionModel((3, 4), FPS, EmissionSpec()), shuffled, train_cls)
     return {"teacher": teacher, "control": control, "held_inputs": held_inputs,
             "held_cls": held_cls, "perturbed": perturbed}
 

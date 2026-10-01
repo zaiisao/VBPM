@@ -8,7 +8,7 @@ from .constants import TWO_PI
 from .nets import EmissionModel, PosteriorModel, PriorModel
 from .util.kl import gaussian_kl, gaussian_laplace_kl
 from .util.vonmises import kl_vonmises, sample_vonmises_icdf
-from .specs import EmissionSpec, WalkSpec
+from .specs import EmissionSpec, PosteriorSpec, PriorSpec
 
 DEFAULTS = {}
 
@@ -16,27 +16,28 @@ DEFAULTS = {}
 class VBPM(nn.Module):
     """Posterior, prior and emission, joined by draws_to_paths."""
 
-    def __init__(self, input_dim: int, d_model: int = 128, meters=(3, 4),
-                 emission: EmissionSpec | None = None, walk: WalkSpec | None = None,
-                 encoder_pe: bool = False):
+    def __init__(self, input_dim: int, fps: int, meters=(3, 4),
+                 prior_spec: PriorSpec | None = None,
+                 posterior_spec: PosteriorSpec | None = None,
+                 emission_spec: EmissionSpec | None = None):
         super().__init__()
 
         self.register_buffer("meter_values", torch.tensor(meters, dtype=torch.float32),
                              persistent=False)
         self.tau = 1.0
 
-        self.emission_model = EmissionModel(emission or EmissionSpec(), meters)
-        self.prior_model = PriorModel(input_dim, meters, walk or WalkSpec())
-        self.posterior_model = PosteriorModel(input_dim, d_model, self.prior_model,
-                                              encoder_pe=encoder_pe)
+        self.emission_model = EmissionModel(meters, fps, emission_spec or EmissionSpec())
+        self.prior_model = PriorModel(input_dim, meters, fps, prior_spec or PriorSpec())
+        self.posterior_model = PosteriorModel(input_dim, meters, fps,
+                                              posterior_spec or PosteriorSpec())
+        self.posterior_model.init_heads(self.prior_model)
 
     @property
     def deployed_net(self):
         """The network that runs at test time; it reads audio only."""
         return self.prior_model
 
-    def draws_to_paths(self, draw, mask, posterior=None, feats=None, label_beats=None,
-                       prior=None, tau=1.0):
+    def draws_to_paths(self, draw, mask, posterior=None, feats=None, prior=None, tau=1.0):
         """Paths from one draw, frame by frame, with factors from the posterior, prior or draw."""
         phi0, log_tempo_draw, meter_draw = draw["phase0"], draw["log_tempo"], draw["meter"]
 
@@ -65,7 +66,7 @@ class VBPM(nn.Module):
             pred = phi + log_tempo.exp() / beats_per_bar * mask[:, k]
             drift = log_tempo - log_tempo_draw[:, 0]
             if posterior is not None:
-                factors = posterior.step(feats[:, k], label_beats[:, k], pred, drift, meter)
+                factors = posterior.step(feats[:, k], pred, drift, meter)
             elif prior is not None:
                 factors = {"phase": (pred, prior["phase"].expand_as(pred)),
                            "meter_logits": meter @ prior["log_meter_transition"]}
@@ -167,7 +168,7 @@ class VBPM(nn.Module):
         draw, q_phi = self.posterior_model(h, cls, mask, tau=self.tau)
         feats = q_phi["feats"]
         path = self.draws_to_paths(draw, mask, posterior=self.posterior_model, feats=feats,
-                                   label_beats=q_phi["label_beats"], tau=self.tau)
+                                   tau=self.tau)
 
         recon = self.emission_model.loglik(path["phi_path"], path["meter_path"], cls, mask)
         kl = self.kl(h, mask, q_phi, path)
@@ -195,10 +196,11 @@ class VBPM(nn.Module):
         return torch.softmax(logits, -1)[..., 2]
 
 
-def build_model(cfg, input_dim: int) -> VBPM:
+def build_model(cfg, input_dim: int, fps: int) -> VBPM:
     """One VBPM from a config."""
-    emission = EmissionSpec(layers=cfg.emission_layers, positional=cfg.emission_positional)
-    walk = WalkSpec(prior_phase_kappa=cfg.prior_phase_kappa)
-    model = VBPM(input_dim, meters=tuple(cfg.meters), emission=emission, walk=walk)
+    prior_spec = PriorSpec(phase_kappa_per_second=cfg.prior_phase_kappa_per_second)
+    emission_spec = EmissionSpec(layers=cfg.emission_layers, positional=cfg.emission_positional)
+    model = VBPM(input_dim, fps, meters=tuple(cfg.meters), prior_spec=prior_spec,
+                 emission_spec=emission_spec)
 
     return model

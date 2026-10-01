@@ -14,7 +14,7 @@ FRAMES = 1500
 
 @pytest.fixture(scope="module")
 def model():
-    return VBPM(input_dim=8)
+    return VBPM(input_dim=8, fps=FPS)
 
 
 def _window(bars, bpm, rubato=0.0, seed=0, start=3.0):
@@ -82,7 +82,7 @@ class _AimAtPath:
     def __init__(self, kappa):
         self.kappa = kappa
 
-    def step(self, feats_k, label_beats_k, pred, tempo_drift, meter):
+    def step(self, feats_k, pred, tempo_drift, meter):
         return {"phase": (feats_k[:, 0], torch.full_like(pred, self.kappa))}
 
 
@@ -109,8 +109,7 @@ def test_phase_step_aimed_at_the_path_keeps_drift_at_one_frame(model):
     base = _replay(model, draw)["phi_path"][0]
     feats = base[None, :, None].expand(256, FRAMES, 1)
     phi = model.draws_to_paths(_batch(draw, 256), torch.ones(256, FRAMES),
-                               posterior=_AimAtPath(kappa), feats=feats,
-                               label_beats=torch.zeros(256, FRAMES))["phi_path"]
+                               posterior=_AimAtPath(kappa), feats=feats)["phi_path"]
     drift = (phi[:, [200, 1000, FRAMES - 1]] - base[[200, 1000, FRAMES - 1]]).std(0)
     assert (drift < 1.2 / math.sqrt(kappa)).all(), drift
 

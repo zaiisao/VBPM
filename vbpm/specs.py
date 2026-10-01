@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from .constants import PRIOR_PHASE_KAPPA
+from .constants import PRIOR_PHASE_KAPPA_PER_SECOND
 
 
 @dataclasses.dataclass
@@ -16,10 +16,17 @@ class EmissionSpec:
 
 
 @dataclasses.dataclass
-class WalkSpec:
-    """The prior's phase concentration around the tempo advance."""
+class PriorSpec:
+    """p(path | x): the phase concentration around the tempo advance."""
 
-    prior_phase_kappa: float = PRIOR_PHASE_KAPPA
+    phase_kappa_per_second: float = PRIOR_PHASE_KAPPA_PER_SECOND
 
     def __post_init__(self):
-        self.prior_phase_kappa = float(self.prior_phase_kappa)
+        self.phase_kappa_per_second = float(self.phase_kappa_per_second)
+
+
+@dataclasses.dataclass
+class PosteriorSpec:
+    """q(path | x, labels): the size of the encoder trunk."""
+
+    d_model: int = 128
