@@ -21,6 +21,7 @@ ignore = [
                              # code W/K/T/H and `import reference as R` ARE the clear names
     "D107",                  # __init__ is documented in the class docstring (Google style)
     "D105",                  # magic methods (__repr__ etc.) need no docstring
+    "D403",
 ]
 
 [lint.pydocstyle]
@@ -28,4 +29,5 @@ convention = "google"
 
 [lint.per-file-ignores]
 # the blind suite documents contracts in test names, not docstrings
-"vbpm/tests/*" = ["D", "N"]
+"tests/*" = ["D", "N"]
+"vbpm/frontends/__init__.py" = ["E402"]

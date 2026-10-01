@@ -3,8 +3,8 @@
 #     conda env create -f environment.yml          # or: conda create -n vbpm python=3.10 pip
 #     conda run -n vbpm pip install -e . -e ./external/beat_this
 #
-# The two editable installs make `import vbpm` / `import beat_this` resolve to THIS tree
-# (edits reflect immediately, no reinstall) and eliminate every sys.path hack.
+# Editable installs make `import vbpm`, `import beat_this`, and `import musicfm` resolve
+# to this checkout (edits reflect immediately, no sys.path hacks).
 # On this machine the env lives at /disk4/anaconda3/envs/vbpm.
 name: vbpm
 channels:
@@ -19,8 +19,11 @@ dependencies:
       - numpy
       - scipy
       - soundfile                 # audio I/O in the frontend pass
+      - pandas                    # Beat This dataset loader
+      - pytorch-lightning         # Beat This dataset loader
       - mir_eval                  # beat/downbeat F-measure
       - einops                    # beat_this
+      - transformers<5            # MusicFM's Wav2Vec2 conformer encoder
       - rotary_embedding_torch    # beat_this
       - soxr                      # beat_this resampling
       - mido                      # madmom (beat_this transitive) needs it at import

@@ -10,12 +10,6 @@
     "default": false,
     "description": "transformer emission only: add positional encoding, letting the emission read FRAME INDEX as well as phase."
   },
-  "target_tol_frames": {
-    "type": "integer",
-    "default": 0,
-    "minimum": 0,
-    "description": "half-width in frames of the framewise target y. 0 is the tutorial's own b (eq 55): one frame per downbeat, at which point the two emission_recon terms are identical by construction. Widening it smears one downbeat over 2n+1 frames, which no longer is b."
-  },
   "epochs": {
     "type": "integer",
     "default": 12,
@@ -39,12 +33,6 @@
     "default": 5.0,
     "minimum": 0.0,
     "description": "gradient-norm clip over the params the variant's optimizer hook hands back."
-  },
-  "pos_weight": {
-    "type": "number",
-    "default": 1.0,
-    "minimum": 0.0,
-    "description": "positive-class weight in the Bernoulli reconstruction. Anything but 1 is a surrogate, not an ELBO."
   },
   "beta_start": {
     "type": "number",
@@ -77,12 +65,12 @@
   "frontend": {
     "type": "string",
     "default": "beat_this",
-    "description": "module under vbpm.data.frontends supplying features + activations. The frontend is part of the model, not preprocessing (see vbpm-checkpoint-artifact)."
+    "description": "registered frontend name, such as beat_this or musicfm."
   },
   "frontend_checkpoint": {
     "type": "string",
-    "default": "final0",
-    "description": "checkpoint the frontend loads; ONE serves train/val/test alike. final0 is Beat This's (gtzan held out of every checkpoint); beat_transformer wants e.g. fold_0."
+    "default": "",
+    "description": "checkpoint path or frontend-specific checkpoint name; empty uses the frontend's own default. One checkpoint serves train/validation/test. MusicFM expects pretrained_msd.pt with msd_stats.json beside it."
   },
   "frontend_lr_scale": {
     "type": "number",

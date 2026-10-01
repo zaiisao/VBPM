@@ -6,14 +6,14 @@ from vbpm.data.excerpts import (ExcerptDataset, collate_excerpts,
 
 
 class _StubFrontend:
-    FPS = 50.0
+    output_fps = 50
 
     @property
     def name(self):
         return "stub"
 
     def prepare_input(self, signal, sample_rate):
-        return np.zeros((int(len(signal) / sample_rate * self.FPS), 4),
+        return np.zeros((int(len(signal) / sample_rate * self.output_fps), 4),
                         dtype=np.float32)
 
 
@@ -53,7 +53,7 @@ def test_deterministic_takes_the_middle(tmp_path):
     song = _Song("long", np.arange(0.0, 70.0, 2.0))
     _make_cache(tmp_path, song)
     ds = ExcerptDataset([song], _StubFrontend(), cache_root=str(tmp_path),
-                        excerpt_seconds=45.0, deterministic=True)
+                        excerpt_seconds=45.0, centered=True)
     total, frames = int(70.0 * 50), ds.excerpt_frames
     expected_start = (total - frames) // 2
     assert int(round(float(ds[0]["t0"]) * ds.fps)) == expected_start
@@ -85,7 +85,7 @@ def test_targets_match_annotations(tmp_path):
     song = _Song("long", np.arange(0.0, 70.0, period))
     _make_cache(tmp_path, song)
     ds = ExcerptDataset([song], _StubFrontend(), cache_root=str(tmp_path),
-                        excerpt_seconds=45.0, deterministic=True)
+                        excerpt_seconds=45.0, centered=True)
     item = ds[0]
     start = int(round(float(item["t0"]) * ds.fps))
     for t in item["downbeat_times"]:

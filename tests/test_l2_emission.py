@@ -7,7 +7,7 @@ import torch
 from vbpm.model import VBPM
 from vbpm.nets import EmissionModel
 from vbpm.specs import EmissionSpec
-from vbpm.tests.oracle import (bar_meters, beat_positions, labels_from_beats, oracle_draw,
+from vbpm.util.oracle import (bar_meters, beat_positions, labels_from_beats, oracle_draw,
                                synthetic_song)
 
 FPS = 50.0

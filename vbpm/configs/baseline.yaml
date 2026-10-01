@@ -10,15 +10,11 @@
 # 2026-08-20 along with its ar_* knobs: it sampled the previous phase, and the
 # displacement KL that follows priced the model toward a metronome (gtzan 0.475
 # against 0.711 for marginal carriage, n=993).
-target_tol_frames: 0
-
-
 excerpt_seconds: 30.0
 batch_size: 4
 epochs: 24
 lr: 3.0e-4
 beta_warmup: 0
-pos_weight: 1.0
 prior_phase_kappa: 383.0
 frontend_lr_scale: 0.0
 meters: [3, 4]

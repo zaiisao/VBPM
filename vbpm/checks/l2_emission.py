@@ -7,11 +7,10 @@ import math
 import numpy as np
 import torch
 
-from vbpm.data.dataset import split_songs
-from vbpm.model import VBPM
-from vbpm.nets import EmissionModel
-from vbpm.specs import EmissionSpec
-from vbpm.tests.oracle import bar_meters, beat_positions, labels_from_beats, oracle_draw
+from ..model import VBPM
+from ..nets import EmissionModel
+from ..specs import EmissionSpec
+from ..util.oracle import bar_meters, beat_positions, labels_from_beats, oracle_draw
 
 FPS = 50.0
 METERS = (3, 4)
@@ -19,7 +18,8 @@ METERS = (3, 4)
 
 def windows(song, frames, count, rng):
     """Up to ``count`` (draw, cls, meter) oracle windows of one song."""
-    beat_times, downbeat_times = song.beats()
+    beat_times = song["beat_time"]
+    downbeat_times = beat_times[song["beat_value"] == 1]
     beat_times = np.unique(np.asarray(beat_times, dtype=np.float64))
     downbeat_times = np.asarray(downbeat_times, dtype=np.float64)
     if len(downbeat_times) < 4 or len(beat_times) < 8:
@@ -119,7 +119,10 @@ def main():
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     frames = int(round(args.seconds * FPS))
-    train_songs, val_songs, _ = split_songs(7)
+    from ..data.dataset import load_beat_this
+
+    data = load_beat_this(7)
+    train_songs, val_songs = data.train_dataset.items, data.val_dataset.items
     train_songs = [train_songs[i] for i in rng.permutation(len(train_songs))[:args.train_songs]]
     val_songs = [val_songs[i] for i in rng.permutation(len(val_songs))[:args.held_songs]]
 

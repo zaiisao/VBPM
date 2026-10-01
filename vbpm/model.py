@@ -5,8 +5,9 @@ import torch
 from torch import nn
 
 from .constants import TWO_PI
-from .nets import EmissionModel, PosteriorModel, PriorModel, gaussian_kl
-from .vonmises import kl_vonmises, log_i0, mean_resultant, sample_vonmises_icdf
+from .nets import EmissionModel, PosteriorModel, PriorModel
+from .util.kl import gaussian_kl, gaussian_laplace_kl
+from .util.vonmises import kl_vonmises, sample_vonmises_icdf
 from .specs import EmissionSpec, WalkSpec
 
 DEFAULTS = {}
@@ -34,7 +35,8 @@ class VBPM(nn.Module):
         """The network that runs at test time; it reads audio only."""
         return self.prior_model
 
-    def draws_to_paths(self, draw, mask, posterior=None, feats=None, prior=None, tau=1.0):
+    def draws_to_paths(self, draw, mask, posterior=None, feats=None, label_beats=None,
+                       prior=None, tau=1.0):
         """Paths from one draw, frame by frame, with factors from the posterior, prior or draw."""
         phi0, log_tempo_draw, meter_draw = draw["phase0"], draw["log_tempo"], draw["meter"]
 
@@ -63,7 +65,7 @@ class VBPM(nn.Module):
             pred = phi + log_tempo.exp() / beats_per_bar * mask[:, k]
             drift = log_tempo - log_tempo_draw[:, 0]
             if posterior is not None:
-                factors = posterior.step(feats[:, k], pred, drift, meter)
+                factors = posterior.step(feats[:, k], label_beats[:, k], pred, drift, meter)
             elif prior is not None:
                 factors = {"phase": (pred, prior["phase"].expand_as(pred)),
                            "meter_logits": meter @ prior["log_meter_transition"]}
@@ -133,8 +135,7 @@ class VBPM(nn.Module):
         live = mask.clone()
         live[:, 0] = 0.0
 
-        phase0_mu, phase0_kappa = q_phi["phase0"]
-        kl_phase0 = phase0_kappa * mean_resultant(phase0_kappa) - log_i0(phase0_kappa)
+        kl_phase0 = kl_vonmises(*q_phi["phase0"], *p["phase0"])
 
         kl_phase = kl_vonmises(path["phase_mu"], path["phase_kappa"], path["phase_pred"],
                                p["phase"].expand_as(path["phase_mu"]))
@@ -146,9 +147,9 @@ class VBPM(nn.Module):
                                          p_log_tempo0_mu, p_log_tempo0_sigma)
         kl_tempo0 = (q_phi["log_meter0"].exp() * kl_tempo0_by_meter).sum(-1)
 
-        p_log_tempo_change_mu, p_log_tempo_change_sigma = p["log_tempo"]
-        kl_tempo = gaussian_kl(path["tempo_mu"], path["tempo_sigma"],
-                               p_log_tempo_change_mu, p_log_tempo_change_sigma)
+        p_log_tempo_change_mu, p_log_tempo_change_scale = p["log_tempo"]
+        kl_tempo = gaussian_laplace_kl(path["tempo_mu"], path["tempo_sigma"],
+                                       p_log_tempo_change_mu, p_log_tempo_change_scale)
         kl_tempo = (kl_tempo * path["is_beat"]).sum(1)
 
         q_meter0 = q_phi["log_meter0"].exp()
@@ -161,15 +162,14 @@ class VBPM(nn.Module):
 
         return kl_phase0 + kl_phase + kl_tempo0 + kl_tempo + kl_meter0 + kl_meter
 
-    def forward(self, h, mask, y, pos_weight: float = 1.0, cls=None, has_downbeats=None):
+    def forward(self, h, mask, cls=None):
         """The ELBO for one batch: recon on q's sampled path minus KL(q || p)."""
         draw, q_phi = self.posterior_model(h, cls, mask, tau=self.tau)
         feats = q_phi["feats"]
         path = self.draws_to_paths(draw, mask, posterior=self.posterior_model, feats=feats,
-                                   tau=self.tau)
+                                   label_beats=q_phi["label_beats"], tau=self.tau)
 
-        recon = self.emission_model.loglik(path["phi_path"], path["meter_path"], cls, mask,
-                                           has_downbeats)
+        recon = self.emission_model.loglik(path["phi_path"], path["meter_path"], cls, mask)
         kl = self.kl(h, mask, q_phi, path)
         elbo = recon - kl
 
@@ -199,19 +199,6 @@ def build_model(cfg, input_dim: int) -> VBPM:
     """One VBPM from a config."""
     emission = EmissionSpec(layers=cfg.emission_layers, positional=cfg.emission_positional)
     walk = WalkSpec(prior_phase_kappa=cfg.prior_phase_kappa)
-    return VBPM(input_dim, meters=tuple(cfg.meters), emission=emission, walk=walk)
+    model = VBPM(input_dim, meters=tuple(cfg.meters), emission=emission, walk=walk)
 
-
-def optimizer(model, cfg):
-    """(optimizer, params-to-clip). One Adam group; everything clipped."""
-    params = list(model.parameters())
-    return torch.optim.Adam(params, lr=cfg.lr), params
-
-
-def objective(out, beta: float, cfg):
-    """Per-crop training objective [B]: the beta-annealed ELBO."""
-    return out["recon"] - beta * out["kl"]
-
-
-def on_epoch(model, cfg, epoch: int) -> None:
-    """Nothing is scheduled per epoch."""
+    return model

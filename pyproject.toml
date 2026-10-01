@@ -14,18 +14,17 @@ dependencies = [
     "soundfile",
     "mir_eval",
     "pyyaml",
+    "pandas",
+    "pytorch-lightning",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 
-# ONE package. Inside it: model + hooks modules (mainline/psi) at the top, the data
-# layer (data.py catalog+features, songs.py, frontends/), checks/ diagnostics, and
-# configs/ YAML recipes. tests live in vbpm/tests and are not shipped.
 [tool.setuptools]
-packages = ["vbpm", "vbpm.variants", "vbpm.data",
-            "vbpm.data.frontends", "vbpm.scoring", "vbpm.checks"]
+packages = ["vbpm", "vbpm.data", "vbpm.frontends", "vbpm.util", "vbpm.scoring", "vbpm.checks",
+            "musicfm", "musicfm.model", "musicfm.modules"]
+package-dir = {musicfm = "external/musicfm"}
 
-# The config schema is code, not data: run.py refuses a config without it.
 [tool.setuptools.package-data]
 vbpm = ["config_schema.json"]

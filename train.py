@@ -2,17 +2,15 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import pathlib
 
 import numpy as np
 import torch
 
-from .config import load_config
-from .scoring.evaluation import (evaluate, print_table, scoring_records,
-                                 trajectory_health)
-from .data.dataset import split_songs
-from .data.excerpts import (ExcerptDataset, collate_excerpts)
+from vbpm.config import load_config
+from vbpm.scoring.evaluation import evaluate, print_table
+from vbpm.data.excerpts import (ExcerptDataset, collate_excerpts)
+from vbpm.frontends import build_frontend
 
 
 # JA: For naive training, we always choose fold 7 to serve as the validation fold.
@@ -54,15 +52,17 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
     if init_from:
         blob = torch.load(init_from, map_location="cpu", weights_only=False)
         report = model.load_state_dict(blob["model"], strict=False)
-        frontend._audio2frames.model.load_state_dict(blob["frontend"])
+        if blob.get("frontend") is not None:
+            frontend.model.load_state_dict(blob["frontend"])
         print(f"warm start from {init_from}\n"
               f"  fresh parameters: {sorted(report.missing_keys)}\n"
               f"  unused in checkpoint: {sorted(report.unexpected_keys)}", flush=True)
 
-    opt, clip_params = hooks.optimizer(model, cfg)
+    params = list(model.parameters())
+    opt = torch.optim.Adam(params, lr=cfg.lr)
 
     if cfg.frontend_lr_scale > 0:
-        fe = list(frontend._audio2frames.model.parameters())
+        fe = list(frontend.model.parameters())
         opt.add_param_group({"params": fe, "lr": cfg.lr * cfg.frontend_lr_scale})
 
     best = {"score": -float("inf"), "epoch": -1, "state": None}
@@ -70,28 +70,21 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
     for epoch in range(cfg.epochs):
         model.train()
         beta = beta_at(epoch, cfg)
-        hooks.on_epoch(model, cfg, epoch)
 
         totals, steps = np.zeros(3), 0
-        health = np.zeros(4)
         gnorm = 0.0
-        anchor = np.zeros(2)
         for raw in loader:
             with torch.set_grad_enabled(cfg.frontend_lr_scale > 0):
                 h = frontend.forward_features(raw["input"])
 
             mask = raw["mask"].to(device, non_blocking=True)
-            y = raw["y"].to(device, non_blocking=True)
-
-            extra = {"raw": raw} if getattr(model, "wants_raw", False) else {}
-            extra["cls"] = raw["cls"].to(device, non_blocking=True)
-            extra["has_downbeats"] = raw["has_downbeats"].to(device, non_blocking=True)
-            out = model(h, mask, y, pos_weight=cfg.pos_weight, **extra)
+            cls = raw["cls"].to(device, non_blocking=True)
+            out = model(h, mask, cls=cls)
 
             # per-frame normalisation and beta-annealed loss; reported elbo is beta=1.
             # clamp: a backstop item (fully-masked window) must cost 0, not produce nan.
             frames = mask.sum(1).clamp(min=1.0)
-            loss = -(hooks.objective(out, beta, cfg) / frames).mean()
+            loss = -((out["recon"] - beta * out["kl"]) / frames).mean()
 
             opt.zero_grad()
             loss.backward()
@@ -101,9 +94,9 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
             # when off, LARGEST single-tensor norm when on.
             if cfg.clip_per_group:
                 gnorm += max(float(torch.nn.utils.clip_grad_norm_([p], cfg.clip))
-                             for p in clip_params if p.grad is not None)
+                             for p in params if p.grad is not None)
             else:
-                gnorm += float(torch.nn.utils.clip_grad_norm_(clip_params, cfg.clip))
+                gnorm += float(torch.nn.utils.clip_grad_norm_(params, cfg.clip))
             if cfg.frontend_lr_scale > 0:
                 torch.nn.utils.clip_grad_norm_(fe, cfg.clip)
 
@@ -112,21 +105,6 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
             totals += [float(out["elbo"].mean()),
                        float(out["recon"].mean()),
                        float(out["kl"].mean())]
-            if "resultant" in out:
-                anchor[0] += float(out["resultant"].mean())
-                if "corr_abs" in out:
-                    anchor[1] += float(out["corr_abs"])
-            # What the ELBO cannot tell you: whether mu is a bar pointer or an arbitrary
-            # path that crosses zero in the right places. Read off the batch already
-            # computed -- no extra forward. See trajectory_health for the thresholds.
-            with torch.no_grad():
-                records = [c for c in scoring_records(raw) if c is not None]
-                if records:
-                    keep = [i for i, c in enumerate(scoring_records(raw))
-                            if c is not None]
-                    health += trajectory_health(out["phi"][keep].detach(),
-                                                out["kappa"][keep].detach(),
-                                                mask[keep], records)
             steps += 1
 
         if select != "none" and val_set is not None and len(val_set):
@@ -142,21 +120,16 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
 
         gain = getattr(model.emission_model, "b", None)
         b_note = "" if gain is None else f"  b {float(gain):5.2f}"
-        adv, kap, perr, cov = health / steps
-        res, kloff = anchor / steps
-        a_note = "" if anchor[0] == 0.0 else f"  res {res:5.3f}  kl_off {kloff:6.2f}"
         print(f"  epoch {epoch:2d}  beta {beta:5.3f}  elbo {totals[0] / steps:9.2f}  "
-              f"recon {totals[1] / steps:8.2f}  kl {totals[2] / steps:9.2f}{b_note}\n"
-              f"            advance {adv:7.4f} (true p10-p90 0.042-0.102, med 0.064)  "
-              f"kappa {kap:9.1f}  "
-              f"phase_err {perr:5.3f} (chance 1.571)  circle {cov:5.1%}  "
-              f"|g| {gnorm / steps:8.2f}{a_note}",
+              f"recon {totals[1] / steps:8.2f}  kl {totals[2] / steps:9.2f}{b_note}  "
+              f"|g| {gnorm / steps:8.2f}",
               flush=True)
 
         if save_dir is not None:
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"model": model.state_dict(),
-                        "frontend": frontend._audio2frames.model.state_dict(),
+                        "frontend": (frontend.model.state_dict()
+                                     if cfg.frontend_lr_scale > 0 else None),
                         "config": vars(cfg), "seed": seed, "epoch": epoch},
                        save_dir / f"seed{seed}_epoch{epoch:02d}.pt")
 
@@ -193,33 +166,39 @@ def parse_args():
 
 
 def main() -> None:
-    """Catalog, train, evaluate, print the per-dataset table."""
+    """Load Beat This splits, train, evaluate, print the per-dataset table."""
     args = parse_args()
     cfg, hooks = load_config(args.config, args.set)
     device = torch.device(f"cuda:{args.gpu}")
 
     print(f"config {args.config}  seed {args.seed}  ->  {vars(cfg)}", flush=True)
 
-    train_songs, val_songs, test_songs = split_songs(VAL_FOLD, args.limit_per_fold)
+    checkpoint = {"checkpoint": cfg.frontend_checkpoint} if cfg.frontend_checkpoint else {}
+    frontend = build_frontend(cfg.frontend, device=f"cuda:{args.gpu}", **checkpoint)
+    from vbpm.data.dataset import load_beat_this
 
-    frontend_name = f"vbpm.data.frontends.{cfg.frontend}"
-    frontend_class = importlib.import_module(frontend_name).FRONTEND
-    frontend = frontend_class(
-        checkpoint=cfg.frontend_checkpoint,
-        device=f"cuda:{args.gpu}",
-        output="features"
-    )
+    data = load_beat_this(VAL_FOLD)
+    data.setup("test")
 
-    tol = getattr(cfg, "target_tol_frames", 0)
-    train_set = ExcerptDataset(train_songs, frontend, cfg.excerpt_seconds,
-                               target_tol_frames=tol)
-    val_set = ExcerptDataset(val_songs, frontend, cfg.excerpt_seconds, deterministic=True,
-                             target_tol_frames=tol)
-    test_set = ExcerptDataset(test_songs, frontend, cfg.excerpt_seconds, deterministic=True,
-                             target_tol_frames=tol)
+    train_source, val_source, test_source = (
+        data.train_dataset, data.val_dataset, data.test_dataset)
+    if args.limit_per_fold is not None:
+        for source in (train_source, val_source, test_source):
+            kept, counts = [], {}
+            for item in source.items:
+                dataset = item["spect_path"].parts[0]
+                counts[dataset] = counts.get(dataset, 0)
+                if counts[dataset] < args.limit_per_fold:
+                    kept.append(item)
+                    counts[dataset] += 1
+            source.items = kept
 
-    print(f"songs: train {len(train_songs)} / val {len(val_songs)} / "
-          f"gtzan-test {len(test_songs)}")
+    train_set = ExcerptDataset(train_source, frontend, cfg.excerpt_seconds)
+    val_set = ExcerptDataset(val_source, frontend, cfg.excerpt_seconds, centered=True)
+    test_set = ExcerptDataset(test_source, frontend, cfg.excerpt_seconds, centered=True)
+
+    print(f"songs: train {len(train_source)} / val {len(val_source)} / "
+          f"gtzan-test {len(test_source)}")
     print(f"train: {len(train_set)} songs, fresh {cfg.excerpt_seconds:.0f}s window "
           f"per epoch, rejects {len(train_set.rejects)}")
 
@@ -227,14 +206,12 @@ def main() -> None:
                   val_set=val_set, select=args.select, init_from=args.init_from,
                   save_dir=pathlib.Path(args.save_dir) if args.save_dir else None)
 
-    if getattr(model, "_selected", None) is None and args.select != "none":
-        pass
-
     if args.save_dir:
         save_dir = pathlib.Path(args.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save({"model": model.state_dict(),
-                    "frontend": frontend._audio2frames.model.state_dict(),
+                    "frontend": (frontend.model.state_dict()
+                                 if cfg.frontend_lr_scale > 0 else None),
                     "config": vars(cfg), "seed": args.seed,
                     "config_path": args.config, "overrides": list(args.set)},
                    save_dir / f"seed{args.seed}.pt")
@@ -244,8 +221,8 @@ def main() -> None:
                for split, name in ((val_set, "val"), (test_set, "gtzan")) if len(split)}
 
     print_table(results)
-    print(f"\nfps={frontend.FPS}  excerpt={cfg.excerpt_seconds}s (fresh window per epoch)  "
-          f"frontend={frontend.name}/{cfg.frontend_checkpoint}  "
+    print(f"\nfps={frontend.output_fps}  excerpt={cfg.excerpt_seconds}s (fresh window per epoch)  "
+          f"frontend={cfg.frontend}/{cfg.frontend_checkpoint}  "
           f"no meter, no beat grid, no offset")
 
 

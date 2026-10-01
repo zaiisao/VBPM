@@ -13,21 +13,21 @@ from `master` or git history. v1 lives in `vbpm-campaign-2026-07-26`.
 
 | path | what |
 |---|---|
-| `vbpm/` | the model (`model.py`), training CLI (`run.py`), the config schema (`config.py` + `config_schema.json`), hooks modules (`variants/`), data (`data/`), pre-flight controls and scoring (`scoring/`), tests (`tests/`) |
+| `vbpm/` | the model (`model.py`), training CLI (`run.py`), the config schema (`config.py` + `vbpm/config_schema.json`), hooks modules (`variants/`), data (`data/`), pre-flight controls and scoring (`scoring/`), tests (`tests/`) |
 | `docs/vbpm_decisions.md` | measured rationale behind every flag and recorded deviations |
 | `vbpm/data.py` | fold-honest frontend feature pass (the single authority) |
-| `data/songs.py` | song catalog: Beat This annotations + official 8-fold splits + local audio |
+| `vbpm/data/songs.py` | Beat This annotation catalog and 8-fold splits |
 | `frontends/` | Beat This / Beat Transformer wrappers over `external/` submodules |
 | `logs/vbpm/` | full training logs of the 2026-08 campaign |
 
 ## Run
 
-    PYTHONPATH=. python -m vbpm.run --config vbpm/configs/anchor_k.yaml --gpu 1
+    PYTHONPATH=. python train.py --config vbpm/configs/anchor_k.yaml --gpu 1
 
 The recipe is the config's business; the CLI carries only run mechanics (device, seed,
 paths). Override one key for one run with `--set`, repeatable:
 
-    PYTHONPATH=. python -m vbpm.run --config vbpm/configs/baseline.yaml \
+    PYTHONPATH=. python train.py --config vbpm/configs/baseline.yaml \
         --set epochs=2 --set emission=cosine --save-dir checkpoints/<name>
 
 Every mainline key, its default, its type and why it has that value:
@@ -35,4 +35,20 @@ Every mainline key, its default, its type and why it has that value:
 Anything else in a config -- or a value of the wrong type, or outside the declared range --
 refuses at parse time.
 
-    PYTHONPATH=. python -m pytest vbpm/tests -q     # 69 tests, CPU, ~2 s
+## MusicFM frontend
+
+The MusicFM encoder and pretrained checkpoint loader remain available. MusicFM training
+requires normalized 100 fps MusicFM mel inputs. The supplied Beat This spectrograms are
+50 fps, so the conversion and data-loading path for MusicFM inputs still needs to be added.
+Use `beat_this` for training with the currently wired Beat This spectrogram bundles.
+
+## Beat This spectrogram data
+
+The default Beat This frontend reads Beat This's supplied, memory-mapped spectrogram
+bundles from `/disk4/shared/beat_this/data/audio/spectrograms/<dataset>.npz`. The matching
+annotation repository is pinned as `external/beat_this_annotations`. Training uses these
+spectrograms directly, so local audio is not required for Beat This datasets. Install the
+project dependencies with `python -m pip install -e .` to include Beat This's dataset-loader
+dependencies.
+
+    PYTHONPATH=. python -m pytest tests -q     # 69 tests, CPU, ~2 s

@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from vbpm.model import VBPM
-from vbpm.tests.oracle import (bar_meters, beat_positions, oracle_draw, synthetic_song)
+from vbpm.util.oracle import (bar_meters, beat_positions, labels_from_beats, oracle_draw,
+                               synthetic_song)
 
 FPS = 50.0
 FRAMES = 1500
@@ -81,7 +82,7 @@ class _AimAtPath:
     def __init__(self, kappa):
         self.kappa = kappa
 
-    def step(self, feats_k, pred, tempo_drift, meter):
+    def step(self, feats_k, label_beats_k, pred, tempo_drift, meter):
         return {"phase": (feats_k[:, 0], torch.full_like(pred, self.kappa))}
 
 
@@ -108,7 +109,8 @@ def test_phase_step_aimed_at_the_path_keeps_drift_at_one_frame(model):
     base = _replay(model, draw)["phi_path"][0]
     feats = base[None, :, None].expand(256, FRAMES, 1)
     phi = model.draws_to_paths(_batch(draw, 256), torch.ones(256, FRAMES),
-                               posterior=_AimAtPath(kappa), feats=feats)["phi_path"]
+                               posterior=_AimAtPath(kappa), feats=feats,
+                               label_beats=torch.zeros(256, FRAMES))["phi_path"]
     drift = (phi[:, [200, 1000, FRAMES - 1]] - base[[200, 1000, FRAMES - 1]]).std(0)
     assert (drift < 1.2 / math.sqrt(kappa)).all(), drift
 
@@ -133,3 +135,20 @@ def test_meter_change_keeps_the_beat_tempo(model):
     changes = draw["log_tempo"][0, 1:].abs()
     assert changes.max() < 0.01
     assert (changes > 1e-4).sum() <= 2
+
+
+@pytest.mark.parametrize("bars, bpm, rubato", [([4] * 40, 120.0, 0.0), ([3] * 30, 90.0, 0.0),
+                                               ([4] * 40, 75.0, 0.02)])
+def test_posterior_start_matches_the_oracle(model, bars, bpm, rubato):
+    beat_times, downbeat_times = synthetic_song(bars, bpm, FPS, rubato=rubato, seed=5)
+    start = 3.0
+    positions = beat_positions(beat_times, downbeat_times)
+    draw, _ = oracle_draw((beat_times - start) * FPS, positions, bar_meters(positions), FRAMES)
+    labels = labels_from_beats(beat_times - start, downbeat_times - start, 0, FRAMES, FPS)
+    (phase0, kappa0), (log_tempo0, _), meter0 = model.posterior_model.start_from_labels(labels)
+    offset = phase0 - draw["phase0"]
+    phase_error = torch.atan2(torch.sin(offset), torch.cos(offset))
+    assert abs(float(phase_error)) < 0.1
+    assert abs(float(log_tempo0 - draw["log_tempo"][0, 0])) < 0.05
+    assert int(meter0.argmax(-1)) == int(draw["meter"][0, 0].argmax())
+    assert float(kappa0) > 10.0

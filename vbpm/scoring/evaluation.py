@@ -85,36 +85,10 @@ def trajectory_period(mu, mask, fps):
     return period.cpu().numpy()
 
 
-def trajectory_health(mu, kappa, mask, crops):
-    """(advance, kappa, phase_err, coverage): what F cannot see about the trajectory."""
-    from ..data.dataset import true_phase
-
-    inc = mu[:, 1:] - mu[:, :-1]
-    inc = torch.atan2(torch.sin(inc), torch.cos(inc))
-    w = mask[:, 1:] * mask[:, :-1]
-    advance = float((inc * w).sum() / w.sum().clamp(min=1.0))
-    kappa_mean = float((kappa * mask).sum() / mask.sum().clamp(min=1.0))
-
-    errs, visited = [], np.zeros(16, dtype=bool)
-    for i, crop in enumerate(crops):
-        t = len(crop["y"])
-        phi_true, ok = true_phase(crop)
-        if not ok.any():
-            continue
-        m = mu[i, :t].cpu().numpy()[ok]
-        diff = np.angle(np.exp(1j * (m - phi_true[ok])))
-        errs.append(np.abs(diff))
-        visited |= np.bincount(((m % TWO_PI) / TWO_PI * 16).astype(int) % 16,
-                               minlength=16).astype(bool)
-
-    phase_err = float(np.mean(np.concatenate(errs))) if errs else float("nan")
-    return advance, kappa_mean, phase_err, float(visited.mean())
-
-
 def null_times(crop, kind: str, rng):
     """A baseline downbeat sequence with the right RATE but no learned phase."""
     period = crop["bar_period"]
-    span = len(crop["y"]) / crop["fps"] if "fps" in crop else None
+    span = crop["valid_frames"] / crop["fps"] if "fps" in crop else None
     duration = span if span is not None else (crop["downbeat_times"][-1] - crop["t0"])
     offset = rng.uniform(0.0, period) if kind == "random" else 0.0
     return crop["t0"] + offset + np.arange(0.0, max(duration, 0.0), period)
@@ -127,29 +101,28 @@ def event_times(flags, crossing, raw):
 
 def crop_times(frames, raw):
     """Frame positions -> seconds, dropping events past each crop's last valid frame."""
-    return [f[f < len(c["y"]) - 1] / c["fps"] + c["t0"] for f, c in zip(frames, raw)]
+    return [f[f < c["valid_frames"] - 1] / c["fps"] + c["t0"] for f, c in zip(frames, raw)]
 
 
-def scoring_records(raw) -> list:
+def scoring_records(raw, fps: float) -> list:
     """Collated excerpt batch -> per-item scoring records, trimmed to valid frames."""
     records = []
-    for i in range(len(raw["y"])):
+    for i in range(len(raw["mask"])):
         valid = int(raw["mask"][i].sum())
         if valid == 0:
             records.append(None)
             continue
-        records.append({"y": raw["y"][i, :valid].numpy(),
-                        "fps": float(raw["fps"][i]), "t0": float(raw["t0"][i]),
+        records.append({"valid_frames": valid,
+                        "fps": fps, "t0": float(raw["t0"][i]),
                         "downbeat_times": np.asarray(raw["downbeat_times"][i]),
-                        "beat_times": np.asarray(raw.get("beat_times", [[]] * len(raw["y"]))[i]),
-                        "anchors": np.asarray(raw["anchors"][i]),
-                        "dataset": raw["dataset"][i], "song_id": raw["song_id"][i]})
+                        "beat_times": np.asarray(raw.get("beat_times", [[]] * len(raw["mask"]))[i]),
+                        "dataset": raw["dataset"][i]})
     return records
 
 
 def evaluate(model, dataset, frontend, device, batch_size: int, seed: int = 0):
     """Per-dataset downbeat metrics for both read-outs, beside the nulls."""
-    assert dataset.deterministic, "evaluation scores FIXED windows"
+    assert dataset.centered, "evaluation scores FIXED windows"
     model.eval()
     rows: dict = defaultdict(lambda: defaultdict(list))
     rng = np.random.default_rng(seed)
@@ -158,7 +131,7 @@ def evaluate(model, dataset, frontend, device, batch_size: int, seed: int = 0):
 
     with torch.no_grad():
         for raw in loader:
-            records = scoring_records(raw)
+            records = scoring_records(raw, frontend.output_fps)
             keep = [i for i, c in enumerate(records) if c is not None]
             if not keep:
                 continue
@@ -178,12 +151,12 @@ def evaluate(model, dataset, frontend, device, batch_size: int, seed: int = 0):
 
             # the peak picker and the nulls need a bar period; take the model's OWN
             # inferred tempo, the only period left in the pipeline now that delta is gone
-            period = trajectory_period(mu, mask[keep], float(raw["fps"][0]))
+            period = trajectory_period(mu, mask[keep], frontend.output_fps)
             for i, crop in enumerate(crops):
                 crop["bar_period"] = float(period[i])
 
             for i, crop in enumerate(crops):
-                t = len(crop["y"])
+                t = crop["valid_frames"]
                 truth = np.asarray(crop["downbeat_times"])
                 rule_g = times[i]
                 per = rows[crop["dataset"]]

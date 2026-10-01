@@ -213,3 +213,6 @@ external/beatfm_repro/
 
 # Research documents (private; do NOT push)
 *.pdf
+
+# Local, never committed
+private/
