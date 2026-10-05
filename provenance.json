@@ -1,0 +1,28 @@
+{
+  "base_commit": "b5af0ede4d642388179fa08fc3301b7a84237b39",
+  "original_experiment": "/home/sogang/jaehoon/VBPM/experiments/tutorial_cvae_dbn/musicfm_real_data",
+  "original_experiment_sha256": {
+    "data.py": "9a38ee4b0b7bfc36a48ed6b7a62ffd6d367bcfd9df8d63a37b26d6955a5fb4a5",
+    "features.py": "409814332e2462023c49ca9c85136be84361dccf0f21990273c8f14e71997495",
+    "model.py": "2ca236e65f1558910193846baeb374a22c05c4c16938e3f625310f24885df45c",
+    "run.py": "8b8cf3a704eec3db3e7c064180acfebe91cd41312bc415148b12d84bad3ab3ce",
+    "plot.py": "a6ed10285fa1d182e0ea1589ef7ebea1126bb1d7ca23ae1f13f4a4b9c2e3e93c"
+  },
+  "original_reference_sha256": {
+    "vae_dbn.py": "b721acd93c341537aabdfea26d9372a3e958e357b78a0c0e8f63381b0d2488e9",
+    "train_logger.py": "b62dcb25e5454381e1b763f4ecc5af6ec95fb6998466b531aec6cfbd4e320a30",
+    "plot_logs.py": "1484ff1cfb5f397ee0c4ab37161753675ebcd87bc2224e45886ca28d99f9d73b"
+  },
+  "musicfm": {
+    "repository": "https://github.com/minzwon/musicfm",
+    "commit": "b83ebedb401bcef639b26b05c0c8bee1dc2dfe71",
+    "files": {
+      "vendor/musicfm/LICENSE": "5684e11c103b652a5fc59a2cc930c4bb63b5d4aa497e8519aaeb147bc4d34877",
+      "vendor/musicfm/modules/conv.py": "585705a6450db374e8c411034e846491f7f48d4ed0516fbf8d3b84855ef0d7d1",
+      "vendor/musicfm/modules/random_quantizer.py": "2ffae390fbf7fefa8a62000ba0490af92ecc001d3b5715fb98f7a1e1578c2aa2",
+      "vendor/musicfm/modules/features.py": "aa8e99711f4a4eab522ff89fe86fc27e281e373ed0ae416743736da229f171da",
+      "vendor/musicfm/model/musicfm_25hz.py": "9645e51938e7a73689a0792ecb15ee957e0723582c8f040949eadd25036ec804"
+    }
+  },
+  "migration": "Package/import paths, resource/output paths, archived PDF-audit fallback and local gradient helper; no changes to model, objective, duration, data law or training settings."
+}

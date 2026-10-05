@@ -1,0 +1,7 @@
+[tool.ruff]
+# Keep audited tutorial and upstream source byte-for-byte unchanged.
+extend-exclude = ["cvae_dbn/reference", "vendor"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["F"]

@@ -1,0 +1,8 @@
+torch==2.6.0
+torchaudio==2.6.0
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.14.0
+matplotlib==3.10.9
+einops==0.8.2
+transformers==4.57.6
