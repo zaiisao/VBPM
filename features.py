@@ -6,12 +6,12 @@ from pathlib import Path
 
 import torch
 
-from cvae_dbn.data import (
+from data import (
     FPS, FRAMES, CONTEXT_FRAMES, OFFSET_FRAMES, SAMPLE_RATE, OUTPUT_DIR, STORE,
     load_waveform, select_clips, sha256, stack_split)
 
 HERE = Path(__file__).resolve().parent
-VENDOR = HERE.parent / 'vendor'
+VENDOR = HERE / 'vendor'
 
 
 def prepare(device='cuda:0', *, weights=None, statistics=None, store=STORE, output=OUTPUT_DIR):
@@ -19,7 +19,7 @@ def prepare(device='cuda:0', *, weights=None, statistics=None, store=STORE, outp
     output.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(VENDOR))
     module = importlib.import_module('musicfm.model.musicfm_25hz')
-    data_dir = HERE.parent / 'assets/musicfm'
+    data_dir = HERE / 'assets/musicfm'
     weights = Path(weights) if weights is not None else data_dir / 'pretrained_msd.pt'
     statistics = Path(statistics) if statistics is not None else data_dir / 'msd_stats.json'
     if not weights.is_file() or not statistics.is_file():

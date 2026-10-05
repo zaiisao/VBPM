@@ -2,7 +2,7 @@
 import torch
 from torch import nn
 
-from cvae_dbn.reference.vae_dbn import VAEDBN
+from reference.vae_dbn import VAEDBN
 
 
 class MusicFMCVAEDBN(VAEDBN):

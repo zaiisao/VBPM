@@ -16,17 +16,17 @@ import torch
 from scipy.signal import find_peaks
 from torch.nn import functional as F
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from cvae_dbn.audit_reference import audit
-from cvae_dbn.reference import vae_dbn as ref
-from cvae_dbn.reference.train_logger import (
+from audit_reference import audit
+from reference import vae_dbn as ref
+from reference.train_logger import (
     TrainLogger, HealthMonitor, global_grad_norm, tensor_stats)
-from cvae_dbn.debug import gradient_routes
-from cvae_dbn.data import (
+from debug import gradient_routes
+from data import (
     FPS, FRAMES, CONTEXT_FRAMES, SAMPLE_RATE, OUTPUT_DIR, STORE, annotation_reference, rasterize, sha256)
-from cvae_dbn.features import prepare
-from cvae_dbn.model import MusicFMCVAEDBN
+from features import prepare
+from model import MusicFMCVAEDBN
 
 HERE = Path(__file__).resolve().parent
 OUT = OUTPUT_DIR
@@ -383,7 +383,7 @@ def main():
         print('DONE: extracted and checked', OUT / 'features.pt', flush=True)
         return
     preflight(data['training'])
-    reference_paths = [ROOT / 'cvae_dbn/reference' / name
+    reference_paths = [ROOT / 'reference' / name
                        for name in ('vae_dbn.py', 'train_logger.py', 'plot_logs.py')]
     source_hashes = {str(path.relative_to(ROOT)): sha256(path) for path in reference_paths}
     report = dict(settings=dict(seeds=[0, 1], steps=STEPS, learning_rate=LR,
@@ -420,7 +420,7 @@ def main():
     report['experiment_source_hashes'] = {name: sha256(HERE / name)
                                         for name in ('data.py', 'features.py', 'model.py', 'run.py', 'plot.py', 'debug.py', 'audit_reference.py')}
     save_report(report)
-    from cvae_dbn.plot import render
+    from plot import render
     render(OUT)
     print('DONE', OUT / 'report.json', flush=True)
 

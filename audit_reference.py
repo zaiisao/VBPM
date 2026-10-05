@@ -13,7 +13,7 @@ import subprocess
 import tokenize
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 HERE = Path(__file__).resolve().parent
 REFERENCE = HERE/'reference'
 PROVENANCE = REFERENCE/'provenance.json'

@@ -8,7 +8,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from cvae_dbn.data import FPS, OUTPUT_DIR
+from data import FPS, OUTPUT_DIR
 
 HERE = Path(__file__).resolve().parent
 OUT = OUTPUT_DIR

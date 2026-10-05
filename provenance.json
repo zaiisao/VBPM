@@ -1,6 +1,6 @@
 {
   "base_commit": "b5af0ede4d642388179fa08fc3301b7a84237b39",
-  "original_experiment": "/home/sogang/jaehoon/VBPM/experiments/tutorial_cvae_dbn/musicfm_real_data",
+  "original_experiment": "/home/sogang/jaehoon/VBPM_saved_before_musicfm_20261006_022837/checkout/experiments/tutorial_cvae_dbn/musicfm_real_data",
   "original_experiment_sha256": {
     "data.py": "9a38ee4b0b7bfc36a48ed6b7a62ffd6d367bcfd9df8d63a37b26d6955a5fb4a5",
     "features.py": "409814332e2462023c49ca9c85136be84361dccf0f21990273c8f14e71997495",
@@ -24,5 +24,10 @@
       "vendor/musicfm/model/musicfm_25hz.py": "9645e51938e7a73689a0792ecb15ee957e0723582c8f040949eadd25036ec804"
     }
   },
-  "migration": "Package/import paths, resource/output paths, archived PDF-audit fallback and local gradient helper; no changes to model, objective, duration, data law or training settings."
+  "migration": "Flattened package/import paths, resource/output paths, archived PDF-audit fallback and local gradient helper; no changes to model, objective, duration, data law or training settings.",
+  "source_layout": "Top-level experiment modules, reference/ and vendor/musicfm/",
+  "saved_checkout": "/home/sogang/jaehoon/VBPM_saved_before_musicfm_20261006_022837/checkout",
+  "saved_branch": "archain-anchor",
+  "saved_head": "6bf398a9fa9ffbed166fc7ca25ebd857663cb4d9",
+  "saved_tracked_changes_stash": "ebda265d6ea7170876c21933b5537fab8150a62a"
 }

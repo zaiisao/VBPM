@@ -9,16 +9,16 @@ package and the other experiments.
 
 | Path | Purpose |
 |---|---|
-| `cvae_dbn/run.py` | Main runner: extraction/cache, existing debug checks, training and evaluation |
-| `cvae_dbn/data.py` | Native audio crops, official song folds, categorical labels and diagnostic references |
-| `cvae_dbn/features.py` | Frozen MusicFM extraction; concatenate all 12 Conformer layers |
-| `cvae_dbn/model.py` | Per-layer normalization and learned feature projection |
-| `cvae_dbn/plot.py` | Training, label scores, phase and velocity plots |
-| `cvae_dbn/debug.py` | Per-term gradient routing helper used by the runner |
-| `cvae_dbn/reference/vae_dbn.py` | Unmodified tutorial model, distributions, transitions, loss and inference |
-| `cvae_dbn/reference/train_logger.py` | Unmodified tutorial gradient/health logger |
-| `cvae_dbn/reference/plot_logs.py` | Unmodified tutorial log plotting tool |
-| `cvae_dbn/audit_reference.py` | Audit reference computations against PDF appendix extractions or a supplied PDF |
+| `run.py` | Main runner: extraction/cache, existing debug checks, training and evaluation |
+| `data.py` | Native audio crops, official song folds, categorical labels and diagnostic references |
+| `features.py` | Frozen MusicFM extraction; concatenate all 12 Conformer layers |
+| `model.py` | Per-layer normalization and learned feature projection |
+| `plot.py` | Training, label scores, phase and velocity plots |
+| `debug.py` | Per-term gradient routing helper used by the runner |
+| `reference/vae_dbn.py` | Unmodified tutorial model, distributions, transitions, loss and inference |
+| `reference/train_logger.py` | Unmodified tutorial gradient/health logger |
+| `reference/plot_logs.py` | Unmodified tutorial log plotting tool |
+| `audit_reference.py` | Audit reference computations against PDF appendix extractions or a supplied PDF |
 | `vendor/musicfm/` | Required upstream MusicFM source, pinned and copied unchanged with its license |
 | `provenance.json` | Original source hashes, initial commit and MusicFM revision |
 
@@ -53,8 +53,8 @@ diagnostics. Training and label/event scoring still use all 750 frames.
 Use the existing environment on this machine:
 
 ```sh
-cd /home/sogang/jaehoon/VBPM_musicfm_cvae_dbn
-/disk4/anaconda3/envs/vbpm/bin/python -m cvae_dbn
+cd /home/sogang/jaehoon/VBPM
+/disk4/anaconda3/envs/vbpm/bin/python run.py
 ```
 
 The ignored local `assets/musicfm/` directory can contain or link to
@@ -63,7 +63,7 @@ their default root is `/disk1/jaehoon/dataset_store`. All resource paths can
 be set explicitly:
 
 ```sh
-python -m cvae_dbn \
+python run.py \
   --data-store /path/to/dataset_store \
   --musicfm-weights /path/to/pretrained_msd.pt \
   --musicfm-stats /path/to/msd_stats.json \
@@ -81,10 +81,10 @@ their checksum and configured sequence lengths.
 
 Reference audit uses archived code extractions from the original, already
 audited PDF. The PDF hash and reference hashes are recorded in
-`cvae_dbn/reference/provenance.json`. To audit against the original PDF again:
+`reference/provenance.json`. To audit against the original PDF again:
 
 ```sh
-python -m cvae_dbn --tutorial-pdf /path/to/CVAE_DBN_Debug_tutorial.pdf
+python run.py --tutorial-pdf /path/to/CVAE_DBN_Debug_tutorial.pdf
 ```
 
 That option also requires `pdftotext`. The archived audit does not require the
@@ -107,6 +107,13 @@ Report label scores, phase/velocity diagnostics and decoder shuffle probes
 separately. A lower loss or accurate training labels alone does not establish
 that the latent state represents physical bar phase and tempo.
 
-The original active run continues in its existing checkout. The local cache
-can be copied here for reuse; its provenance records where extraction occurred.
-This branch contains no historical results or production VBPM code.
+The active 30-second run continues with its original loaded code and training
+state. `outputs/30s/` links to its saved output directory so its results remain
+visible here. A temporary ignored `experiments/` compatibility path gives the
+running process access to its original source paths; it is removed automatically
+when the run finishes. The tracked branch contains the experiment code and its
+required source dependencies.
+
+The previous checkout, including uncommitted and local files, is saved outside
+this repo. Its location and the Git stash containing the tracked changes are
+recorded in `provenance.json`.

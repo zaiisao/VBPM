@@ -16,7 +16,7 @@ FPS, SAMPLE_RATE = 25, 24000
 FRAMES, CONTEXT_FRAMES = 750, 750
 CONTEXT_SECONDS = CONTEXT_FRAMES / FPS
 OFFSET_FRAMES = (CONTEXT_FRAMES - FRAMES) // 2
-OUTPUT_DIR = Path(__file__).resolve().parents[1] / 'outputs/30s'
+OUTPUT_DIR = Path(__file__).resolve().parent / 'outputs/30s'
 
 
 def sha256(path):
