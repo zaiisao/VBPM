@@ -182,8 +182,8 @@ class VAEDBN(nn.Module):
         return torch.cat([torch.cos(phi)[:,None], torch.sin(phi)[:,None], m_oh], -1)
 
     def omega(self, hp):
-        """Phase advance per frame as a deterministic function of the audio."""
-        return F.softplus(self.pri_omega(hp)).squeeze(-1)
+        """Phase advance per frame from the audio, in (0, pi / Delta) so one frame never exceeds half a turn."""
+        return PI / self.Delta * torch.sigmoid(self.pri_omega(hp)).squeeze(-1)
 
     def backbone_feats(self, x):
         h,_ = self.backbone(x); return torch.tanh(self.hb(h))     # [B,T,hid]
