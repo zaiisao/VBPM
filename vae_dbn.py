@@ -25,7 +25,7 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 # von Mises implicit reparameterisation (batched; forward bisection,
 # backward = the implicit reparam gradient dS/dkappa, derived by differentiating F_kappa(S)=eps)
 # ======================================================================
-def _i0(k): return torch.special.i0(k)
+def _log_i0(k): return torch.log(torch.special.i0e(k)) + k
 def A_vm(k): return torch.special.i1e(k) / torch.special.i0e(k)   # I1/I0, stable
 
 class VonMisesInvCDF(torch.autograd.Function):
@@ -37,11 +37,11 @@ class VonMisesInvCDF(torch.autograd.Function):
         lo = torch.full(shape, -PI, dtype=dt, device=dev)
         hi = torch.full(shape,  PI, dtype=dt, device=dev)
         grid = torch.linspace(0, 1, n, dtype=dt, device=dev)
-        Z = 2 * PI * _i0(k)
+        Z = 2 * PI * torch.special.i0e(k)
         for _ in range(iters):                          # batched bisection of F_k(phi)=e
             mid = 0.5 * (lo + hi)
             pts = (-PI) + (mid[..., None] + PI) * grid
-            dens = torch.exp(k[..., None] * torch.cos(pts))
+            dens = torch.exp(k[..., None] * (torch.cos(pts) - 1))
             step = (mid + PI) / (n - 1)
             Fmid = step * (dens.sum(-1) - 0.5 * (dens[..., 0] + dens[..., -1])) / Z
             go = Fmid < e                               # root is to the right of mid
@@ -57,11 +57,11 @@ class VonMisesInvCDF(torch.autograd.Function):
         dt, dev = k.dtype, k.device
         A = A_vm(k); grid = torch.linspace(0, 1, n, dtype=dt, device=dev)
         pts = (-PI) + (phi[..., None] + PI) * grid
-        q0 = torch.exp(k[..., None] * torch.cos(pts)) / (2 * PI * _i0(k)[..., None])
+        q0 = torch.exp(k[..., None] * (torch.cos(pts) - 1)) / (2 * PI * torch.special.i0e(k)[..., None])
         integ = (torch.cos(pts) - A[..., None]) * q0
         step = (phi + PI) / (n - 1)
         num = step * (integ.sum(-1) - 0.5 * (integ[..., 0] + integ[..., -1]))
-        q0p = torch.exp(k * torch.cos(phi)) / (2 * PI * _i0(k))
+        q0p = torch.exp(k * (torch.cos(phi) - 1)) / (2 * PI * torch.special.i0e(k))
         dS = -num / q0p                                         # implicit reparam gradient dS/dkappa
         return g * dS, None, None, None
 
@@ -73,9 +73,9 @@ def vm_sample(mu, kappa, eps):                        # full vM(mu,kappa) draw, 
 # Closed-form KL divergences
 # ======================================================================
 def kl_vm(mu_q, k_q, mu_p, k_p):                      # Eq. 9
-    return torch.log(_i0(k_p) / _i0(k_q)) + A_vm(k_q) * (k_q - k_p * torch.cos(mu_q - mu_p))
+    return _log_i0(k_p) - _log_i0(k_q) + A_vm(k_q) * (k_q - k_p * torch.cos(mu_q - mu_p))
 def kl_vm_uniform(mu_q, k_q):                         # Eq. 10 (k_p = 0)
-    return k_q * A_vm(k_q) - torch.log(_i0(k_q))
+    return k_q * A_vm(k_q) - _log_i0(k_q)
 def kl_gauss(mu_q, logs_q, mu_p, logs_p):
     return (logs_p - logs_q + (torch.exp(2*logs_q) + (mu_q-mu_p)**2)/(2*torch.exp(2*logs_p)) - 0.5)
 def kl_cat(logit_q, logit_p):
