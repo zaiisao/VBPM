@@ -177,6 +177,9 @@ class VAEDBN(nn.Module):
         self.pri_meter = nn.Linear(hid, n_meter)
         # emission p(b_k | phi_k, m_k) at metrical landmarks
         self.emit = LandmarkEmission()
+        with torch.no_grad():
+            self.emit.log_width.fill_(math.log(0.3)); self.emit.log_sharpness.fill_(math.log(8.0))
+        self.emit.requires_grad_(False)
 
     def feats(self, phi, m_oh):
         return torch.cat([torch.cos(phi)[:,None], torch.sin(phi)[:,None], m_oh], -1)
