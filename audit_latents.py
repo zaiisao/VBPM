@@ -29,11 +29,11 @@ def prior_paths(model, x, n):
             hp = model.pri(torch.cat([h[:, k], model.feats(phi_p, m_p)], -1))
             v = model.omega(hp)
             if k == 0:
-                phi = torch.rand(B, device=x.device) * 2 * math.pi - math.pi
+                mu, kappa = model.phase_params(model.pri_phase0(hp))
             else:
                 mu = torch.remainder(phi_p + v * model.Delta, 2 * math.pi)
                 kappa = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
-                phi = M.vm_sample(mu, kappa, torch.rand(B, device=x.device))
+            phi = M.vm_sample(mu, kappa, torch.rand(B, device=x.device))
             m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
             pp.append(phi)
             pv.append(v)
