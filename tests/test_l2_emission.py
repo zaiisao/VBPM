@@ -7,8 +7,13 @@ import torch
 from vbpm.model import VBPM
 from vbpm.nets import EmissionModel
 from vbpm.specs import EmissionSpec
-from vbpm.util.oracle import (bar_meters, beat_positions, labels_from_beats, oracle_draw,
-                               synthetic_song)
+from vbpm.util.oracle import (
+    bar_meters,
+    beat_positions,
+    labels_from_beats,
+    oracle_draw,
+    synthetic_song,
+)
 
 FPS = 50.0
 FRAMES = 500
@@ -19,8 +24,9 @@ def _song(seed):
     rng = np.random.default_rng(seed)
     meter = int(rng.choice([3, 4]))
     bpm = float(rng.uniform(70, 160))
-    beat_times, downbeat_times = synthetic_song([meter] * 40, bpm, FPS,
-                                                rubato=float(rng.uniform(0, 0.03)), seed=seed)
+    beat_times, downbeat_times = synthetic_song(
+        [meter] * 40, bpm, FPS, rubato=float(rng.uniform(0, 0.03)), seed=seed
+    )
     start = float(rng.uniform(2.5, 4.0))
     positions = beat_positions(beat_times, downbeat_times)
     draw, _ = oracle_draw((beat_times - start) * FPS, positions, bar_meters(positions), FRAMES)
@@ -30,20 +36,24 @@ def _song(seed):
 
 def _replay(paths, draw):
     path = paths.draws_to_paths(draw, torch.ones(1, FRAMES))
-    return path["phi_path"], path["meter_path"]
+    return path["phi_path"], path["velocity_path"], path["meter_path"]
 
 
 def _perturbations(draw, meter):
     shifted = {k: v.clone() for k, v in draw.items()}
     shifted["phase0"] += math.pi / meter
     doubled = {k: v.clone() for k, v in draw.items()}
-    doubled["log_tempo"][:, 0] += math.log(2.0)
+    doubled["velocity"] *= 2.0
     halved = {k: v.clone() for k, v in draw.items()}
-    halved["log_tempo"][:, 0] -= math.log(2.0)
+    halved["velocity"] /= 2.0
     remetered = {k: v.clone() for k, v in draw.items()}
     remetered["meter"] = remetered["meter"].flip(-1)
-    return {"half-beat shift": shifted, "tempo x2": doubled, "tempo x1/2": halved,
-            "wrong meter": remetered}
+    return {
+        "half-beat shift": shifted,
+        "tempo x2": doubled,
+        "tempo x1/2": halved,
+        "wrong meter": remetered,
+    }
 
 
 def _stack(items):
@@ -54,7 +64,7 @@ def _train(emission, inputs, cls, steps=400):
     opt = torch.optim.Adam(emission.parameters(), lr=1e-3)
     mask = torch.ones(cls.shape)
     for _ in range(steps):
-        loss = -emission.loglik(*inputs, cls, mask).mean() / FRAMES
+        loss = -emission.loglik(*inputs, cls, mask, None).mean() / FRAMES
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -63,13 +73,13 @@ def _train(emission, inputs, cls, steps=400):
 
 def _recon(emission, inputs, cls):
     with torch.no_grad():
-        return float(emission.loglik(*inputs, cls, torch.ones(cls.shape)).mean()) / FRAMES
+        return float(emission.loglik(*inputs, cls, torch.ones(cls.shape), None).mean()) / FRAMES
 
 
 @pytest.fixture(scope="module")
 def corpus():
     torch.manual_seed(0)
-    paths = VBPM(input_dim=8, fps=FPS)
+    paths = VBPM(input_dim=8)
     songs = [_song(seed) for seed in range(24)]
     train, held = songs[:18], songs[18:]
     train_inputs = _stack([_replay(paths, d) for d, _, _ in train])
@@ -79,11 +89,16 @@ def corpus():
     perturbed = {}
     for name in _perturbations(*held[0][::2]):
         perturbed[name] = _stack([_replay(paths, _perturbations(d, m)[name]) for d, _, m in held])
-    teacher = _train(EmissionModel((3, 4), FPS, EmissionSpec()), train_inputs, train_cls)
+    teacher = _train(EmissionModel(EmissionSpec(), (3, 4), 0), train_inputs, train_cls)
     shuffled = [torch.roll(x, 1, 0) for x in train_inputs]
-    control = _train(EmissionModel((3, 4), FPS, EmissionSpec()), shuffled, train_cls)
-    return {"teacher": teacher, "control": control, "held_inputs": held_inputs,
-            "held_cls": held_cls, "perturbed": perturbed}
+    control = _train(EmissionModel(EmissionSpec(), (3, 4), 0), shuffled, train_cls)
+    return {
+        "teacher": teacher,
+        "control": control,
+        "held_inputs": held_inputs,
+        "held_cls": held_cls,
+        "perturbed": perturbed,
+    }
 
 
 def test_teacher_forced_emission_reads_the_true_path(corpus):

@@ -1,4 +1,5 @@
-"""Train and evaluate the bar-phase VAE: one continuous latent, no meter, no beat grid."""
+"""Train and evaluate VBPM with phase, tempo and meter, including pure GSNN."""
+
 from __future__ import annotations
 
 import argparse
@@ -9,7 +10,7 @@ import torch
 
 from vbpm.config import load_config
 from vbpm.scoring.evaluation import evaluate, print_table
-from vbpm.data.excerpts import (ExcerptDataset, collate_excerpts)
+from vbpm.data.excerpts import ExcerptDataset, collate_excerpts
 from vbpm.frontends import build_frontend
 
 
@@ -30,8 +31,19 @@ def _seed_worker(_worker_id: int) -> None:
     np.random.seed(torch.initial_seed() % 2**32)
 
 
-def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
-          val_set=None, select: str = "none", init_from: str = None, save_dir=None):
+def train(
+    dataset,
+    frontend,
+    device,
+    cfg,
+    hooks,
+    seed: int,
+    workers: int,
+    val_set=None,
+    select: str = "none",
+    init_from: str = None,
+    save_dir=None,
+):
     """One seed: run the controls, then fit the objective the hooks define.
 
     ``select`` names a CHECKPOINT RULE, declared before the run rather than chosen
@@ -41,22 +53,47 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
     is known to be monotone.
     """
     torch.manual_seed(seed)
-    model = hooks.build_model(cfg, frontend.num_channels, frontend.output_fps).to(device)
+    model = hooks.build_model(cfg, frontend.num_channels).to(device)
 
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=workers,
-        collate_fn=collate_excerpts, pin_memory=True, worker_init_fn=_seed_worker,
+        dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=workers,
+        collate_fn=collate_excerpts,
+        pin_memory=True,
+        worker_init_fn=_seed_worker,
         persistent_workers=workers > 0,
-        generator=torch.Generator().manual_seed(seed))
+        generator=torch.Generator().manual_seed(seed),
+    )
 
     if init_from:
         blob = torch.load(init_from, map_location="cpu", weights_only=False)
-        report = model.load_state_dict(blob["model"], strict=False)
+        current = model.state_dict()
+        state = blob["model"]
+        # Old posterior tensors have the same shapes but different units:
+        # absolute means/softplus scales versus dimensionless prior residuals.
+        legacy_posterior = (
+            blob.get("posterior_parameterization") != model.posterior_parameterization
+        )
+        fresh_posterior = [
+            k for k in state if legacy_posterior and k.startswith("posterior_model.")
+        ]
+        incompatible = [k for k, v in state.items() if k in current and v.shape != current[k].shape]
+        skipped = set(incompatible) | set(fresh_posterior)
+        compatible = {k: v for k, v in state.items() if k not in skipped}
+        report = model.load_state_dict(compatible, strict=False)
+        print(f"  incompatible shapes initialized fresh: {sorted(incompatible)}", flush=True)
+        if fresh_posterior:
+            print("  legacy posterior initialized fresh for prior-residual coordinates", flush=True)
         if blob.get("frontend") is not None:
             frontend.model.load_state_dict(blob["frontend"])
-        print(f"warm start from {init_from}\n"
-              f"  fresh parameters: {sorted(report.missing_keys)}\n"
-              f"  unused in checkpoint: {sorted(report.unexpected_keys)}", flush=True)
+        print(
+            f"warm start from {init_from}\n"
+            f"  fresh parameters: {sorted(report.missing_keys)}\n"
+            f"  unused in checkpoint: {sorted(report.unexpected_keys)}",
+            flush=True,
+        )
 
     params = list(model.parameters())
     opt = torch.optim.Adam(params, lr=cfg.lr)
@@ -79,12 +116,15 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
 
             mask = raw["mask"].to(device, non_blocking=True)
             cls = raw["cls"].to(device, non_blocking=True)
-            out = model(h, mask, cls=cls)
+            out = model(h, mask, cls=cls, gsnn_only=cfg.gsnn_alpha == 0.0)
 
             # per-frame normalisation and beta-annealed loss; reported elbo is beta=1.
             # clamp: a backstop item (fully-masked window) must cost 0, not produce nan.
             frames = mask.sum(1).clamp(min=1.0)
-            loss = -((out["recon"] - beta * out["kl"]) / frames).mean()
+            cvae = out["recon"] - beta * out["kl"]
+            loss = -(
+                (cfg.gsnn_alpha * cvae + (1.0 - cfg.gsnn_alpha) * out["recon_prior"]) / frames
+            ).mean()
 
             opt.zero_grad()
             loss.backward()
@@ -93,8 +133,11 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
             # all run long; downbeat_source: search-read-out-verdict). |g| logged = pooled norm
             # when off, LARGEST single-tensor norm when on.
             if cfg.clip_per_group:
-                gnorm += max(float(torch.nn.utils.clip_grad_norm_([p], cfg.clip))
-                             for p in params if p.grad is not None)
+                gnorm += max(
+                    float(torch.nn.utils.clip_grad_norm_([p], cfg.clip))
+                    for p in params
+                    if p.grad is not None
+                )
             else:
                 gnorm += float(torch.nn.utils.clip_grad_norm_(params, cfg.clip))
             if cfg.frontend_lr_scale > 0:
@@ -102,9 +145,11 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
 
             opt.step()
 
-            totals += [float(out["elbo"].mean()),
-                       float(out["recon"].mean()),
-                       float(out["kl"].mean())]
+            totals += [
+                float(out["elbo"].mean()),
+                float(out["recon"].mean()),
+                float(out["kl"].mean()),
+            ]
             steps += 1
 
         if select != "none" and val_set is not None and len(val_set):
@@ -112,56 +157,89 @@ def train(dataset, frontend, device, cfg, hooks, seed: int, workers: int,
             per = next(iter(scored.values()))
             score = per.get(select, (float("nan"), 0))[0]
             if score > best["score"]:
-                best = {"score": score, "epoch": epoch,
-                        "state": {k: v.detach().clone() for k, v in
-                                  model.state_dict().items()}}
-            print(f"            select[{select}] {score:.4f}  "
-                  f"best {best['score']:.4f} @ epoch {best['epoch']}", flush=True)
+                best = {
+                    "score": score,
+                    "epoch": epoch,
+                    "state": {k: v.detach().clone() for k, v in model.state_dict().items()},
+                }
+            print(
+                f"            select[{select}] {score:.4f}  "
+                f"best {best['score']:.4f} @ epoch {best['epoch']}",
+                flush=True,
+            )
 
         gain = getattr(model.emission_model, "b", None)
         b_note = "" if gain is None else f"  b {float(gain):5.2f}"
-        print(f"  epoch {epoch:2d}  beta {beta:5.3f}  elbo {totals[0] / steps:9.2f}  "
-              f"recon {totals[1] / steps:8.2f}  kl {totals[2] / steps:9.2f}{b_note}  "
-              f"|g| {gnorm / steps:8.2f}",
-              flush=True)
+        print(
+            f"  epoch {epoch:2d}  beta {beta:5.3f}  elbo {totals[0] / steps:9.2f}  "
+            f"recon {totals[1] / steps:8.2f}  kl {totals[2] / steps:9.2f}{b_note}  "
+            f"|g| {gnorm / steps:8.2f}",
+            flush=True,
+        )
 
         if save_dir is not None:
             save_dir.mkdir(parents=True, exist_ok=True)
-            torch.save({"model": model.state_dict(),
-                        "frontend": (frontend.model.state_dict()
-                                     if cfg.frontend_lr_scale > 0 else None),
-                        "config": vars(cfg), "seed": seed, "epoch": epoch},
-                       save_dir / f"seed{seed}_epoch{epoch:02d}.pt")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "posterior_parameterization": model.posterior_parameterization,
+                    "frontend": (
+                        frontend.model.state_dict() if cfg.frontend_lr_scale > 0 else None
+                    ),
+                    "config": vars(cfg),
+                    "seed": seed,
+                    "epoch": epoch,
+                },
+                save_dir / f"seed{seed}_epoch{epoch:02d}.pt",
+            )
 
     if best["state"] is not None:
         model.load_state_dict(best["state"])
-        print(f"  checkpoint rule [{select}] selected epoch {best['epoch']} "
-              f"(score {best['score']:.4f})", flush=True)
+        print(
+            f"  checkpoint rule [{select}] selected epoch {best['epoch']} "
+            f"(score {best['score']:.4f})",
+            flush=True,
+        )
     return model
 
 
 def parse_args():
     """Run mechanics ONLY -- the recipe is the config's business."""
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="vbpm/configs/baseline.yaml",
-                   help="YAML recipe; its variant: key names the hooks module")
-    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
-                   help="override a config key for this run (repeatable)")
+    p.add_argument(
+        "--config",
+        default="vbpm/configs/baseline.yaml",
+        help="YAML recipe; its variant: key names the hooks module",
+    )
+    p.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="override a config key for this run (repeatable)",
+    )
     p.add_argument("--gpu", type=int, default=1, choices=(0, 1, 2, 3))
-    p.add_argument("--seed", type=int, default=0,
-                   help="one run = one seed; sweep seeds with an outer script")
+    p.add_argument(
+        "--seed", type=int, default=0, help="one run = one seed; sweep seeds with an outer script"
+    )
     p.add_argument("--limit-per-fold", type=int, default=None)
-    p.add_argument("--select", default="none",
-                   help="checkpoint rule: a validation metric name from the scoring "
-                        "table (e.g. rule-g, rule-g CMLt). Declared before the run; "
-                        "none keeps the last epoch.")
-    p.add_argument("--workers", type=int, default=4,
-                   help="DataLoader workers (window draws + mmap reads)")
-    p.add_argument("--init-from", default=None,
-                   help="warm-start model and frontend weights from a checkpoint; "
-                        "parameters absent from it keep their fresh initialisation")
-    p.add_argument("--save-dir", default=None,
-                   help="save the model to <save-dir>/seed<k>.pt")
+    p.add_argument(
+        "--select",
+        default="none",
+        help="checkpoint rule: a validation metric name from the scoring "
+        "table (e.g. downbeat F, beat F). Declared before the run; "
+        "none keeps the last epoch.",
+    )
+    p.add_argument(
+        "--workers", type=int, default=4, help="DataLoader workers (window draws + mmap reads)"
+    )
+    p.add_argument(
+        "--init-from",
+        default=None,
+        help="warm-start model and frontend weights from a checkpoint; "
+        "parameters absent from it keep their fresh initialisation",
+    )
+    p.add_argument("--save-dir", default=None, help="save the model to <save-dir>/seed<k>.pt")
     return p.parse_args()
 
 
@@ -181,7 +259,10 @@ def main() -> None:
     data.setup("test")
 
     train_source, val_source, test_source = (
-        data.train_dataset, data.val_dataset, data.test_dataset)
+        data.train_dataset,
+        data.val_dataset,
+        data.test_dataset,
+    )
     if args.limit_per_fold is not None:
         for source in (train_source, val_source, test_source):
             kept, counts = [], {}
@@ -197,33 +278,56 @@ def main() -> None:
     val_set = ExcerptDataset(val_source, frontend, cfg.excerpt_seconds, centered=True)
     test_set = ExcerptDataset(test_source, frontend, cfg.excerpt_seconds, centered=True)
 
-    print(f"songs: train {len(train_source)} / val {len(val_source)} / "
-          f"gtzan-test {len(test_source)}")
-    print(f"train: {len(train_set)} songs, fresh {cfg.excerpt_seconds:.0f}s window "
-          f"per epoch, rejects {len(train_set.rejects)}")
+    print(
+        f"songs: train {len(train_source)} / val {len(val_source)} / gtzan-test {len(test_source)}"
+    )
+    print(
+        f"train: {len(train_set)} songs, fresh {cfg.excerpt_seconds:.0f}s window "
+        f"per epoch, rejects {len(train_set.rejects)}"
+    )
 
-    model = train(train_set, frontend, device, cfg, hooks, args.seed, args.workers,
-                  val_set=val_set, select=args.select, init_from=args.init_from,
-                  save_dir=pathlib.Path(args.save_dir) if args.save_dir else None)
+    model = train(
+        train_set,
+        frontend,
+        device,
+        cfg,
+        hooks,
+        args.seed,
+        args.workers,
+        val_set=val_set,
+        select=args.select,
+        init_from=args.init_from,
+        save_dir=pathlib.Path(args.save_dir) if args.save_dir else None,
+    )
 
     if args.save_dir:
         save_dir = pathlib.Path(args.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        torch.save({"model": model.state_dict(),
-                    "frontend": (frontend.model.state_dict()
-                                 if cfg.frontend_lr_scale > 0 else None),
-                    "config": vars(cfg), "seed": args.seed,
-                    "config_path": args.config, "overrides": list(args.set)},
-                   save_dir / f"seed{args.seed}.pt")
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "posterior_parameterization": model.posterior_parameterization,
+                "frontend": (frontend.model.state_dict() if cfg.frontend_lr_scale > 0 else None),
+                "config": vars(cfg),
+                "seed": args.seed,
+                "config_path": args.config,
+                "overrides": list(args.set),
+            },
+            save_dir / f"seed{args.seed}.pt",
+        )
 
-    results = {name: evaluate(model, split, frontend, device, cfg.batch_size,
-                              seed=args.seed)
-               for split, name in ((val_set, "val"), (test_set, "gtzan")) if len(split)}
+    results = {
+        name: evaluate(model, split, frontend, device, cfg.batch_size, seed=args.seed)
+        for split, name in ((val_set, "val"), (test_set, "gtzan"))
+        if len(split)
+    }
 
     print_table(results)
-    print(f"\nfps={frontend.output_fps}  excerpt={cfg.excerpt_seconds}s (fresh window per epoch)  "
-          f"frontend={cfg.frontend}/{cfg.frontend_checkpoint}  "
-          f"no meter, no beat grid, no offset")
+    print(
+        f"\nfps={frontend.output_fps}  excerpt={cfg.excerpt_seconds}s (fresh window per epoch)  "
+        f"frontend={cfg.frontend}/{cfg.frontend_checkpoint}  "
+        f"no meter, no beat grid, no offset"
+    )
 
 
 if __name__ == "__main__":

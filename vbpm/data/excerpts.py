@@ -1,4 +1,5 @@
 """Frontend-agnostic training excerpts: the shared shape of both official pipelines."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -10,8 +11,7 @@ MIN_DOWNBEATS = 4
 class ExcerptDataset(torch.utils.data.Dataset):
     """Per-epoch random windows of cached frontend input + framewise VAE targets."""
 
-    def __init__(self, source, frontend, excerpt_seconds: float = 45.0,
-                 centered: bool = False):
+    def __init__(self, source, frontend, excerpt_seconds: float = 45.0, centered: bool = False):
         self.output_fps = frontend.output_fps
         self.spect_fps = source.fps
         self.excerpt_frames = int(round(excerpt_seconds * self.output_fps))
@@ -59,30 +59,34 @@ class ExcerptDataset(torch.utils.data.Dataset):
 
         targets = self._targets(downbeat_times, beat_times, start, window_frames)
 
-        annotated = (len(targets["downbeat_times"]) > 0
-                     or len(targets["beat_times"]) > 0)
+        annotated = len(targets["downbeat_times"]) > 0 or len(targets["beat_times"]) > 0
         frame_mask = np.full(window_frames, float(annotated), dtype=np.float32)
 
         pad = self.excerpt_frames - window_frames
-        if pad > 0:                                             # song shorter than the window
+        if pad > 0:  # song shorter than the window
             targets["cls"] = np.pad(targets["cls"], (0, pad))
             frame_mask = np.pad(frame_mask, (0, pad))
 
-        return {"input": spect_window,
-                "cls": targets["cls"], "mask": frame_mask, "t0": t0,
-                "beat_times": targets["beat_times"],
-                "downbeat_times": targets["downbeat_times"],
-                "dataset": song["dataset"]}
+        return {
+            "input": spect_window,
+            "cls": targets["cls"],
+            "mask": frame_mask,
+            "t0": t0,
+            "beat_times": targets["beat_times"],
+            "downbeat_times": targets["downbeat_times"],
+            "dataset": song["dataset"],
+        }
 
     def _spect_window(self, spect, start: int, window_frames: int):
         spect_start = int(round(start * self.spect_fps / self.output_fps))
         spect_frames = int(round(window_frames * self.spect_fps / self.output_fps))
-        spect_window = np.array(spect[spect_start:spect_start + spect_frames], dtype=np.float32)
+        spect_window = np.array(spect[spect_start : spect_start + spect_frames], dtype=np.float32)
 
         spect_pad = self.spect_excerpt_frames - len(spect_window)
         if spect_pad > 0:
-            spect_window = np.pad(spect_window,
-                                  [(0, spect_pad)] + [(0, 0)] * (spect_window.ndim - 1))
+            spect_window = np.pad(
+                spect_window, [(0, spect_pad)] + [(0, 0)] * (spect_window.ndim - 1)
+            )
 
         return spect_window
 
@@ -93,10 +97,13 @@ class ExcerptDataset(torch.utils.data.Dataset):
         1 = beat, 2 = downbeat, written downbeat-last so a downbeat overwrites the beat
         that shares its time.
         """
-        lo_t, hi_t = start / self.output_fps, (start + frames) / self.output_fps
 
-        window_beats = beat_times[(beat_times >= lo_t) & (beat_times <= hi_t)]
-        window_downbeats = downbeat_times[(downbeat_times >= lo_t) & (downbeat_times <= hi_t)]
+        def in_window(times):
+            centers = np.round(times * self.output_fps) - start
+            return times[(centers >= 0) & (centers < frames)]
+
+        window_beats = in_window(beat_times)
+        window_downbeats = in_window(downbeat_times)
 
         cls = np.zeros(frames, dtype=np.int64)
         for times, label in ((window_beats, 1), (window_downbeats, 2)):
@@ -105,9 +112,7 @@ class ExcerptDataset(torch.utils.data.Dataset):
                 if center < frames:
                     cls[center] = label
 
-        return {"cls": cls,
-                "beat_times": window_beats,
-                "downbeat_times": window_downbeats}
+        return {"cls": cls, "beat_times": window_beats, "downbeat_times": window_downbeats}
 
 
 def collate_excerpts(batch: list) -> dict:

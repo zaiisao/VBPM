@@ -1,4 +1,5 @@
 """The true latent path of an annotated excerpt, as a draw that draws_to_paths replays."""
+
 from __future__ import annotations
 
 import math
@@ -48,8 +49,7 @@ def oracle_draw(beat_frames, positions, meters, frames: int, meter_values=(3, 4)
     rate = spacing / (b[j] - b[j - 1])
     phi0 = phi_prev_beat - rate * b[j - 1]
 
-    log_tempo = np.zeros(frames)
-    log_tempo[0] = math.log(rate * seg_meter)
+    velocity = np.full(frames, rate)
     meter = np.zeros((frames, len(meter_values)))
     meter[:, meter_index[seg_meter]] = 1.0
 
@@ -63,7 +63,6 @@ def oracle_draw(beat_frames, positions, meters, frames: int, meter_values=(3, 4)
         downbeat = positions[j] == 0
         crossings.append((c, float(b[j]), downbeat))
         phi_c = seg_phi + rate * (c - seg_start)
-        bar_meter = seg_meter
         if downbeat:
             seg_meter = meters[j] if meters[j] is not None else seg_meter
             meter[c:, :] = 0.0
@@ -74,15 +73,19 @@ def oracle_draw(beat_frames, positions, meters, frames: int, meter_values=(3, 4)
         if j + 1 >= len(b):
             break
         new_rate = (landmark - phi_c) / (b[j + 1] - c)
-        log_tempo[c] = math.log(new_rate * seg_meter) - math.log(rate * bar_meter)
+        velocity[c:] = new_rate
         seg_start, seg_phi, rate = c, phi_c, new_rate
         j += 1
 
     def as_tensor(x):
         return torch.tensor(x, dtype=torch.float32)[None]
 
-    draw = {"phase0": as_tensor(phi0).reshape(1), "phase": torch.zeros(1, frames),
-            "log_tempo": as_tensor(log_tempo), "meter": as_tensor(meter)}
+    draw = {
+        "phase0": as_tensor(phi0).reshape(1),
+        "phase": torch.zeros(1, frames),
+        "velocity": as_tensor(velocity),
+        "meter": as_tensor(meter),
+    }
     return draw, crossings
 
 
@@ -98,13 +101,17 @@ def labels_from_beats(beat_times, downbeat_times, start: int, frames: int, fps: 
     return torch.from_numpy(cls)[None]
 
 
-def synthetic_song(bars, bpm: float, fps: float = 50.0, rubato: float = 0.0,
-                   offset: float = 0.37, seed: int = 0):
+def synthetic_song(
+    bars, bpm: float, fps: float = 50.0, rubato: float = 0.0, offset: float = 0.37, seed: int = 0
+):
     """(beat_times, downbeat_times) for a list of bar lengths at bpm, jittered by rubato."""
     rng = np.random.default_rng(seed)
     n = int(sum(bars))
-    log_period = math.log(60.0 / bpm) + np.cumsum(rng.normal(0.0, rubato, n)) if rubato else \
-        np.full(n, math.log(60.0 / bpm))
+    log_period = (
+        math.log(60.0 / bpm) + np.cumsum(rng.normal(0.0, rubato, n))
+        if rubato
+        else np.full(n, math.log(60.0 / bpm))
+    )
     beat_times = offset + np.concatenate([[0.0], np.cumsum(np.exp(log_period[:-1]))])
     starts = np.concatenate([[0], np.cumsum(bars)[:-1]]).astype(int)
     return beat_times, beat_times[starts]

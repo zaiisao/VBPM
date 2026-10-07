@@ -1,9 +1,10 @@
 """The constructor's argument groups: one dataclass per cluster of knobs."""
+
 from __future__ import annotations
 
 import dataclasses
 
-from .constants import PRIOR_PHASE_KAPPA_PER_SECOND
+from .constants import PRIOR_PHASE_KAPPA
 
 
 @dataclasses.dataclass
@@ -13,20 +14,26 @@ class EmissionSpec:
     layers: int = 2
     dim: int = 64
     positional: bool = False
+    reads_audio: bool = False
+    reads_velocity: bool = False
+    kind: str = "transformer"
+
+
+@dataclasses.dataclass
+class WalkSpec:
+    """The prior's phase concentration around the tempo advance."""
+
+    prior_phase_kappa: float = PRIOR_PHASE_KAPPA
+
+    def __post_init__(self):
+        self.prior_phase_kappa = float(self.prior_phase_kappa)
 
 
 @dataclasses.dataclass
 class PriorSpec:
-    """p(path | x): the phase concentration around the tempo advance."""
+    """Audio-only sequence encoder for the centered phase/tempo generator."""
 
-    phase_kappa_per_second: float = PRIOR_PHASE_KAPPA_PER_SECOND
-
-    def __post_init__(self):
-        self.phase_kappa_per_second = float(self.phase_kappa_per_second)
-
-
-@dataclasses.dataclass
-class PosteriorSpec:
-    """q(path | x, labels): the size of the encoder trunk."""
-
-    d_model: int = 128
+    dim: int = 128
+    layers: int = 2
+    phase0_kappa: float = 40.0
+    velocity_sigma: float = 0.05

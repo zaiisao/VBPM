@@ -12,14 +12,15 @@ known to stay large. q's concentration is LEARNED and floored at KAPPA_Q_MIN =
 0.01, so that condition cannot be assumed during training. It survives here for
 the variants that already used it.
 """
+
 from __future__ import annotations
 
 import math
 
 import torch
 
-SMALL_KAPPA = 1e-4   # below this the von Mises is uniform to float64 precision, and the
-                     # Best-Fisher rho = (tau - sqrt(2 tau)) / (2 kappa) is 0/0
+SMALL_KAPPA = 1e-4  # below this the von Mises is uniform to float64 precision, and the
+# Best-Fisher rho = (tau - sqrt(2 tau)) / (2 kappa) is 0/0
 
 
 def log_i0(kappa: torch.Tensor) -> torch.Tensor:
@@ -27,9 +28,9 @@ def log_i0(kappa: torch.Tensor) -> torch.Tensor:
     return torch.log(torch.special.i0e(kappa)) + kappa
 
 
-ASYMPTOTIC_KAPPA = 50.0   # above this A'(kappa) is taken from the series: the exact form
-                          # 1 - A/k - A^2 cancels two float32 quantities agreeing to ~5e-6
-                          # at kappa 1e5, which flips the sign of every phase-kappa gradient
+ASYMPTOTIC_KAPPA = 50.0  # above this A'(kappa) is taken from the series: the exact form
+# 1 - A/k - A^2 cancels two float32 quantities agreeing to ~5e-6
+# at kappa 1e5, which flips the sign of every phase-kappa gradient
 
 
 class _MeanResultant(torch.autograd.Function):
@@ -47,7 +48,7 @@ class _MeanResultant(torch.autograd.Function):
         k = kappa.double().clamp_min(1e-12)
         ad = a.double()
         exact = 1.0 - ad / k - ad * ad
-        asym = 0.5 / k ** 2 + 0.25 / k ** 3 + 0.375 / k ** 4
+        asym = 0.5 / k**2 + 0.25 / k**3 + 0.375 / k**4
         deriv = torch.where(k > ASYMPTOTIC_KAPPA, asym, exact)
         return grad_out * deriv.to(grad_out.dtype)
 
@@ -57,10 +58,26 @@ def mean_resultant(kappa: torch.Tensor) -> torch.Tensor:
     return _MeanResultant.apply(kappa)
 
 
+def kl_vonmises_uniform(kappa):
+    """KL(vM(mu, kappa) || uniform circle) = kappa A(kappa) - log I0(kappa)."""
+    return kappa * mean_resultant(kappa) - log_i0(kappa)
+
+
 def kl_vonmises(mu1, kappa1, mu2, kappa2):
     """KL( vM(mu1, kappa1) || vM(mu2, kappa2) ), closed form, elementwise."""
-    return (log_i0(kappa2) - log_i0(kappa1)
-            + mean_resultant(kappa1) * (kappa1 - kappa2 * torch.cos(mu1 - mu2)))
+    # Separately subtracting log I0 and kappa terms loses small KL values at
+    # high concentration. Keep the scaled Bessel terms and use 2*sin²(d/2)
+    # for 1-cos(d); float64 also preserves 1-A(kappa) near one.
+    dtype = mu1.dtype
+    mu1, kappa1, mu2, kappa2 = (x.double() for x in (mu1, kappa1, mu2, kappa2))
+    a = mean_resultant(kappa1)
+    kl = (
+        torch.special.i0e(kappa2).log()
+        - torch.special.i0e(kappa1).log()
+        + (1.0 - a) * (kappa2 - kappa1)
+        + 2.0 * a * kappa2 * torch.sin((mu1 - mu2) / 2.0).square()
+    )
+    return kl.to(dtype)
 
 
 def _best_fisher_rho(kappa: torch.Tensor) -> torch.Tensor:
@@ -90,8 +107,7 @@ def sample_vonmises(kappa: torch.Tensor, max_rounds: int = 64) -> torch.Tensor:
             z = torch.cos(math.pi * p1)
             f = (1.0 + r * z) / (r + z)
             c = work * (r - f)
-            ok = ((c * (2.0 - c) - p2) > 0) | ((torch.log(c / p2.clamp_min(1e-300))
-                                                + 1.0 - c) >= 0)
+            ok = ((c * (2.0 - c) - p2) > 0) | ((torch.log(c / p2.clamp_min(1e-300)) + 1.0 - c) >= 0)
             take = ok & (~accepted)
             u1 = torch.where(take, p1, u1)
             u3 = torch.where(take, p3, u3)
@@ -110,8 +126,7 @@ def sample_vonmises(kappa: torch.Tensor, max_rounds: int = 64) -> torch.Tensor:
 
     one_minus_f = ((r - 1.0) * (1.0 - z) / (r + z)).clamp(0.0, 2.0)
     sign = torch.where(u3 > 0.5, 1.0, -1.0)
-    angle = 2.0 * sign * torch.asin(
-        torch.sqrt(one_minus_f / 2.0 + 1e-24).clamp(max=1.0))
+    angle = 2.0 * sign * torch.asin(torch.sqrt(one_minus_f / 2.0 + 1e-24).clamp(max=1.0))
 
     uniform = (2.0 * u1 - 1.0) * math.pi
     angle = torch.where(tiny | (~accepted), uniform, angle)

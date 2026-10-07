@@ -1,4 +1,5 @@
 """L2 on real songs: does a teacher-forced emission read the oracle path of annotated excerpts."""
+
 from __future__ import annotations
 
 import argparse
@@ -39,8 +40,9 @@ def windows(song, frames, count, rng):
         if any(m is not None and m not in METERS for m in inside):
             continue
         try:
-            draw, crossings = oracle_draw((beat_times - start) * FPS, positions, meters,
-                                          frames, METERS)
+            draw, crossings = oracle_draw(
+                (beat_times - start) * FPS, positions, meters, frames, METERS
+            )
         except ValueError:
             continue
         cls = labels_from_beats(beat_times - start, downbeat_times - start, 0, frames, FPS)
@@ -55,22 +57,22 @@ def perturb(draw, meter, name):
     if name == "half-beat shift":
         out["phase0"] += math.pi / meter
     elif name == "tempo x2":
-        out["log_tempo"][:, 0] += math.log(2.0)
+        out["velocity"] *= 2.0
     elif name == "tempo x1/2":
-        out["log_tempo"][:, 0] -= math.log(2.0)
+        out["velocity"] /= 2.0
     elif name == "wrong meter":
         out["meter"] = out["meter"].flip(-1)
     return out
 
 
 def replay(paths, draws, device, chunk=64):
-    """(phi, log_tempo, meter) paths for a list of single-item draws."""
+    """(phi, velocity, meter) paths for a list of single-item draws."""
     parts = []
     for i in range(0, len(draws), chunk):
-        batch = {k: torch.cat([d[k] for d in draws[i:i + chunk]]).to(device) for k in draws[0]}
-        mask = torch.ones(batch["log_tempo"].shape, device=device)
+        batch = {k: torch.cat([d[k] for d in draws[i : i + chunk]]).to(device) for k in draws[0]}
+        mask = torch.ones(batch["velocity"].shape, device=device)
         path = paths.draws_to_paths(batch, mask)
-        parts.append((path["phi_path"], path["meter_path"]))
+        parts.append((path["phi_path"], path["velocity_path"], path["meter_path"]))
     return [torch.cat(p) for p in zip(*parts)]
 
 
@@ -81,7 +83,9 @@ def train(emission, inputs, cls, steps, batch, seed):
     mask = torch.ones(batch, cls.shape[1], device=cls.device)
     for step in range(steps):
         idx = torch.randint(0, len(cls), (batch,), generator=gen, device=cls.device)
-        loss = -emission.loglik(*[x[idx] for x in inputs], cls[idx], mask).mean() / cls.shape[1]
+        loss = (
+            -emission.loglik(*[x[idx] for x in inputs], cls[idx], mask, None).mean() / cls.shape[1]
+        )
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -95,9 +99,12 @@ def recon(emission, inputs, cls, chunk=64):
     """Mean recon per frame."""
     total = 0.0
     for i in range(0, len(cls), chunk):
-        mask = torch.ones(cls[i:i + chunk].shape, device=cls.device)
-        total += float(emission.loglik(*[x[i:i + chunk] for x in inputs], cls[i:i + chunk],
-                                       mask).sum())
+        mask = torch.ones(cls[i : i + chunk].shape, device=cls.device)
+        total += float(
+            emission.loglik(
+                *[x[i : i + chunk] for x in inputs], cls[i : i + chunk], mask, None
+            ).sum()
+        )
     return total / cls.numel()
 
 
@@ -123,10 +130,10 @@ def main():
 
     data = load_beat_this(7)
     train_songs, val_songs = data.train_dataset.items, data.val_dataset.items
-    train_songs = [train_songs[i] for i in rng.permutation(len(train_songs))[:args.train_songs]]
-    val_songs = [val_songs[i] for i in rng.permutation(len(val_songs))[:args.held_songs]]
+    train_songs = [train_songs[i] for i in rng.permutation(len(train_songs))[: args.train_songs]]
+    val_songs = [val_songs[i] for i in rng.permutation(len(val_songs))[: args.held_songs]]
 
-    paths = VBPM(input_dim=8, fps=FPS).to(device)
+    paths = VBPM(input_dim=8).to(device)
     train_w = [w for s in train_songs for w in windows(s, frames, args.windows, rng)]
     held_w = [w for s in val_songs for w in windows(s, frames, args.windows, rng)]
     print(f"windows: train {len(train_w)}  held-out {len(held_w)}", flush=True)
@@ -138,18 +145,22 @@ def main():
 
     held_paths = paths.draws_to_paths(
         {k: torch.cat([d[k] for d, _, _ in held_w[:64]]).to(device) for k in held_w[0][0]},
-        torch.ones(min(64, len(held_w)), frames, device=device))
+        torch.ones(min(64, len(held_w)), frames, device=device),
+    )
     beats = held_paths["is_beat"]
-    labelled = held_cls[:len(beats)] > 0
+    labelled = held_cls[: len(beats)] > 0
     near = torch.nn.functional.max_pool1d(labelled.float()[:, None], 5, 1, 2)[:, 0] > 0
-    print(f"oracle replay: {float((beats & near).sum() / beats.sum().clamp(min=1)):.3f} of path "
-          f"beats within 2 frames of a label, {int(beats.sum())} path beats vs "
-          f"{int(labelled.sum())} labels", flush=True)
+    print(
+        f"oracle replay: {float((beats & near).sum() / beats.sum().clamp(min=1)):.3f} of path "
+        f"beats within 2 frames of a label, {int(beats.sum())} path beats vs "
+        f"{int(labelled.sum())} labels",
+        flush=True,
+    )
 
     freq = torch.bincount(train_cls.flatten(), minlength=3).float() / train_cls.numel()
 
     def fresh():
-        emission = EmissionModel(METERS, FPS, EmissionSpec()).to(device)
+        emission = EmissionModel(EmissionSpec(), METERS, 0).to(device)
         if args.init == "random":
             with torch.no_grad():
                 torch.nn.init.kaiming_uniform_(emission.out.weight, a=math.sqrt(5))
@@ -163,9 +174,11 @@ def main():
     control = train(fresh(), shuffled, train_cls, args.steps, args.batch, args.seed)
     prior_only = float(freq.log()[held_cls].mean())
     truth = recon(teacher, held_in, held_cls)
-    rows = [("class frequencies only", prior_only),
-            ("shuffled-path control", recon(control, held_in, held_cls)),
-            ("TRUTH", truth)]
+    rows = [
+        ("class frequencies only", prior_only),
+        ("shuffled-path control", recon(control, held_in, held_cls)),
+        ("TRUTH", truth),
+    ]
     for name in ("half-beat shift", "tempo x2", "tempo x1/2", "wrong meter"):
         wrong_in = replay(paths, [perturb(d, m, name) for d, _, m in held_w], device)
         rows.append((name, recon(teacher, wrong_in, held_cls)))

@@ -34,6 +34,12 @@
     "minimum": 0.0,
     "description": "gradient-norm clip over the params the variant's optimizer hook hands back."
   },
+  "gsnn_alpha": {
+    "type": "number",
+    "default": 0.7,
+    "minimum": 0.0,
+    "description": "Weight of the CVAE objective: zero trains only the sampled prior and learned decoder."
+  },
   "beta_start": {
     "type": "number",
     "default": 0.0,
@@ -56,9 +62,9 @@
     "minimum": 1.0,
     "description": "window length. Below ~45 s the ELBO cannot separate tracking the truth from coasting on a constant period (crop-horizon root cause)."
   },
-  "prior_phase_kappa_per_second": {
+  "prior_phase_kappa": {
     "type": "number",
-    "default": 7.66,
+    "default": 383.0,
     "minimum": 0.0,
     "description": "concentration of the physical prior's increment law: the DRIFT TAX. Real tempo wobble is heavy-tailed, so lowering this cuts the KL price of expressing drift."
   },
@@ -85,7 +91,61 @@
   },
   "meters": {
     "type": "array",
-    "default": [2, 3, 4, 5, 6, 7, 8],
+    "default": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
     "description": "beats-per-bar values the chain enumerates; at least one is required. Meter joins rate in the state and may change only at a wrapping phase transition."
+  },
+  "prior_dim": {
+    "type": "integer",
+    "default": 128,
+    "description": "Audio-only prior encoder width (multiple of four).",
+    "minimum": 4
+  },
+  "prior_layers": {
+    "type": "integer",
+    "default": 2,
+    "description": "Audio-only prior encoder depth.",
+    "minimum": 1
+  },
+  "prior_phase0_kappa": {
+    "type": "number",
+    "default": 40.0,
+    "description": "Initial learned phase concentration.",
+    "minimum": 1.001
+  },
+  "prior_velocity_sigma": {
+    "type": "number",
+    "default": 0.05,
+    "description": "Initial Gaussian velocity uncertainty.",
+    "minimum": 1e-06
+  },
+  "log_velocity": {
+    "type": "boolean",
+    "default": false,
+    "description": "Use a positive physical velocity via velocity_ref * exp(latent)."
+  },
+  "velocity_ref": {
+    "type": "number",
+    "default": 0.06283185307179587,
+    "description": "Reference radians per frame for log velocity; 120 BPM in 4/4 at 50 Hz.",
+    "minimum": 1e-06
+  },
+  "velocity_step": {
+    "type": "number",
+    "default": 0.010465180361560902,
+    "description": "Per-frame scale of log-velocity innovations.",
+    "minimum": 1e-06
+  },
+  "meter_gated": {
+    "type": "boolean",
+    "default": false,
+    "description": "Allow learned meter transitions only when the bar pointer crosses a downbeat."
   }
 }

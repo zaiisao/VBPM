@@ -1,12 +1,10 @@
-# Mixed VBPM: 70% CVAE (reconstruction minus KL), 30% prior-sampled GSNN.
-# Uses the corrected generator; gsnn.yaml retains the alpha=0 diagnostic.
-# Velocity units assume 50 frontend frames per second.
+# Pure GSNN: audio-conditioned prior + trainable original Transformer decoder.
+# Log-velocity units assume the restored Beat This frontend's 50 frames/second.
 excerpt_seconds: 45.0
 batch_size: 4
 epochs: 24
 lr: 3.0e-4
-gsnn_alpha: 0.7
-beta_warmup: 0
+gsnn_alpha: 0.0
 log_velocity: true
 velocity_ref: 0.06283185307179587
 velocity_step: 0.010465180361560902

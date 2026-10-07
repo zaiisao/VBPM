@@ -1,4 +1,5 @@
 """Scoring: the downbeat metrics themselves, and the model-facing evaluation loops."""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -62,7 +63,10 @@ def f_measure(predicted, annotated, tolerance: float = TOLERANCE_S):
         gap = np.abs(annotated - t)
         gap[used] = np.inf
         j = int(np.argmin(gap))
-        if gap[j] <= tolerance:
+        # Subtraction at nonzero timestamps can round an exact 70 ms gap
+        # slightly upward. Allow floating-point roundoff at the endpoints.
+        roundoff = 8 * np.finfo(np.float64).eps * max(1.0, abs(t), abs(annotated[j]))
+        if gap[j] <= tolerance + roundoff:
             used[j] = True
             hits += 1
 
@@ -70,6 +74,29 @@ def f_measure(predicted, annotated, tolerance: float = TOLERANCE_S):
     recall = hits / len(annotated)
     f = 0.0 if hits == 0 else 2 * precision * recall / (precision + recall)
     return f, precision, recall
+
+
+def decode_event_times(probs, fps: float):
+    """Decode one peak per contiguous beat/downbeat classification region.
+
+    Several adjacent positive frames describe one event. Matching every such
+    frame to a reference beat incorrectly penalizes a broad predicted peak as
+    duplicate beats. Selection uses probabilities only, never annotations.
+    """
+    probs = np.asarray(probs, dtype=np.float64)
+    if probs.ndim != 2 or probs.shape[1] != 3 or fps <= 0:
+        raise ValueError("Expected [frames, N/B/D] probabilities and positive fps")
+    labels = probs.argmax(-1)
+
+    def select(active, strength):
+        indices = np.flatnonzero(active)
+        if len(indices) == 0:
+            return np.zeros(0, dtype=np.float64)
+        regions = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+        peaks = [region[np.argmax(strength[region])] for region in regions]
+        return np.asarray(peaks, dtype=np.float64) / fps
+
+    return (select(labels > 0, probs[:, 1:].sum(-1)), select(labels == 2, probs[:, 2]))
 
 
 def trajectory_period(mu, mask, fps):
@@ -94,16 +121,6 @@ def null_times(crop, kind: str, rng):
     return crop["t0"] + offset + np.arange(0.0, max(duration, 0.0), period)
 
 
-def event_times(flags, crossing, raw):
-    """Event TIMES per crop from the path's own crossings, interpolated within the frame."""
-    return [crossing[i][flags[i]].cpu().numpy() for i in range(len(raw))]
-
-
-def crop_times(frames, raw):
-    """Frame positions -> seconds, dropping events past each crop's last valid frame."""
-    return [f[f < c["valid_frames"] - 1] / c["fps"] + c["t0"] for f, c in zip(frames, raw)]
-
-
 def scoring_records(raw, fps: float) -> list:
     """Collated excerpt batch -> per-item scoring records, trimmed to valid frames."""
     records = []
@@ -112,22 +129,28 @@ def scoring_records(raw, fps: float) -> list:
         if valid == 0:
             records.append(None)
             continue
-        records.append({"valid_frames": valid,
-                        "fps": fps, "t0": float(raw["t0"][i]),
-                        "downbeat_times": np.asarray(raw["downbeat_times"][i]),
-                        "beat_times": np.asarray(raw.get("beat_times", [[]] * len(raw["mask"]))[i]),
-                        "dataset": raw["dataset"][i]})
+        records.append(
+            {
+                "valid_frames": valid,
+                "fps": fps,
+                "t0": float(raw["t0"][i]),
+                "downbeat_times": np.asarray(raw["downbeat_times"][i]),
+                "beat_times": np.asarray(raw.get("beat_times", [[]] * len(raw["mask"]))[i]),
+                "dataset": raw["dataset"][i],
+            }
+        )
     return records
 
 
 def evaluate(model, dataset, frontend, device, batch_size: int, seed: int = 0):
-    """Per-dataset downbeat metrics for both read-outs, beside the nulls."""
+    """Per-dataset beat and downbeat metrics decoded from the emission, beside the nulls."""
     assert dataset.centered, "evaluation scores FIXED windows"
     model.eval()
     rows: dict = defaultdict(lambda: defaultdict(list))
     rng = np.random.default_rng(seed)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
-                                         collate_fn=collate_excerpts)
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, collate_fn=collate_excerpts
+    )
 
     with torch.no_grad():
         for raw in loader:
@@ -142,68 +165,67 @@ def evaluate(model, dataset, frontend, device, batch_size: int, seed: int = 0):
 
             path = model.infer_path(h, mask)
             mu = path["phi_path"][keep]
-            crossing = path["crossing"][keep]
-            times = crop_times(event_times(path["is_downbeat"][keep], crossing, crops), crops)
-            beats = crop_times(event_times(path["is_beat"][keep], crossing, crops), crops)
-            probs = model.emission_probs(h, mask, path)[keep].cpu().numpy()
+            probabilities = model.label_probs(h, mask)[keep].cpu().numpy()
             beats_per_bar = path["meter_path"] @ model.meter_values
             meter = (beats_per_bar * mask).sum(1) / mask.sum(1).clamp(min=1.0)
 
-            # the peak picker and the nulls need a bar period; take the model's OWN
-            # inferred tempo, the only period left in the pipeline now that delta is gone
+            # the nulls need a bar period; take the model's OWN inferred tempo
             period = trajectory_period(mu, mask[keep], frontend.output_fps)
             for i, crop in enumerate(crops):
                 crop["bar_period"] = float(period[i])
 
             for i, crop in enumerate(crops):
                 t = crop["valid_frames"]
+                beats, downbeats = decode_event_times(probabilities[i, :t], crop["fps"])
+                beats = beats + crop["t0"]
+                downbeats = downbeats + crop["t0"]
                 truth = np.asarray(crop["downbeat_times"])
-                rule_g = times[i]
                 per = rows[crop["dataset"]]
-                if len(truth) == 0:
-                    if beats is not None and len(crop["beat_times"]):
-                        bt = np.asarray(crop["beat_times"])
-                        per["beat F"].append(f_measure(beats[i], bt)[0])
-                        bc, ba = continuity_scores(bt, beats[i])
-                        per["beat CMLt"].append(bc)
-                        per["beat AMLt"].append(ba)
-                        per["beat est/ref"].append(len(beats[i]) / max(len(bt), 1))
-                        per["meter"].append(float(meter[keep][i]))
-                    continue
-                per["rule-g"].append(f_measure(rule_g, truth)[0])
-                cmlt, amlt = continuity_scores(truth, rule_g)
-                per["rule-g CMLt"].append(cmlt)
-                per["rule-g AMLt"].append(amlt)
-                per["est/ref"].append(len(rule_g) / max(len(truth), 1))
-
-                alt_d = peak_times(probs[i, :t], crop["fps"], crop["bar_period"]) + crop["t0"]
-                per["emission-D"].append(f_measure(alt_d, truth)[0])
-
-                if beats is not None and len(crop["beat_times"]):
+                if len(crop["beat_times"]):
                     bt = np.asarray(crop["beat_times"])
-                    per["beat F"].append(f_measure(beats[i], bt)[0])
-                    bc, ba = continuity_scores(bt, beats[i])
+                    per["beat F"].append(f_measure(beats, bt)[0])
+                    bc, ba = continuity_scores(bt, beats)
                     per["beat CMLt"].append(bc)
                     per["beat AMLt"].append(ba)
-                    per["beat est/ref"].append(len(beats[i]) / max(len(bt), 1))
+                    per["beat est/ref"].append(len(beats) / max(len(bt), 1))
                     per["meter"].append(float(meter[keep][i]))
+                if len(truth) == 0:
+                    continue
+                per["downbeat F"].append(f_measure(downbeats, truth)[0])
+                cmlt, amlt = continuity_scores(truth, downbeats)
+                per["downbeat CMLt"].append(cmlt)
+                per["downbeat AMLt"].append(amlt)
+                per["est/ref"].append(len(downbeats) / max(len(truth), 1))
 
                 for kind in ("random", "zero"):
-                    per[f"null-{kind}"].append(
-                        f_measure(null_times(crop, kind, rng), truth)[0])
+                    per[f"null-{kind}"].append(f_measure(null_times(crop, kind, rng), truth)[0])
 
-    return {ds: {k: (float(np.mean(v)), len(v)) for k, v in per_mode.items()}
-            for ds, per_mode in rows.items()}
+    return {
+        ds: {k: (float(np.mean(v)), len(v)) for k, v in per_mode.items()}
+        for ds, per_mode in rows.items()
+    }
 
 
 def print_table(results):
     """One row per (split, dataset, mode). One run = one seed; sweeps aggregate outside."""
-    print("\n==== downbeat F (+-70 ms) ====")
-    rows = sorted((split, dataset, mode, value, count)
-                  for split, per_dataset in results.items()
-                  for dataset, modes in per_dataset.items()
-                  for mode, (value, count) in modes.items())
-    units = {"est/ref": "ratio", "rule-g CMLt": "CMLt", "rule-g AMLt": "AMLt"}
+    print("\n==== beat and downbeat scores (+-70 ms) ====")
+    rows = sorted(
+        (split, dataset, mode, value, count)
+        for split, per_dataset in results.items()
+        for dataset, modes in per_dataset.items()
+        for mode, (value, count) in modes.items()
+    )
+    units = {
+        "est/ref": "ratio",
+        "beat est/ref": "ratio",
+        "meter": "bpb",
+        "downbeat CMLt": "CMLt",
+        "downbeat AMLt": "AMLt",
+        "beat CMLt": "CMLt",
+        "beat AMLt": "AMLt",
+    }
     for split, dataset, mode, value, count in rows:
-        print(f"  {split:6s} {mode:15s} {dataset:11s} "
-              f"{units.get(mode, 'F'):5s} {value:.3f}  (n={count})")
+        print(
+            f"  {split:6s} {mode:15s} {dataset:11s} "
+            f"{units.get(mode, 'F'):5s} {value:.3f}  (n={count})"
+        )
