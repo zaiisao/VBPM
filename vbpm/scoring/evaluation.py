@@ -165,7 +165,7 @@ def evaluate(model, dataset, frontend, device, batch_size: int, seed: int = 0):
 
             path = model.infer_path(h, mask)
             mu = path["phi_path"][keep]
-            probabilities = model.label_probs(h, mask)[keep].cpu().numpy()
+            probabilities = model.predict_label_probs(h, mask)[keep].cpu().numpy()
             beats_per_bar = path["meter_path"] @ model.meter_values
             meter = (beats_per_bar * mask).sum(1) / mask.sum(1).clamp(min=1.0)
 

@@ -69,7 +69,6 @@ def main():
             else {}
         )
         extra["angular_frame_bin_emission"] = checkpoint.get("angular_frame_bin_emission", False)
-        extra["landmark_emission"] = checkpoint.get("landmark_emission", False)
         extra["log_tempo_noise"] = checkpoint.get("log_tempo_noise", False)
         extra["clock_mass_emission"] = checkpoint.get("clock_mass_emission", False)
         extra["bernoulli_clock_emission"] = checkpoint.get("bernoulli_clock_emission", False)

@@ -59,7 +59,6 @@ def load_config(path: str, overrides: list[str] = ()):
     mainline = schema()
     hooks = importlib.import_module("vbpm.model")
     known = {key: spec["default"] for key, spec in mainline.items()}
-    known |= hooks.DEFAULTS
     unknown = set(recipe) - set(known)
     assert not unknown, f"unknown config keys {sorted(unknown)} (typo?)"
     for key, value in recipe.items():

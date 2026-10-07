@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vbpm.audio_prediction_prior import AudioPredictionPrior
+from diagnostics.audio_proposals import extract_audio_phase
 
 
 def test_official_confidence_threshold_rejects_false_subdivision_peak():
@@ -18,10 +18,8 @@ def test_official_confidence_threshold_rejects_false_subdivision_peak():
     audio[0, [10, 40], 0] = torch.logit(torch.tensor(0.9))
     audio[0, 25, 0] = torch.logit(torch.tensor(0.42))
     mask = torch.ones(1, 60)
-    old = AudioPredictionPrior.initial_prediction(predictor, audio, mask, max_bpm=300.0)
-    repaired = AudioPredictionPrior.initial_prediction(
-        predictor, audio, mask, max_bpm=300.0, min_probability=0.5
-    )
+    old = extract_audio_phase(predictor, audio, mask, max_bpm=300.0)
+    repaired = extract_audio_phase(predictor, audio, mask, max_bpm=300.0, min_probability=0.5)
     conversion = 4 * 50 * 60 / (2 * math.pi)
     torch.testing.assert_close(old["physical_velocity"] * conversion, torch.full((1, 60), 200.0))
     torch.testing.assert_close(
@@ -39,8 +37,8 @@ def test_optional_audio_peak_spacing_rejects_implausibly_fast_duplicate():
     audio = torch.full((1, 60, 1), -10.0)
     audio[0, [10, 15, 40], 0] = torch.tensor([15.0, 14.0, 15.0])
     mask = torch.ones(1, 60)
-    original = AudioPredictionPrior.initial_prediction(predictor, audio, mask)
-    limited = AudioPredictionPrior.initial_prediction(predictor, audio, mask, max_bpm=300.0)
+    original = extract_audio_phase(predictor, audio, mask)
+    limited = extract_audio_phase(predictor, audio, mask, max_bpm=300.0)
     conversion = 4 * 50 * 60 / (2 * math.pi)
     assert original["physical_velocity"].max() * conversion > 300
     assert limited["physical_velocity"].max() * conversion <= 300
@@ -49,10 +47,10 @@ def test_optional_audio_peak_spacing_rejects_implausibly_fast_duplicate():
     torch.testing.assert_close(
         limited["physical_velocity"] * conversion, torch.full((1, 60), 100.0)
     )
-    unchanged = AudioPredictionPrior.initial_prediction(predictor, audio, mask, max_bpm=None)
+    unchanged = extract_audio_phase(predictor, audio, mask, max_bpm=math.inf)
     torch.testing.assert_close(original["phase"], unchanged["phase"], rtol=0, atol=0)
     with pytest.raises(ValueError):
-        AudioPredictionPrior.initial_prediction(predictor, audio, mask, max_bpm=0)
+        extract_audio_phase(predictor, audio, mask, max_bpm=0)
 
 
 @pytest.mark.parametrize(
@@ -73,12 +71,12 @@ def test_optional_missing_peak_recovery_preserves_ordinal_and_tempo(positions, e
     audio = torch.full((1, positions[-1] + 10, 1), -10.0)
     audio[0, positions, 0] = 10.0
     mask = torch.ones(audio.shape[:2])
-    default = AudioPredictionPrior.initial_prediction(predictor, audio, mask, min_probability=0.5)
-    explicit_default = AudioPredictionPrior.initial_prediction(
+    default = extract_audio_phase(predictor, audio, mask, min_probability=0.5)
+    explicit_default = extract_audio_phase(
         predictor, audio, mask, min_probability=0.5, recover_missing_beats=False
     )
     torch.testing.assert_close(default["phase"], explicit_default["phase"], rtol=0, atol=0)
-    recovered = AudioPredictionPrior.initial_prediction(
+    recovered = extract_audio_phase(
         predictor, audio, mask, min_probability=0.5, recover_missing_beats=True
     )
     conversion = 4 * 50 * 60 / (2 * math.pi)

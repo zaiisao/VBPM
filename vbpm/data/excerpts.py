@@ -11,14 +11,28 @@ MIN_DOWNBEATS = 4
 class ExcerptDataset(torch.utils.data.Dataset):
     """Per-epoch random windows of cached frontend input + framewise VAE targets."""
 
-    def __init__(self, source, frontend, excerpt_seconds: float = 45.0, centered: bool = False):
+    def __init__(
+        self,
+        source,
+        frontend,
+        excerpt_seconds: float = 45.0,
+        centered: bool = False,
+        full_length: bool = False,
+    ):
         self.output_fps = frontend.output_fps
         self.spect_fps = source.fps
         self.excerpt_frames = int(round(excerpt_seconds * self.output_fps))
         self.spect_excerpt_frames = int(round(excerpt_seconds * self.spect_fps))
         self.centered = centered
+        self.full_length = full_length
         self.source = source
         self.items, self.rejects = self._annotated_songs(source)
+        if full_length:
+            self.items = [
+                item
+                for item in self.items
+                if len(source._get_spect(item[0])) >= self.spect_excerpt_frames
+            ]
 
     @staticmethod
     def _annotated_songs(source):
@@ -63,7 +77,7 @@ class ExcerptDataset(torch.utils.data.Dataset):
         frame_mask = np.full(window_frames, float(annotated), dtype=np.float32)
 
         pad = self.excerpt_frames - window_frames
-        if pad > 0:  # song shorter than the window
+        if not self.full_length and pad > 0:  # evaluation song shorter than the window
             targets["cls"] = np.pad(targets["cls"], (0, pad))
             frame_mask = np.pad(frame_mask, (0, pad))
 
@@ -83,7 +97,7 @@ class ExcerptDataset(torch.utils.data.Dataset):
         spect_window = np.array(spect[spect_start : spect_start + spect_frames], dtype=np.float32)
 
         spect_pad = self.spect_excerpt_frames - len(spect_window)
-        if spect_pad > 0:
+        if not self.full_length and spect_pad > 0:
             spect_window = np.pad(
                 spect_window, [(0, spect_pad)] + [(0, 0)] * (spect_window.ndim - 1)
             )

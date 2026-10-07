@@ -1,9 +1,10 @@
-"""von Mises: closed-form KL, and two samplers of which only one is exact.
+"""von Mises: closed-form KL and numerical reparameterized samplers.
 
 `sample_vonmises_icdf` is the mainline draw and the one the phase note derives:
 phi = S_kappa(eps) with S the inverse CDF, whose kappa-derivative comes from
 differentiating F_kappa(S_kappa(eps)) = eps rather than from any closed form.
-Its gradient is unbiased at every concentration.
+The finite-grid CDF and implicit derivative are numerical approximations;
+tests compare the concentration gradient against an independent SciPy oracle.
 
 `sample_vonmises` is Best-Fisher rejection with a pathwise gradient. It is
 cheaper per draw but its kappa-gradient is biased -- measured -48% at kappa = 2,
@@ -140,9 +141,8 @@ VM_NODES = 512
 def _vm_tables(kappa, nodes: int = VM_NODES):
     """(grid, cdf, dcdf_dkappa) for vM(0, kappa) on [-pi, pi], one row per element.
 
-    The trapezoid rule on a periodic density converges geometrically, so a fixed grid
-    replaces the root-find's quadrature entirely: F_kappa and its kappa-derivative are
-    cumulative sums over the same nodes, and the inverse is a searchsorted away.
+    Batched trapezoidal integration tabulates F_kappa and its kappa-derivative
+    on the same grid. The inverse is obtained by search and linear interpolation.
     """
     unit = torch.linspace(-1.0, 1.0, nodes, device=kappa.device, dtype=kappa.dtype)
     half = (8.0 / kappa.clamp(min=1e-3).sqrt()).clamp(max=math.pi)

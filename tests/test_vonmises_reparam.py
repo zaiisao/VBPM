@@ -57,3 +57,75 @@ def test_mean_resultant_identity(kappa):
         np.pi,
     )[0]
     assert abs(val) < 1e-9
+
+
+def test_gaussian_location_scale_gradients_match_equation_eight():
+    from vbpm.nets import LatentParameters, LatentSampler
+
+    torch.manual_seed(33)
+    noise = torch.randn(4, dtype=torch.float64)
+    torch.manual_seed(33)
+    mean = torch.tensor([-2., 0., 1., 3.], dtype=torch.float64, requires_grad=True)
+    scale = torch.tensor([0.2, 0.5, 1., 2.], dtype=torch.float64, requires_grad=True)
+    parameters = LatentParameters(torch.zeros(4), torch.ones(4), mean, scale.log())
+    velocity = LatentSampler()(parameters).velocity
+    torch.testing.assert_close(velocity, mean + scale * noise)
+    velocity.sum().backward()
+    torch.testing.assert_close(mean.grad, torch.ones_like(mean))
+    torch.testing.assert_close(scale.grad, noise)
+
+
+def test_actual_sampler_phase_mean_gradient_is_one_across_wrap():
+    from vbpm.nets import LatentParameters, LatentSampler
+
+    torch.manual_seed(34)
+    mean = torch.tensor([-3.14, 3.14], dtype=torch.float64, requires_grad=True)
+    kappa = torch.tensor([2., 5.], dtype=torch.float64, requires_grad=True)
+    parameters = LatentParameters(mean, kappa, torch.zeros(2), torch.zeros(2))
+    phase = LatentSampler()(parameters).phase
+    phase.sum().backward()
+    torch.testing.assert_close(mean.grad, torch.ones_like(mean))
+    assert torch.isfinite(kappa.grad).all()
+    assert kappa.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize('use_posterior', [False, True])
+def test_final_frame_reconstruction_reaches_initial_draw_and_heads(use_posterior):
+    from types import SimpleNamespace
+    from vbpm.model import VBPM
+
+    torch.manual_seed(35)
+    model = VBPM(SimpleNamespace(num_channels=5, output_fps=50), d_model=8, samples=2)
+    h = torch.randn(2, 6, 5)
+    labels = torch.tensor([[0, 1, 0, 2, 0, 1], [1, 0, 2, 0, 1, 0]])
+    draws = []
+
+    def capture(module, args, state):
+        if state.phase.requires_grad:
+            state.phase.retain_grad()
+        state.velocity.retain_grad()
+        draws.append(state)
+
+    hook = model.latent_sampler.register_forward_hook(capture)
+    try:
+        if use_posterior:
+            logits, _, _ = model.posterior_rollout(h, labels, samples=2)
+            heads = (model.posterior_model.phase_head, model.posterior_model.velocity_head)
+        else:
+            logits, _ = model.rollout(h, samples=2)
+            heads = (model.prior_model.concentration_head, model.prior_model.velocity_head)
+    finally:
+        hook.remove()
+    targets = labels[:, -1].expand(2, -1).reshape(-1)
+    # Likelihood only: KL gradients cannot hide a detached sampler.
+    loss = torch.nn.functional.cross_entropy(logits[:, :, -1].reshape(-1, 3), targets)
+    loss.backward()
+    assert len(draws) == h.shape[1] + 1
+    # The initial prior phase is a parameter-free uniform draw.
+    phase_draw = draws[0].phase if use_posterior else draws[1].phase
+    for value in (phase_draw, draws[0].velocity):
+        assert value.grad is not None and torch.isfinite(value.grad).all()
+        assert value.grad.abs().sum() > 0
+    for head in heads:
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters())
+        assert all(p.grad.abs().sum() > 0 for p in head.parameters())

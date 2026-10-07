@@ -2,7 +2,7 @@
 
 Work in this checkout on `fix/gsnn-generator`, based on `archain-anchor`
 commit `6bf398a`. The original Git history and the MusicFM experiment branch
-are retained. Prior, posterior, and decoder implementation lives in `vbpm/`.
+are retained. Model implementation lives in `vbpm/`.
 
 Use `/disk4/anaconda3/envs/vbpm/bin/python` or activate the `vbpm` environment.
 
@@ -11,11 +11,24 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest tests -q
 PYTHONPATH=.:external/beat_this python train.py --config vbpm/configs/baseline.yaml --gpu 0 --seed 0 --save-dir runs/new_training
 ```
 
-`baseline.yaml` uses 70% CVAE and 30% GSNN. `gsnn.yaml` uses GSNN only.
-These recipes are experimental; prior-only generalization is unresolved.
-The actual posterior still uses prior-relative corrections, whose direct KL
-teaching gradients require investigation. No posterior repair was promoted
-into production during the handover.
+`baseline.yaml` and `gsnn.yaml` now use GSNN only, with fixed meter four.
+The active model is a fresh implementation of the transition-prior rollout in
+`CVAE_DBN_Debug_tutorial.pdf`; it does not use pretrained beat-peak proposals.
+`PriorModel` predicts Gaussian velocity and von Mises phase parameters from
+frontend features and the previous sampled state. `LatentSampler` draws the
+state, and `EmissionModel` predicts labels from phase and velocity only; audio enters through the prior.
+Initial phase is uniform. Velocity is in radians per second; frame duration
+comes from the frontend. The chain has an unobserved initial state followed by
+one transition per label frame; the ELBO includes the initial-state KL.
+`PosteriorModel` reads audio and labels with a
+bidirectional encoder and conditions on the previous sampled state. A nonzero
+`gsnn_alpha` enables posterior reconstruction and phase/velocity KL terms in
+the existing hybrid training objective. Defaults remain GSNN only. Training uses full-length crops;
+evaluation accepts padded clips.
+
+`train.py --init-from` loads weights saved by this implementation. Earlier
+proposal-based experiment checkpoints are incompatible. Historical experiments
+and their results remain in `diagnostics/` and `runs/`.
 
 Reusable experiments are in `diagnostics/`; use `python -m` and `--help`:
 

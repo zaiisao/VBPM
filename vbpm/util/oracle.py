@@ -1,4 +1,4 @@
-"""The true latent path of an annotated excerpt, as a draw that draws_to_paths replays."""
+"""Annotation-derived phase and velocity references for diagnostic scoring."""
 
 from __future__ import annotations
 

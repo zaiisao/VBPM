@@ -1,13 +1,20 @@
 """Frozen or fine-tunable MusicFM encoder frontend."""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import torch
 
-from ..util.spect_convert import (bt_to_mag, build_freq_map, level_offset, mel_bt_to_fm,
-                                  power_to_musicfm, upsample_time)
-from . import Frontend as FrontendBase
+from ..util.spect_convert import (
+    bt_to_mag,
+    build_freq_map,
+    level_offset,
+    mel_bt_to_fm,
+    power_to_musicfm,
+    upsample_time,
+)
+from . import FrontendBase
 
 
 class MusicFMFrontend(FrontendBase):
@@ -27,8 +34,13 @@ class MusicFMFrontend(FrontendBase):
         stats_path = checkpoint_path.with_name("msd_stats.json")
 
         self.device = torch.device(device)
-        self.model = musicfm_25hz.MusicFM25Hz(is_flash=False, stat_path=stats_path,
-                                                 model_path=checkpoint_path).to(self.device).eval()
+        self.model = (
+            musicfm_25hz.MusicFM25Hz(
+                is_flash=False, stat_path=stats_path, model_path=checkpoint_path
+            )
+            .to(self.device)
+            .eval()
+        )
         self.num_channels = self.model.conv.linear.out_features
 
         width_bt, freq_map = build_freq_map()

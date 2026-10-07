@@ -89,3 +89,12 @@ def test_collate_removes_empty_windows_and_rejects_an_empty_batch():
     assert collate_excerpts([item, empty])["cls"].shape[0] == 1
     with pytest.raises(ValueError, match="every item"):
         collate_excerpts([empty])
+
+
+def test_full_length_training_excludes_short_songs_and_has_no_padding():
+    assert len(ExcerptDataset(Source(seconds=30), Frontend(), full_length=True)) == 0
+    source = Source(seconds=45)
+    item = ExcerptDataset(source, Frontend(), full_length=True)[0]
+    np.testing.assert_array_equal(item["input"], source.spect)
+    assert item["mask"].all()
+    assert item["cls"].shape == (2250,)

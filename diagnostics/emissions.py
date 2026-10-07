@@ -1,27 +1,23 @@
-"""Shared normalized clock and frame-bin observation decoders."""
+"""Historical frame decoders and imports for diagnostic experiments."""
 
 import math
 
 import torch
-from torch import nn
 from torch.nn import functional as F
 
 from diagnostics.synthetic_ladder import SparseDecoder
+from torch import nn
+from vbpm.util.clock_likelihood import clock_log_masses, clock_log_probs
+from vbpm.util.clock_likelihood import log_interval_mass as log_interval_mass
 
 
-def log_interval_mass(lower, upper, width):
-    """Compute stable Gaussian log probability in an interval."""
-    reflect = lower + upper > 0
-    lo = torch.where(reflect, -upper, lower) / width
-    hi = torch.where(reflect, -lower, upper) / width
-    log_hi = torch.special.log_ndtr(hi)
-    log_lo = torch.special.log_ndtr(lo)
-    difference = (log_lo - log_hi).clamp_max(-torch.finfo(torch.float64).eps)
-    return log_hi + torch.log(-torch.expm1(difference))
+class ClockEmission(nn.Module):
+    """Trainable p(y | z) from Bernoulli metrical clock masses.
 
-
-class ClockMassDecoder(nn.Module):
-    """Decode normalized metrical event masses into categorical probabilities."""
+    Four circular landmarks produce beat/downbeat probabilities in each frame.
+    Learned timing widths control their spread; downbeats take precedence over
+    ordinary beats at coincident landmarks.
+    """
 
     def __init__(self):
         super().__init__()
@@ -30,23 +26,16 @@ class ClockMassDecoder(nn.Module):
         self.raw_width = nn.Parameter(torch.full((2,), math.log(fraction / (1 - fraction))))
 
     def log_masses(self, phase, velocity):
-        """Return metrical event log masses in each frame interval."""
-        previous = torch.cat((velocity[..., :1], velocity), -1).clamp_min(1e-4)
-        following = torch.cat((velocity, velocity[..., -1:]), -1).clamp_min(1e-4)
-        distance = phase[..., None] - self.centers
-        distance = torch.atan2(distance.sin(), distance.cos()).double()
-        lower = distance - 0.5 * previous[..., None].double()
-        upper = distance + 0.5 * following[..., None].double()
-        sigma = 0.001 + (math.pi - 0.001) * (-F.softplus(-self.raw_width.double())).exp()
-        width = torch.stack((sigma[1], sigma[0], sigma[0], sigma[0]))
-        central = log_interval_mass(lower.clamp_min(-math.pi), upper.clamp_max(math.pi), width)
-        below = log_interval_mass(lower + 2 * math.pi, torch.full_like(upper, math.pi), width)
-        above = log_interval_mass(torch.full_like(lower, -math.pi), upper - 2 * math.pi, width)
-        below = torch.where(lower < -math.pi, below, torch.full_like(below, -torch.inf))
-        above = torch.where(upper > math.pi, above, torch.full_like(above, -torch.inf))
-        log_mass = torch.logsumexp(torch.stack((central, below, above)), 0)
-        log_mass = log_mass - torch.erf(math.pi / (math.sqrt(2) * width)).log()
-        return log_mass
+        """Log probability of each beat landmark falling within each frame."""
+        return clock_log_masses(phase, velocity, self.centers, self.raw_width)
+
+    def forward(self, phase, velocity):
+        """Return non-beat, beat, and downbeat log probabilities."""
+        return clock_log_probs(self.log_masses(phase, velocity)).to(phase.dtype)
+
+
+class ClockMassDecoder(ClockEmission):
+    """Historical Poisson-link decoder used only by diagnostic experiments."""
 
     def forward(self, phase, velocity):
         """Evaluate the network on its input tensors."""
@@ -65,33 +54,9 @@ class ClockMassDecoder(nn.Module):
 
 
 class BernoulliClockDecoder(ClockMassDecoder):
-    """Independent landmark-bin probabilities, merging coincident labels.
+    """Diagnostic compatibility name for the production Bernoulli emission."""
 
-    A downbeat takes precedence over coincident ordinary beats. Unlike the
-    Poisson link, one concentrated landmark can have event probability near
-    one. Normalized timing mass and structural centers stay unchanged.
-    """
-
-    def forward(self, phase, velocity):
-        """Evaluate the network on its input tensors."""
-        log_mass = self.log_masses(phase, velocity).clamp_max(-1e-12)
-        log_missing = torch.log(-torch.expm1(log_mass))
-        log_no_beat = log_missing[..., 1:].sum(-1)
-        log_beat = torch.log(-torch.expm1(log_no_beat.clamp_max(-1e-20)))
-        # For remote kernels, exp underflow would make the complement zero;
-        # the small-probability union approaches the sum of its masses.
-        log_beat = torch.where(
-            log_no_beat > -1e-20, torch.logsumexp(log_mass[..., 1:], -1), log_beat
-        )
-        logits = torch.stack(
-            (log_missing[..., 0] + log_no_beat, log_missing[..., 0] + log_beat, log_mass[..., 0]),
-            -1,
-        )
-        # Tiny observation-error floor supplies finite categorical likelihoods.
-        # It is fixed and never used as a latent supervision or count target.
-        error = 1e-8
-        floor = torch.full_like(logits, math.log(error / 3))
-        return torch.logaddexp(logits + math.log1p(-error), floor).to(phase.dtype)
+    forward = ClockEmission.forward
 
 
 class FrameBinDecoder(SparseDecoder):

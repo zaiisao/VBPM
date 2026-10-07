@@ -53,7 +53,7 @@ def train(
     is known to be monotone.
     """
     torch.manual_seed(seed)
-    model = hooks.build_model(cfg, frontend.num_channels).to(device)
+    model = hooks.build_model(cfg, frontend).to(device)
 
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -68,41 +68,15 @@ def train(
     )
 
     if init_from:
-        blob = torch.load(init_from, map_location="cpu", weights_only=False)
-        current = model.state_dict()
-        state = blob["model"]
-        # Old posterior tensors have the same shapes but different units:
-        # absolute means/softplus scales versus dimensionless prior residuals.
-        legacy_posterior = (
-            blob.get("posterior_parameterization") != model.posterior_parameterization
-        )
-        fresh_posterior = [
-            k for k in state if legacy_posterior and k.startswith("posterior_model.")
-        ]
-        incompatible = [k for k, v in state.items() if k in current and v.shape != current[k].shape]
-        skipped = set(incompatible) | set(fresh_posterior)
-        compatible = {k: v for k, v in state.items() if k not in skipped}
-        report = model.load_state_dict(compatible, strict=False)
-        print(f"  incompatible shapes initialized fresh: {sorted(incompatible)}", flush=True)
-        if fresh_posterior:
-            print("  legacy posterior initialized fresh for prior-residual coordinates", flush=True)
-        if blob.get("frontend") is not None:
-            frontend.model.load_state_dict(blob["frontend"])
-        print(
-            f"warm start from {init_from}\n"
-            f"  fresh parameters: {sorted(report.missing_keys)}\n"
-            f"  unused in checkpoint: {sorted(report.unexpected_keys)}",
-            flush=True,
-        )
+        checkpoint = torch.load(init_from, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint["model"])
+        print(f"Loaded model weights from {init_from}", flush=True)
 
     params = list(model.parameters())
     opt = torch.optim.Adam(params, lr=cfg.lr)
 
-    if cfg.frontend_lr_scale > 0:
-        fe = list(frontend.model.parameters())
-        opt.add_param_group({"params": fe, "lr": cfg.lr * cfg.frontend_lr_scale})
-
     best = {"score": -float("inf"), "epoch": -1, "state": None}
+    gsnn_only = cfg.gsnn_alpha == 0.0
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -111,37 +85,25 @@ def train(
         totals, steps = np.zeros(3), 0
         gnorm = 0.0
         for raw in loader:
-            with torch.set_grad_enabled(cfg.frontend_lr_scale > 0):
+            with torch.no_grad():
                 h = frontend.forward_features(raw["input"])
 
             mask = raw["mask"].to(device, non_blocking=True)
             cls = raw["cls"].to(device, non_blocking=True)
-            out = model(h, mask, cls=cls, gsnn_only=cfg.gsnn_alpha == 0.0)
+            out = model(h, mask, cls=cls, gsnn_only=gsnn_only)
 
             # per-frame normalisation and beta-annealed loss; reported elbo is beta=1.
             # clamp: a backstop item (fully-masked window) must cost 0, not produce nan.
             frames = mask.sum(1).clamp(min=1.0)
             cvae = out["recon"] - beta * out["kl"]
             loss = -(
-                (cfg.gsnn_alpha * cvae + (1.0 - cfg.gsnn_alpha) * out["recon_prior"]) / frames
+                (cfg.gsnn_alpha * cvae + (1.0 - cfg.gsnn_alpha) * out["prior_recon"]) / frames
             ).mean()
 
             opt.zero_grad()
             loss.backward()
 
-            # clip_per_group: per-TENSOR clip budgets (pooled norm ran 93-1330 vs clip 5.0
-            # all run long; downbeat_source: search-read-out-verdict). |g| logged = pooled norm
-            # when off, LARGEST single-tensor norm when on.
-            if cfg.clip_per_group:
-                gnorm += max(
-                    float(torch.nn.utils.clip_grad_norm_([p], cfg.clip))
-                    for p in params
-                    if p.grad is not None
-                )
-            else:
-                gnorm += float(torch.nn.utils.clip_grad_norm_(params, cfg.clip))
-            if cfg.frontend_lr_scale > 0:
-                torch.nn.utils.clip_grad_norm_(fe, cfg.clip)
+            gnorm += float(torch.nn.utils.clip_grad_norm_(params, cfg.clip))
 
             opt.step()
 
@@ -168,11 +130,9 @@ def train(
                 flush=True,
             )
 
-        gain = getattr(model.emission_model, "b", None)
-        b_note = "" if gain is None else f"  b {float(gain):5.2f}"
         print(
             f"  epoch {epoch:2d}  beta {beta:5.3f}  elbo {totals[0] / steps:9.2f}  "
-            f"recon {totals[1] / steps:8.2f}  kl {totals[2] / steps:9.2f}{b_note}  "
+            f"recon {totals[1] / steps:8.2f}  kl {totals[2] / steps:9.2f}  "
             f"|g| {gnorm / steps:8.2f}",
             flush=True,
         )
@@ -182,10 +142,6 @@ def train(
             torch.save(
                 {
                     "model": model.state_dict(),
-                    "posterior_parameterization": model.posterior_parameterization,
-                    "frontend": (
-                        frontend.model.state_dict() if cfg.frontend_lr_scale > 0 else None
-                    ),
                     "config": vars(cfg),
                     "seed": seed,
                     "epoch": epoch,
@@ -222,7 +178,6 @@ def parse_args():
     p.add_argument(
         "--seed", type=int, default=0, help="one run = one seed; sweep seeds with an outer script"
     )
-    p.add_argument("--limit-per-fold", type=int, default=None)
     p.add_argument(
         "--select",
         default="none",
@@ -236,8 +191,7 @@ def parse_args():
     p.add_argument(
         "--init-from",
         default=None,
-        help="warm-start model and frontend weights from a checkpoint; "
-        "parameters absent from it keep their fresh initialisation",
+        help="import staged generator weights from a checkpoint",
     )
     p.add_argument("--save-dir", default=None, help="save the model to <save-dir>/seed<k>.pt")
     return p.parse_args()
@@ -263,18 +217,20 @@ def main() -> None:
         data.val_dataset,
         data.test_dataset,
     )
-    if args.limit_per_fold is not None:
-        for source in (train_source, val_source, test_source):
-            kept, counts = [], {}
-            for item in source.items:
-                dataset = item["spect_path"].parts[0]
-                counts[dataset] = counts.get(dataset, 0)
-                if counts[dataset] < args.limit_per_fold:
-                    kept.append(item)
-                    counts[dataset] += 1
-            source.items = kept
+    for source in (train_source, val_source, test_source):
+        original_count = len(source.items)
+        kept = []
+        for song in source.items:
+            values = np.asarray(song["beat_value"])
+            downbeats = np.flatnonzero(values == 1)
+            if len(downbeats) >= 2 and np.all(np.diff(downbeats) == 4) and np.max(values) == 4:
+                kept.append(song)
+        source.items = kept
+        print(f"Fixed 4/4 cohort: {len(kept)}/{original_count} recordings", flush=True)
+    if not len(train_source.items):
+        raise ValueError("No fixed 4/4 training recordings remain")
 
-    train_set = ExcerptDataset(train_source, frontend, cfg.excerpt_seconds)
+    train_set = ExcerptDataset(train_source, frontend, cfg.excerpt_seconds, full_length=True)
     val_set = ExcerptDataset(val_source, frontend, cfg.excerpt_seconds, centered=True)
     test_set = ExcerptDataset(test_source, frontend, cfg.excerpt_seconds, centered=True)
 
@@ -306,8 +262,6 @@ def main() -> None:
         torch.save(
             {
                 "model": model.state_dict(),
-                "posterior_parameterization": model.posterior_parameterization,
-                "frontend": (frontend.model.state_dict() if cfg.frontend_lr_scale > 0 else None),
                 "config": vars(cfg),
                 "seed": args.seed,
                 "config_path": args.config,
@@ -326,7 +280,7 @@ def main() -> None:
     print(
         f"\nfps={frontend.output_fps}  excerpt={cfg.excerpt_seconds}s (fresh window per epoch)  "
         f"frontend={cfg.frontend}/{cfg.frontend_checkpoint}  "
-        f"no meter, no beat grid, no offset"
+        f"generator=audio phase/tempo, meters={cfg.meters}"
     )
 
 

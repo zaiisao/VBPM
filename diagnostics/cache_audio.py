@@ -11,7 +11,6 @@ import torch
 from vbpm.data.dataset import load_beat_this
 from vbpm.data.excerpts import ExcerptDataset, collate_excerpts
 from vbpm.frontends import build_frontend
-from vbpm.model import VBPM
 from vbpm.util.oracle import bar_meters, beat_positions, oracle_draw
 
 
@@ -128,16 +127,16 @@ def main():
                     full_masks.append(context_mask.cpu())
     h = torch.stack(features)
     draw = {k: torch.cat([d[k] for d in draws]) for k in draws[0]}
-    replay = VBPM(8)
-    with torch.no_grad():
-        path = replay.draws_to_paths(draw, collated["mask"])
+    phase = torch.cat(
+        (draw["phase0"][:, None], draw["phase0"][:, None] + draw["velocity"][:, :-1].cumsum(1)), 1
+    )
     result = dict(
         h=h,
         labels=collated["cls"],
         mask=collated["mask"],
-        phi=path["phi_path"],
-        velocity=path["velocity_path"],
-        meter=path["meter_path"],
+        phi=phase,
+        velocity=draw["velocity"],
+        meter=draw["meter"],
         songs=ids,
         start_frames=starts,
         beat_times=[torch.as_tensor(r["beat_times"] - r["t0"], dtype=torch.float64) for r in raws],

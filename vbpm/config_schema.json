@@ -1,15 +1,4 @@
 {
-  "emission_layers": {
-    "type": "integer",
-    "default": 2,
-    "minimum": 1,
-    "description": "transformer emission only: number of attention layers. Ignored by the closed-form emissions."
-  },
-  "emission_positional": {
-    "type": "boolean",
-    "default": false,
-    "description": "transformer emission only: add positional encoding, letting the emission read FRAME INDEX as well as phase."
-  },
   "epochs": {
     "type": "integer",
     "default": 12,
@@ -36,7 +25,7 @@
   },
   "gsnn_alpha": {
     "type": "number",
-    "default": 0.7,
+    "default": 0.0,
     "minimum": 0.0,
     "description": "Weight of the CVAE objective: zero trains only the sampled prior and learned decoder."
   },
@@ -62,12 +51,6 @@
     "minimum": 1.0,
     "description": "window length. Below ~45 s the ELBO cannot separate tracking the truth from coasting on a constant period (crop-horizon root cause)."
   },
-  "prior_phase_kappa": {
-    "type": "number",
-    "default": 383.0,
-    "minimum": 0.0,
-    "description": "concentration of the physical prior's increment law: the DRIFT TAX. Real tempo wobble is heavy-tailed, so lowering this cuts the KL price of expressing drift."
-  },
   "frontend": {
     "type": "string",
     "default": "beat_this",
@@ -78,74 +61,17 @@
     "default": "",
     "description": "checkpoint path or frontend-specific checkpoint name; empty uses the frontend's own default. One checkpoint serves train/validation/test. MusicFM expects pretrained_msd.pt with msd_stats.json beside it."
   },
-  "frontend_lr_scale": {
-    "type": "number",
-    "default": 0.0,
-    "minimum": 0.0,
-    "description": "multiplier on lr for the frontend's own parameters. 0 = frozen (the frontend runs under no_grad and only the VAE trains); > 0 thaws it and adds it as a second optimizer group at lr * this. RECONSTRUCTED 2026-08-11 after an accidental git checkout discarded the uncommitted original -- the semantics come from run.py's usage, the wording is not the author's."
-  },
-  "clip_per_group": {
-    "type": "boolean",
-    "default": false,
-    "description": "clip each parameter tensor against cfg.clip separately instead of one pooled norm (which one tensor dominated, throttling all others). Changes the log's |g|: pooled norm when false, largest single-tensor norm when true."
-  },
   "meters": {
     "type": "array",
     "default": [
-      2,
-      3,
-      4,
-      5,
-      6,
-      7,
-      8
+      4
     ],
-    "description": "beats-per-bar values the chain enumerates; at least one is required. Meter joins rate in the state and may change only at a wrapping phase transition."
+    "description": "Fixed meter four supported by the audio generator."
   },
-  "prior_dim": {
+  "generator_samples": {
     "type": "integer",
-    "default": 128,
-    "description": "Audio-only prior encoder width (multiple of four).",
-    "minimum": 4
-  },
-  "prior_layers": {
-    "type": "integer",
-    "default": 2,
-    "description": "Audio-only prior encoder depth.",
-    "minimum": 1
-  },
-  "prior_phase0_kappa": {
-    "type": "number",
-    "default": 40.0,
-    "description": "Initial learned phase concentration.",
-    "minimum": 1.001
-  },
-  "prior_velocity_sigma": {
-    "type": "number",
-    "default": 0.05,
-    "description": "Initial Gaussian velocity uncertainty.",
-    "minimum": 1e-06
-  },
-  "log_velocity": {
-    "type": "boolean",
-    "default": false,
-    "description": "Use a positive physical velocity via velocity_ref * exp(latent)."
-  },
-  "velocity_ref": {
-    "type": "number",
-    "default": 0.06283185307179587,
-    "description": "Reference radians per frame for log velocity; 120 BPM in 4/4 at 50 Hz.",
-    "minimum": 1e-06
-  },
-  "velocity_step": {
-    "type": "number",
-    "default": 0.010465180361560902,
-    "description": "Per-frame scale of log-velocity innovations.",
-    "minimum": 1e-06
-  },
-  "meter_gated": {
-    "type": "boolean",
-    "default": false,
-    "description": "Allow learned meter transitions only when the bar pointer crosses a downbeat."
+    "default": 4,
+    "minimum": 1,
+    "description": "Monte Carlo latent draws per reconstruction branch."
   }
 }

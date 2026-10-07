@@ -1,20 +1,10 @@
-# Mixed VBPM: 70% CVAE (reconstruction minus KL), 30% prior-sampled GSNN.
-# Uses the corrected generator; gsnn.yaml retains the alpha=0 diagnostic.
-# Velocity units assume 50 frontend frames per second.
-excerpt_seconds: 45.0
+# Fresh transition-prior baseline: GSNN only, fixed meter four.
+excerpt_seconds: 30.0
 batch_size: 4
 epochs: 24
 lr: 3.0e-4
-gsnn_alpha: 0.7
+gsnn_alpha: 0.0
 beta_warmup: 0
-log_velocity: true
-velocity_ref: 0.06283185307179587
-velocity_step: 0.010465180361560902
-prior_dim: 128
-prior_layers: 2
-prior_phase0_kappa: 40.0
-prior_velocity_sigma: 0.05
-prior_phase_kappa: 383.0
-frontend_lr_scale: 0.0
-meters: [3, 4]
-meter_gated: true
+meters: [4]
+
+generator_samples: 4
