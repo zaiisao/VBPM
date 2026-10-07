@@ -14,6 +14,7 @@ the CVAE/GSNN hybrid objective). It overfits one batch, which certifies the grad
     python vae_dbn.py            # single-batch overfit sanity check
 """
 import math
+import os
 import torch, torch.nn as nn, torch.nn.functional as F
 
 PI = math.pi
@@ -176,11 +177,11 @@ class VAEDBN(nn.Module):
         """Roll the chain. use_post=True -> CVAE branch (z~posterior, accumulate KL).
            use_post=False -> GSNN branch (z~prior, emission only).
            If diag is a dict, fill it with per-factor KLs and posterior-parameter stats
-           (kappa_q, meter entropy) for debugging."""
+           (kappa_q, kappa_p, prior-posterior phase mismatch, meter entropy) for debugging."""
         B, T = x.size(0), x.size(1)
         emis = x.new_zeros(B); kl = x.new_zeros(B)
         klph = x.new_zeros(B); klme = x.new_zeros(B)
-        kap_q_acc, ent_acc = [], []
+        kap_q_acc, ent_acc, kap_p_acc, mis_acc, klp_acc = [], [], [], [], []
         phi_p = x.new_zeros(B)
         m_p = x.new_full((B, self.R), 1.0/self.R)
         for k in range(T):
@@ -209,7 +210,8 @@ class VAEDBN(nn.Module):
                     if diag is not None:
                         rho = F.softmax(mlog_q, -1); ent_acc.append((-(rho*torch.log(rho+1e-9)).sum(-1)).detach())
                 if diag is not None:
-                    kap_q_acc.append(kap_q.detach())
+                    kap_q_acc.append(kap_q.detach()); kap_p_acc.append(kap_p.detach()); klp_acc.append(klp.detach())
+                    mis_acc.append((torch.remainder(mu_pha_q - mu_pha_p + PI, 2*PI) - PI).abs().detach())
             else:
                 phi = vm_sample(mu_pha_p, kap_p, torch.rand(B, device=x.device))
                 if k == 0:
@@ -222,7 +224,8 @@ class VAEDBN(nn.Module):
         kl = klph + klme
         if diag is not None and use_post:
             diag.update(kl_phase=klph.mean(), kl_meter=klme.mean(),
-                        kappa_q=torch.stack(kap_q_acc), meter_entropy=torch.stack(ent_acc))
+                        kappa_q=torch.stack(kap_q_acc), meter_entropy=torch.stack(ent_acc),
+                        kappa_p=torch.stack(kap_p_acc), phase_mismatch=torch.stack(mis_acc), kl_phase_frame=torch.stack(klp_acc))
         return emis, kl
 
 
@@ -291,7 +294,7 @@ def synth(B=16, T=32, R=3, kappa_true=20.0, Delta=1.0, seed=0, return_latents=Fa
 # Training with full debug logging (single-batch overfit sanity check)
 # ======================================================================
 def train(x, b, steps=200, lr=3e-3, alpha=0.7, beta=1.0, tau=0.5, lr_=None,
-          log_name="vae_dbn_run", log_every=5):
+          log_name="vae_dbn_run", log_every=5, ckpt_every=50):
     """Overfit one batch while logging a wide set of health metrics to <log_name>.csv/.log.
     Logged each step: losses (total / -logp_q / per-factor KL / GSNN), gradient norms per
     submodule (catches a dead von Mises path or a detached sample), posterior-parameter
@@ -324,8 +327,14 @@ def train(x, b, steps=200, lr=3e-3, alpha=0.7, beta=1.0, tau=0.5, lr_=None,
             m.update(gn)
             m.update(tensor_stats("kappa_q", diag["kappa_q"]))
             m.update(tensor_stats("meter_entropy", diag["meter_entropy"]))
+            m.update(tensor_stats("kappa_p", diag["kappa_p"]))
+            m.update(tensor_stats("phase_mismatch", diag["phase_mismatch"]))
+            m.update(tensor_stats("kl_phase_frame", diag["kl_phase_frame"]))
             warns = finite_check(loss=loss, kl=kl, kappa_q=diag["kappa_q"]) + health.check(m)
             log.log(t, m, warns)
+        if t % ckpt_every == 0:
+            os.makedirs("ckpt", exist_ok=True)
+            torch.save({"state": model.state_dict()}, f"ckpt/step_{t:04d}.pt")
     csvp, logp = log.close()
     torch.save({"state": model.state_dict()}, "vae_dbn.pt")
     print(f"[done] wrote {csvp}, {logp}, and vae_dbn.pt")
