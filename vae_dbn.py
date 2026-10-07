@@ -241,7 +241,7 @@ def hybrid_loss(model, x, b, alpha=0.7, beta=1.0, tau=0.5, diag=None):
 # ======================================================================
 # Synthetic data: a phase advancing at a per-sequence velocity; labels at phase landmarks
 # ======================================================================
-def synth(B=16, T=32, R=3, kappa_true=20.0, Delta=1.0, seed=0):
+def synth(B=16, T=32, R=3, kappa_true=20.0, Delta=1.0, seed=0, return_latents=False):
     """Ancestral sample FROM the model's own generative process, so the data actually
     exercises the stochastic factors:
       * meter   m ~ Categorical over R classes (sets beats-per-bar) -- a real categorical latent;
@@ -281,6 +281,8 @@ def synth(B=16, T=32, R=3, kappa_true=20.0, Delta=1.0, seed=0):
                      torch.sin(phw) + 0.1*torch.randn(B, T),
                      mcue + 0.1*torch.randn(B, T),
                      0.1*torch.randn(B, T)], -1)
+    if return_latents:
+        return x, b, (phi, v, m)
     return x, b
 
 
