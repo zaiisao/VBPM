@@ -152,10 +152,10 @@ class LandmarkEmission(nn.Module):
 
 
 class VAEDBN(nn.Module):
-    def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0, sigma_backward=0.05, sigma_advance=0.22):
+    def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0, sigma_advance=0.22):
         super().__init__()
         self.R, self.Delta, self.kmin = n_meter, Delta, kmin
-        self.sigma_backward, self.sigma_advance = sigma_backward, sigma_advance
+        self.sigma_advance = sigma_advance
         prevdim = 2 + n_meter                         # [cos phi, sin phi, onehot(m)]
         # generative backbone over x (bidirectional over the covariate is allowed)
         self.backbone = nn.GRU(x_dim, hid, batch_first=True, bidirectional=True)
@@ -191,12 +191,9 @@ class VAEDBN(nn.Module):
         e = torch.cat([self.b_emb(b), x], -1); c,_ = self.encoder(e); return torch.tanh(self.hc(c))
 
     def log_physics(self, phi, phi_p, omega):
-        """Log-likelihood of the virtual observations r = 0 for a forward phase advance of about omega per frame."""
-        advance = torch.remainder(phi - phi_p + PI, 2*PI) - PI
-        zero = torch.zeros_like(advance)
-        backward = torch.distributions.Normal(F.relu(-advance), self.sigma_backward).log_prob(zero)
-        deviation = torch.distributions.Normal(torch.remainder(advance - omega*self.Delta + PI, 2*PI) - PI, self.sigma_advance).log_prob(zero)
-        return backward + deviation
+        """Log-likelihood of the virtual observation r = 0 for a phase advance of about omega per frame."""
+        deviation = torch.remainder(phi - phi_p - omega*self.Delta + PI, 2*PI) - PI
+        return torch.distributions.Normal(deviation, self.sigma_advance).log_prob(torch.zeros_like(deviation))
 
     def phase_params(self, raw):
         mu = torch.atan2(raw[:,1], raw[:,0]); kappa = F.softplus(raw[:,2]) + self.kmin
