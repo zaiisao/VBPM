@@ -2,7 +2,7 @@
 VAE-DBN: a structured (sequential) conditional VAE with a Markov latent chain.
 
 Latent per frame k:  z_k = (phi_k, m_k)
-    phi_k in S^1  : bar phase         -> von Mises        (implicit reparam), advancing by omega(h_k)
+    phi_k in S^1  : bar phase         -> von Mises        (implicit reparam), advancing by omega(h_k) + delta(h_k, phi_{k-1})
     m_k   in {0..R-1} : meter class   -> Categorical      (Gumbel-softmax)
 Covariate x (audio features) conditions every factor and is never inferred.
 Observation b_{1:T} (beat labels) is the data; only the encoder sees it.
@@ -149,6 +149,7 @@ class VAEDBN(nn.Module):
         self.pri = nn.Sequential(nn.Linear(hid + prevdim, hid), nn.ReLU())
         self.pri_kappa = nn.Linear(hid, 1)            # phase concentration (T-b)
         self.pri_phase0 = nn.Linear(hid, 3)
+        self.pri_delta = nn.Linear(hid, 1)
         self.pri_omega = nn.Linear(hid, 1)
         self.pri_meter = nn.Linear(hid, n_meter)
         # emission p(b_k | z_k)
@@ -189,7 +190,7 @@ class VAEDBN(nn.Module):
             if k == 0:
                 mu_pha_p, kap_p = self.phase_params(self.pri_phase0(hp))
             else:
-                mu_pha_p = torch.remainder(phi_p + self.omega(hp)*self.Delta, 2*PI)
+                mu_pha_p = torch.remainder(phi_p + self.omega(hp)*self.Delta + self.pri_delta(hp).squeeze(-1), 2*PI)
                 kap_p = F.softplus(self.pri_kappa(hp)).squeeze(-1) + self.kmin
             mlog_p = self.pri_meter(hp)
             # ---- choose source of z: posterior or prior ----
@@ -300,7 +301,7 @@ def train(x, b, steps=200, lr=3e-3, alpha=0.7, beta=1.0, tau=0.5, lr_=None,
               list(model.post.parameters()) + list(model.post_phase.parameters())
               + list(model.post_meter.parameters()),
               "prior_heads": list(model.pri.parameters()) + list(model.pri_kappa.parameters())
-              + list(model.pri_phase0.parameters()) + list(model.pri_omega.parameters()) + list(model.pri_meter.parameters()),
+              + list(model.pri_phase0.parameters()) + list(model.pri_omega.parameters()) + list(model.pri_delta.parameters()) + list(model.pri_meter.parameters()),
               "emit": model.emit, "total": model}
     print("device:", DEV, "| x", tuple(x.shape), "b", tuple(b.shape), "| logging ->", f"{log_name}.csv/.log")
     for t in range(1, steps + 1):
@@ -375,7 +376,7 @@ def predict_labels(model, x, N=64):
             if k == 0:
                 mu_p, kap_p = model.phase_params(model.pri_phase0(hp))
             else:
-                mu_p = torch.remainder(phi_p + model.omega(hp)*model.Delta, 2*PI)
+                mu_p = torch.remainder(phi_p + model.omega(hp)*model.Delta + model.pri_delta(hp).squeeze(-1), 2*PI)
                 kap_p = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
             phi = vm_sample(mu_p, kap_p, torch.rand(B, device=x.device))
             m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
