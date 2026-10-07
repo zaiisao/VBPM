@@ -1,9 +1,8 @@
 """
 VAE-DBN: a structured (sequential) conditional VAE with a Markov latent chain.
 
-Latent per frame k:  z_k = (phi_k, v_k, m_k)
-    phi_k in S^1  : bar phase         -> von Mises        (implicit reparam)
-    v_k   in R    : phase velocity    -> Gaussian         (location-scale)
+Latent per frame k:  z_k = (phi_k, m_k)
+    phi_k in S^1  : bar phase         -> von Mises        (implicit reparam), advancing by omega(h_k)
     m_k   in {0..R-1} : meter class   -> Categorical      (Gumbel-softmax)
 Covariate x (audio features) conditions every factor and is never inferred.
 Observation b_{1:T} (beat labels) is the data; only the encoder sees it.
@@ -134,7 +133,7 @@ class VAEDBN(nn.Module):
     def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0):
         super().__init__()
         self.R, self.Delta, self.kmin = n_meter, Delta, kmin
-        prevdim = 2 + 1 + n_meter                     # [cos phi, sin phi, v, onehot(m)]
+        prevdim = 2 + n_meter                         # [cos phi, sin phi, onehot(m)]
         # generative backbone over x (bidirectional over the covariate is allowed)
         self.backbone = nn.GRU(x_dim, hid, batch_first=True, bidirectional=True)
         self.hb = nn.Linear(2*hid, hid)
@@ -145,19 +144,22 @@ class VAEDBN(nn.Module):
         # posterior heads: from context c_k and previous latent
         self.post = nn.Sequential(nn.Linear(ctx + prevdim, hid), nn.ReLU())
         self.post_phase = nn.Linear(hid, 3)           # (a1,a2,u)
-        self.post_vel   = nn.Linear(hid, 2)           # (mu, log-std)
         self.post_meter = nn.Linear(hid, n_meter)
         # prior heads: from backbone h_k and previous latent
         self.pri = nn.Sequential(nn.Linear(hid + prevdim, hid), nn.ReLU())
         self.pri_kappa = nn.Linear(hid, 1)            # phase concentration (T-b)
-        self.pri_vel   = nn.Linear(hid, 2)
+        self.pri_omega = nn.Linear(hid, 1)
         self.pri_meter = nn.Linear(hid, n_meter)
         # emission p(b_k | z_k)
-        self.emit = nn.Sequential(nn.Linear(2 + 1 + n_meter, hid), nn.ReLU(),
+        self.emit = nn.Sequential(nn.Linear(2 + n_meter, hid), nn.ReLU(),
                                   nn.Linear(hid, 3))
 
-    def feats(self, phi, v, m_oh):
-        return torch.cat([torch.cos(phi)[:,None], torch.sin(phi)[:,None], v[:,None], m_oh], -1)
+    def feats(self, phi, m_oh):
+        return torch.cat([torch.cos(phi)[:,None], torch.sin(phi)[:,None], m_oh], -1)
+
+    def omega(self, hp):
+        """Phase advance per frame as a deterministic function of the audio."""
+        return F.softplus(self.pri_omega(hp)).squeeze(-1)
 
     def backbone_feats(self, x):
         h,_ = self.backbone(x); return torch.tanh(self.hb(h))     # [B,T,hid]
@@ -172,56 +174,50 @@ class VAEDBN(nn.Module):
         """Roll the chain. use_post=True -> CVAE branch (z~posterior, accumulate KL).
            use_post=False -> GSNN branch (z~prior, emission only).
            If diag is a dict, fill it with per-factor KLs and posterior-parameter stats
-           (kappa_q, velocity sigma, meter entropy) for debugging."""
+           (kappa_q, meter entropy) for debugging."""
         B, T = x.size(0), x.size(1)
         emis = x.new_zeros(B); kl = x.new_zeros(B)
-        klph = x.new_zeros(B); klve = x.new_zeros(B); klme = x.new_zeros(B)
-        kap_q_acc, sig_q_acc, ent_acc = [], [], []
-        phi_p = x.new_zeros(B); v_p = x.new_zeros(B)
+        klph = x.new_zeros(B); klme = x.new_zeros(B)
+        kap_q_acc, ent_acc = [], []
+        phi_p = x.new_zeros(B)
         m_p = x.new_full((B, self.R), 1.0/self.R)
         for k in range(T):
-            prev = self.feats(phi_p, v_p, m_p)
+            prev = self.feats(phi_p, m_p)
             # ---- prior factors (condition on previous latent) ----
             hp = self.pri(torch.cat([h[:,k], prev], -1))
             if k == 0:
                 mu_pha_p, kap_p = torch.zeros(B, device=x.device), torch.zeros(B, device=x.device)   # uniform
             else:
-                mu_pha_p = torch.remainder(phi_p + v_p*self.Delta, 2*PI)
+                mu_pha_p = torch.remainder(phi_p + self.omega(hp)*self.Delta, 2*PI)
                 kap_p = F.softplus(self.pri_kappa(hp)).squeeze(-1) + self.kmin
-            muv_p, logsv_p = self.pri_vel(hp)[:,0], self.pri_vel(hp)[:,1]
             mlog_p = self.pri_meter(hp)
             # ---- choose source of z: posterior or prior ----
             if use_post:
                 hq = self.post(torch.cat([c[:,k], prev], -1))
                 mu_pha_q, kap_q = self.phase_params(self.post_phase(hq))
-                muv_q, logsv_q = self.post_vel(hq)[:,0], self.post_vel(hq)[:,1]
                 mlog_q = self.post_meter(hq)
                 phi = vm_sample(mu_pha_q, kap_q, torch.rand(B, device=x.device))
-                v   = muv_q + torch.exp(logsv_q) * torch.randn(B, device=x.device)
                 m   = F.gumbel_softmax(mlog_q, tau=tau, hard=False)
                 # per-frame KL (closed form), split per factor for diagnostics
                 klp = kl_vm_uniform(mu_pha_q, kap_q) if k == 0 else kl_vm(mu_pha_q, kap_q, mu_pha_p, kap_p)
                 klph = klph + klp
-                klve = klve + kl_gauss(muv_q, logsv_q, muv_p, logsv_p)
                 klme = klme + kl_cat(mlog_q, mlog_p)
                 if diag is not None:
-                    kap_q_acc.append(kap_q.detach()); sig_q_acc.append(torch.exp(logsv_q).detach())
+                    kap_q_acc.append(kap_q.detach())
                     rho = F.softmax(mlog_q, -1); ent_acc.append((-(rho*torch.log(rho+1e-9)).sum(-1)).detach())
             else:
                 phi = vm_sample(mu_pha_p, kap_p.clamp(min=self.kmin), torch.rand(B, device=x.device)) \
                       if k > 0 else torch.rand(B, device=x.device) * 2*PI - PI
-                v   = muv_p + torch.exp(logsv_p) * torch.randn(B, device=x.device)
                 m   = F.gumbel_softmax(mlog_p, tau=tau, hard=False)
             # ---- emission (frames 1..T-1 carry a label here; frame 0 included for simplicity) ----
-            logit = self.emit(self.feats(phi, v, m))
+            logit = self.emit(self.feats(phi, m))
             if b is not None:
                 emis = emis + F.cross_entropy(logit, b[:,k], reduction="none") * (-1.0)  # +log p
-            phi_p, v_p, m_p = phi, v, m                      # advance chain (sampled previous state)
-        kl = klph + klve + klme
+            phi_p, m_p = phi, m                              # advance chain (sampled previous state)
+        kl = klph + klme
         if diag is not None and use_post:
-            diag.update(kl_phase=klph.mean(), kl_vel=klve.mean(), kl_meter=klme.mean(),
-                        kappa_q=torch.stack(kap_q_acc), sigma_q=torch.stack(sig_q_acc),
-                        meter_entropy=torch.stack(ent_acc))
+            diag.update(kl_phase=klph.mean(), kl_meter=klme.mean(),
+                        kappa_q=torch.stack(kap_q_acc), meter_entropy=torch.stack(ent_acc))
         return emis, kl
 
 
@@ -294,17 +290,17 @@ def train(x, b, steps=200, lr=3e-3, alpha=0.7, beta=1.0, tau=0.5, lr_=None,
     """Overfit one batch while logging a wide set of health metrics to <log_name>.csv/.log.
     Logged each step: losses (total / -logp_q / per-factor KL / GSNN), gradient norms per
     submodule (catches a dead von Mises path or a detached sample), posterior-parameter
-    stats (kappa_q, sigma_q, meter entropy), update/param ratio, and NaN/Inf + health warnings."""
+    stats (kappa_q, meter entropy), update/param ratio, and NaN/Inf + health warnings."""
     from train_logger import TrainLogger, HealthMonitor, grad_norms, tensor_stats, finite_check, update_param_ratio
     model = VAEDBN().to(DEV)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     log = TrainLogger(log_name)
-    health = HealthMonitor(loss_key="loss", kl_key="kl", kappa_key="kappa_q/mean", sigma_key="sigma_q/mean")
+    health = HealthMonitor(loss_key="loss", kl_key="kl", kappa_key="kappa_q/mean")
     groups = {"backbone": model.backbone, "encoder": model.encoder, "post_heads":
               list(model.post.parameters()) + list(model.post_phase.parameters())
-              + list(model.post_vel.parameters()) + list(model.post_meter.parameters()),
+              + list(model.post_meter.parameters()),
               "prior_heads": list(model.pri.parameters()) + list(model.pri_kappa.parameters())
-              + list(model.pri_vel.parameters()) + list(model.pri_meter.parameters()),
+              + list(model.pri_omega.parameters()) + list(model.pri_meter.parameters()),
               "emit": model.emit, "total": model}
     print("device:", DEV, "| x", tuple(x.shape), "b", tuple(b.shape), "| logging ->", f"{log_name}.csv/.log")
     for t in range(1, steps + 1):
@@ -317,13 +313,11 @@ def train(x, b, steps=200, lr=3e-3, alpha=0.7, beta=1.0, tau=0.5, lr_=None,
             m = {"loss": round(loss.item(), 4), "recon": round(rec_q.item(), 4),
                  "kl": round(kl.item(), 4), "gsnn_recon": round(rec_p.item(), 4),
                  "kl_phase": round(float(diag["kl_phase"]), 4),
-                 "kl_vel": round(float(diag["kl_vel"]), 4),
                  "kl_meter": round(float(diag["kl_meter"]), 4),
                  "upd/param": update_param_ratio(model, lr),
                  "alpha": alpha, "beta": beta, "tau": round(tau, 3)}
             m.update(gn)
             m.update(tensor_stats("kappa_q", diag["kappa_q"]))
-            m.update(tensor_stats("sigma_q", diag["sigma_q"]))
             m.update(tensor_stats("meter_entropy", diag["meter_entropy"]))
             warns = finite_check(loss=loss, kl=kl, kappa_q=diag["kappa_q"]) + health.check(m)
             log.log(t, m, warns)
@@ -345,27 +339,25 @@ def load_model(ckpt="vae_dbn.pt"):
 def encode_path(model, x, b, sample=False):
     """POSTERIOR INFERENCE: given (x,b), the encoder produces the posterior q(z_k|.) per frame.
     The real inference output is that DISTRIBUTION's parameters per frame -- returned as `params`
-    (mu_phi, kappa, vbar, s, rho) -- plus a latent `path` taken as the posterior MODE (or a
+    (mu_phi, kappa, rho) -- plus a latent `path` taken as the posterior MODE (or a
     reparameterised sample if sample=True). z comes from the ENCODER, not the prior."""
     h = model.backbone_feats(x); c = model.context(b, x)
     B, T = x.size(0), x.size(1)
-    phi_p = x.new_zeros(B); v_p = x.new_zeros(B); m_p = x.new_full((B, model.R), 1.0/model.R)
+    phi_p = x.new_zeros(B); m_p = x.new_full((B, model.R), 1.0/model.R)
     path, params = [], []
     for k in range(T):
-        prev = model.feats(phi_p, v_p, m_p)
+        prev = model.feats(phi_p, m_p)
         hq = model.post(torch.cat([c[:, k], prev], -1))
         mu_q, kap_q = model.phase_params(model.post_phase(hq))
-        vb_q, logs_q = model.post_vel(hq)[:, 0], model.post_vel(hq)[:, 1]
         rho_q = F.softmax(model.post_meter(hq), -1)
-        params.append(dict(mu_phi=mu_q, kappa=kap_q, vbar=vb_q, s=torch.exp(logs_q), rho=rho_q))
+        params.append(dict(mu_phi=mu_q, kappa=kap_q, rho=rho_q))
         if sample:
             phi = vm_sample(mu_q, kap_q, torch.rand(B, device=x.device))
-            v   = vb_q + torch.exp(logs_q) * torch.randn(B, device=x.device)
             m   = torch.multinomial(rho_q, 1).squeeze(-1)
         else:                                          # posterior mode
-            phi, v, m = mu_q, vb_q, rho_q.argmax(-1)
+            phi, m = mu_q, rho_q.argmax(-1)
         m_oh = F.one_hot(m, model.R).float()
-        path.append((phi, v, m)); phi_p, v_p, m_p = phi, v, m_oh
+        path.append((phi, m)); phi_p, m_p = phi, m_oh
     return path, params
 
 @torch.no_grad()
@@ -376,22 +368,20 @@ def predict_labels(model, x, N=64):
     h = model.backbone_feats(x); B, T = x.size(0), x.size(1)
     prob = x.new_zeros(B, T, 3)
     for _ in range(N):
-        phi_p = x.new_zeros(B); v_p = x.new_zeros(B); m_p = x.new_full((B, model.R), 1.0/model.R)
+        phi_p = x.new_zeros(B); m_p = x.new_full((B, model.R), 1.0/model.R)
         for k in range(T):
-            prev = model.feats(phi_p, v_p, m_p)
+            prev = model.feats(phi_p, m_p)
             hp = model.pri(torch.cat([h[:, k], prev], -1))
             if k == 0:
                 phi = torch.rand(B, device=x.device) * 2*PI - PI          # uniform initial phase
             else:
-                mu_p = torch.remainder(phi_p + v_p*model.Delta, 2*PI)
+                mu_p = torch.remainder(phi_p + model.omega(hp)*model.Delta, 2*PI)
                 kap_p = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
                 phi = vm_sample(mu_p, kap_p, torch.rand(B, device=x.device))
-            vb_p, logs_p = model.pri_vel(hp)[:, 0], model.pri_vel(hp)[:, 1]
-            v = vb_p + torch.exp(logs_p) * torch.randn(B, device=x.device)
             m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
             m_oh = F.one_hot(m, model.R).float()
-            prob[:, k] += F.softmax(model.emit(model.feats(phi, v, m_oh)), -1)
-            phi_p, v_p, m_p = phi, v, m_oh
+            prob[:, k] += F.softmax(model.emit(model.feats(phi, m_oh)), -1)
+            phi_p, m_p = phi, m_oh
     prob /= N
     return prob.argmax(-1), prob                          # b_hat [B,T], p_label [B,T,3]
 

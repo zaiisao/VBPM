@@ -17,29 +17,28 @@ def wrap(a):
 
 @torch.no_grad()
 def prior_paths(model, x, n):
-    """Sample n latent paths from the prior chain p_psi(z | x), as predict_labels does."""
+    """Sample n prior paths p_psi(z | x) as predict_labels does; v is the deterministic advance omega."""
     h = model.backbone_feats(x)
     B, T = x.shape[:2]
     phis, vs, ms = [], [], []
     for _ in range(n):
-        phi_p, v_p = x.new_zeros(B), x.new_zeros(B)
+        phi_p = x.new_zeros(B)
         m_p = x.new_full((B, model.R), 1.0 / model.R)
         pp, pv, pm = [], [], []
         for k in range(T):
-            hp = model.pri(torch.cat([h[:, k], model.feats(phi_p, v_p, m_p)], -1))
+            hp = model.pri(torch.cat([h[:, k], model.feats(phi_p, m_p)], -1))
+            v = model.omega(hp)
             if k == 0:
                 phi = torch.rand(B, device=x.device) * 2 * math.pi - math.pi
             else:
-                mu = torch.remainder(phi_p + v_p * model.Delta, 2 * math.pi)
+                mu = torch.remainder(phi_p + v * model.Delta, 2 * math.pi)
                 kappa = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
                 phi = M.vm_sample(mu, kappa, torch.rand(B, device=x.device))
-            vbar, logs = model.pri_vel(hp).unbind(-1)
-            v = vbar + logs.exp() * torch.randn(B, device=x.device)
             m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
             pp.append(phi)
             pv.append(v)
             pm.append(m)
-            phi_p, v_p, m_p = phi, v, F.one_hot(m, model.R).float()
+            phi_p, m_p = phi, F.one_hot(m, model.R).float()
         phis.append(torch.stack(pp, 1))
         vs.append(torch.stack(pv, 1))
         ms.append(torch.stack(pm, 1))
@@ -48,10 +47,10 @@ def prior_paths(model, x, n):
 
 @torch.no_grad()
 def posterior_path(model, x, b):
-    """Posterior-mode latent path from encode_path, shaped [1, B, T]."""
+    """Posterior-mode latent path from encode_path, shaped [1, B, T]; the posterior has no tempo."""
     path, _ = M.encode_path(model, x, b)
-    phi, v, m = (torch.stack(z, 1)[None] for z in zip(*path, strict=True))
-    return phi, v, m
+    phi, m = (torch.stack(z, 1)[None] for z in zip(*path, strict=True))
+    return phi, None, m
 
 
 def score(phi, v, m, truth, n_meter):
@@ -61,17 +60,24 @@ def score(phi, v, m, truth, n_meter):
     offset = torch.atan2(d.sin().mean(-1, keepdim=True), d.cos().mean(-1, keepdim=True))
     perms = itertools.permutations(range(n_meter))
     meter_acc = max((torch.tensor(p, device=m.device)[m] == m_t[:, None]).float().mean().item() for p in perms)
-    return {
+    advance = wrap(phi[..., 1:] - phi[..., :-1])
+    result = {
         "phase_err": d.abs().mean().item(),
         "phase_err_rotated": wrap(d - offset).abs().mean().item(),
+        "advance_mean": advance.mean().item(),
+        "advance_backward": (advance < 0).float().mean().item(),
+        "meter_acc_best_perm": meter_acc,
+        "meter_switch_rate": (m[..., 1:] != m[..., :-1]).float().mean().item(),
+    }
+    if v is None:
+        return result
+    return result | {
         "v_mean": v.mean().item(),
         "v_true_mean": v_t.mean().item(),
         "v_mae": (v - v_t).abs().mean().item(),
         "v_negative": (v < 0).float().mean().item(),
         "dv_mean": (v[..., 1:] - v[..., :-1]).abs().mean().item(),
         "dv_true_mean": (v_t[:, 1:] - v_t[:, :-1]).abs().mean().item(),
-        "meter_acc_best_perm": meter_acc,
-        "meter_switch_rate": (m[..., 1:] != m[..., :-1]).float().mean().item(),
     }
 
 
