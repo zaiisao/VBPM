@@ -131,9 +131,12 @@ def test_vonmises_reparam(kappas=(0.5, 2.0, 5.0, 10.0), n_eps=6, h=1e-5, tol=1e-
 # Model
 # ======================================================================
 class VAEDBN(nn.Module):
-    def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0):
+    def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0,
+                 v_min=0.1, v_max=0.6, sigma_range=0.01, sigma_tempo=0.03):
         super().__init__()
         self.R, self.Delta, self.kmin = n_meter, Delta, kmin
+        self.v_min, self.v_max = v_min, v_max
+        self.sigma_range, self.sigma_tempo = sigma_range, sigma_tempo
         prevdim = 2 + 1 + n_meter                     # [cos phi, sin phi, v, onehot(m)]
         # generative backbone over x (bidirectional over the covariate is allowed)
         self.backbone = nn.GRU(x_dim, hid, batch_first=True, bidirectional=True)
@@ -164,6 +167,14 @@ class VAEDBN(nn.Module):
     def context(self, b, x):
         e = torch.cat([self.b_emb(b), x], -1); c,_ = self.encoder(e); return torch.tanh(self.hc(c))
 
+    def log_physics(self, v, v_p, k):
+        """Log-likelihood of the virtual observations r_k = 0 for tempo range and tempo persistence."""
+        r_range = F.relu(self.v_min - v) + F.relu(v - self.v_max)
+        logp = torch.distributions.Normal(r_range, self.sigma_range).log_prob(torch.zeros_like(v))
+        if k > 0:
+            logp = logp + torch.distributions.Normal(v - v_p, self.sigma_tempo).log_prob(torch.zeros_like(v))
+        return logp
+
     def phase_params(self, raw):
         mu = torch.atan2(raw[:,1], raw[:,0]); kappa = F.softplus(raw[:,2]) + self.kmin
         return mu, kappa
@@ -174,7 +185,7 @@ class VAEDBN(nn.Module):
            If diag is a dict, fill it with per-factor KLs and posterior-parameter stats
            (kappa_q, velocity sigma, meter entropy) for debugging."""
         B, T = x.size(0), x.size(1)
-        emis = x.new_zeros(B); kl = x.new_zeros(B)
+        emis = x.new_zeros(B); kl = x.new_zeros(B); phys = x.new_zeros(B)
         klph = x.new_zeros(B); klve = x.new_zeros(B); klme = x.new_zeros(B)
         kap_q_acc, sig_q_acc, ent_acc = [], [], []
         phi_p = x.new_zeros(B); v_p = x.new_zeros(B)
@@ -216,13 +227,14 @@ class VAEDBN(nn.Module):
             logit = self.emit(self.feats(phi, v, m))
             if b is not None:
                 emis = emis + F.cross_entropy(logit, b[:,k], reduction="none") * (-1.0)  # +log p
+            phys = phys + self.log_physics(v, v_p, k)
             phi_p, v_p, m_p = phi, v, m                      # advance chain (sampled previous state)
         kl = klph + klve + klme
         if diag is not None and use_post:
             diag.update(kl_phase=klph.mean(), kl_vel=klve.mean(), kl_meter=klme.mean(),
                         kappa_q=torch.stack(kap_q_acc), sigma_q=torch.stack(sig_q_acc),
                         meter_entropy=torch.stack(ent_acc))
-        return emis, kl
+        return emis, phys, kl
 
 
 def hybrid_loss(model, x, b, alpha=0.7, beta=1.0, tau=0.5, diag=None):
@@ -230,12 +242,12 @@ def hybrid_loss(model, x, b, alpha=0.7, beta=1.0, tau=0.5, diag=None):
        Pass diag={} to collect debugging diagnostics (per-factor KL, kappa_q, ...)."""
     h = model.backbone_feats(x)
     c = model.context(b, x)
-    emis_q, kl = model.rollout(x, h, c=c, b=b, tau=tau, use_post=True, diag=diag)   # CVAE branch
-    L_cvae = -(emis_q) + beta * kl                                                    # -(emission) + KL
-    emis_p, _ = model.rollout(x, h, c=None, b=b, tau=tau, use_post=False)             # GSNN branch
-    L_gsnn = -(emis_p)
+    emis_q, phys_q, kl = model.rollout(x, h, c=c, b=b, tau=tau, use_post=True, diag=diag)   # CVAE branch
+    L_cvae = -(emis_q + phys_q) + beta * kl                                                    # -(emission) + KL
+    emis_p, phys_p, _ = model.rollout(x, h, c=None, b=b, tau=tau, use_post=False)             # GSNN branch
+    L_gsnn = -(emis_p + phys_p)
     loss = (alpha * L_cvae + (1 - alpha) * L_gsnn).mean()
-    return loss, (-emis_q).mean(), kl.mean(), (-emis_p).mean()
+    return loss, (-emis_q).mean(), kl.mean(), (-emis_p).mean(), (-phys_q).mean(), (-phys_p).mean()
 
 
 # ======================================================================
@@ -309,13 +321,14 @@ def train(x, b, steps=200, lr=3e-3, alpha=0.7, beta=1.0, tau=0.5, lr_=None,
     print("device:", DEV, "| x", tuple(x.shape), "b", tuple(b.shape), "| logging ->", f"{log_name}.csv/.log")
     for t in range(1, steps + 1):
         diag = {}
-        loss, rec_q, kl, rec_p = hybrid_loss(model, x, b, alpha=alpha, beta=beta, tau=tau, diag=diag)
+        loss, rec_q, kl, rec_p, phys_q, phys_p = hybrid_loss(model, x, b, alpha=alpha, beta=beta, tau=tau, diag=diag)
         opt.zero_grad(); loss.backward()
         gn = grad_norms(groups)                                    # BEFORE step (grads live now)
         opt.step()
         if t == 1 or t % log_every == 0:
             m = {"loss": round(loss.item(), 4), "recon": round(rec_q.item(), 4),
                  "kl": round(kl.item(), 4), "gsnn_recon": round(rec_p.item(), 4),
+                 "phys_q": round(phys_q.item(), 4), "phys_p": round(phys_p.item(), 4),
                  "kl_phase": round(float(diag["kl_phase"]), 4),
                  "kl_vel": round(float(diag["kl_vel"]), 4),
                  "kl_meter": round(float(diag["kl_meter"]), 4),
