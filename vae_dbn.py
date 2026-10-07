@@ -130,6 +130,27 @@ def test_vonmises_reparam(kappas=(0.5, 2.0, 5.0, 10.0), n_eps=6, h=1e-5, tol=1e-
 # ======================================================================
 # Model
 # ======================================================================
+class LandmarkEmission(nn.Module):
+    """Label logits from the distance of phase to each meter's downbeat and beat landmarks."""
+
+    def __init__(self, beats_per_bar=(2, 3, 4)):
+        super().__init__()
+        self.beats_per_bar = beats_per_bar
+        self.log_width = nn.Parameter(torch.tensor(math.log(0.5)))
+        self.log_sharpness = nn.Parameter(torch.tensor(0.0))
+        self.bias = nn.Parameter(torch.zeros(3))
+
+    def forward(self, phi, m_oh):
+        width, sharpness = self.log_width.exp(), self.log_sharpness.exp()
+        logits = []
+        for n in self.beats_per_bar:
+            d = torch.remainder(phi[:, None] - 2*PI*torch.arange(n, device=phi.device)/n + PI, 2*PI) - PI
+            down = torch.exp(-(d[:, 0]/width)**2)
+            beat = torch.exp(-(d[:, 1:].abs().min(-1).values/width)**2)
+            logits.append(torch.stack([torch.zeros_like(down), sharpness*beat, sharpness*down], -1))
+        return (torch.stack(logits, 1) * m_oh[..., None]).sum(1) + self.bias
+
+
 class VAEDBN(nn.Module):
     def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0, sigma_backward=0.05, sigma_advance=0.22):
         super().__init__()
@@ -154,9 +175,8 @@ class VAEDBN(nn.Module):
         self.pri_delta = nn.Linear(hid, 1)
         self.pri_omega = nn.Linear(hid, 1)
         self.pri_meter = nn.Linear(hid, n_meter)
-        # emission p(b_k | z_k)
-        self.emit = nn.Sequential(nn.Linear(2 + n_meter, hid), nn.ReLU(),
-                                  nn.Linear(hid, 3))
+        # emission p(b_k | phi_k, m_k) at metrical landmarks
+        self.emit = LandmarkEmission()
 
     def feats(self, phi, m_oh):
         return torch.cat([torch.cos(phi)[:,None], torch.sin(phi)[:,None], m_oh], -1)
@@ -227,7 +247,7 @@ class VAEDBN(nn.Module):
                 if k == 0:
                     m = F.gumbel_softmax(mlog_p, tau=tau, hard=False)
             # ---- emission (frames 1..T-1 carry a label here; frame 0 included for simplicity) ----
-            logit = self.emit(self.feats(phi, m))
+            logit = self.emit(phi, m)
             if b is not None:
                 emis = emis + F.cross_entropy(logit, b[:,k], reduction="none") * (-1.0)  # +log p
             if k > 0:
@@ -412,7 +432,7 @@ def predict_labels(model, x, N=64):
             if k == 0:
                 m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
             m_oh = F.one_hot(m, model.R).float()
-            prob[:, k] += F.softmax(model.emit(model.feats(phi, m_oh)), -1)
+            prob[:, k] += F.softmax(model.emit(phi, m_oh), -1)
             phi_p, m_p = phi, m_oh
     prob /= N
     return prob.argmax(-1), prob                          # b_hat [B,T], p_label [B,T,3]
