@@ -34,7 +34,8 @@ def prior_paths(model, x, n):
                 mu = torch.remainder(phi_p + v * model.Delta + model.pri_delta(hp).squeeze(-1), 2 * math.pi)
                 kappa = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
             phi = M.vm_sample(mu, kappa, torch.rand(B, device=x.device))
-            m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
+            if k == 0:
+                m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
             pp.append(phi)
             pv.append(v)
             pm.append(m)

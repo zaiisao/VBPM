@@ -1,9 +1,9 @@
 """
 VAE-DBN: a structured (sequential) conditional VAE with a Markov latent chain.
 
-Latent per frame k:  z_k = (phi_k, m_k)
+Latent: z = (phi_{1:T}, m)
     phi_k in S^1  : bar phase         -> von Mises        (implicit reparam), advancing by omega(h_k) + delta(h_k, phi_{k-1})
-    m_k   in {0..R-1} : meter class   -> Categorical      (Gumbel-softmax)
+    m     in {0..R-1} : meter class   -> Categorical      (Gumbel-softmax), drawn once per sequence
 Covariate x (audio features) conditions every factor and is never inferred.
 Observation b_{1:T} (beat labels) is the data; only the encoder sees it.
 
@@ -192,24 +192,28 @@ class VAEDBN(nn.Module):
             else:
                 mu_pha_p = torch.remainder(phi_p + self.omega(hp)*self.Delta + self.pri_delta(hp).squeeze(-1), 2*PI)
                 kap_p = F.softplus(self.pri_kappa(hp)).squeeze(-1) + self.kmin
-            mlog_p = self.pri_meter(hp)
+            if k == 0:
+                mlog_p = self.pri_meter(hp)
             # ---- choose source of z: posterior or prior ----
             if use_post:
                 hq = self.post(torch.cat([c[:,k], prev], -1))
                 mu_pha_q, kap_q = self.phase_params(self.post_phase(hq))
-                mlog_q = self.post_meter(hq)
                 phi = vm_sample(mu_pha_q, kap_q, torch.rand(B, device=x.device))
-                m   = F.gumbel_softmax(mlog_q, tau=tau, hard=False)
                 # per-frame KL (closed form), split per factor for diagnostics
                 klp = kl_vm(mu_pha_q, kap_q, mu_pha_p, kap_p)
                 klph = klph + klp
-                klme = klme + kl_cat(mlog_q, mlog_p)
+                if k == 0:
+                    mlog_q = self.post_meter(hq)
+                    m = F.gumbel_softmax(mlog_q, tau=tau, hard=False)
+                    klme = klme + kl_cat(mlog_q, mlog_p)
+                    if diag is not None:
+                        rho = F.softmax(mlog_q, -1); ent_acc.append((-(rho*torch.log(rho+1e-9)).sum(-1)).detach())
                 if diag is not None:
                     kap_q_acc.append(kap_q.detach())
-                    rho = F.softmax(mlog_q, -1); ent_acc.append((-(rho*torch.log(rho+1e-9)).sum(-1)).detach())
             else:
                 phi = vm_sample(mu_pha_p, kap_p, torch.rand(B, device=x.device))
-                m   = F.gumbel_softmax(mlog_p, tau=tau, hard=False)
+                if k == 0:
+                    m = F.gumbel_softmax(mlog_p, tau=tau, hard=False)
             # ---- emission (frames 1..T-1 carry a label here; frame 0 included for simplicity) ----
             logit = self.emit(self.feats(phi, m))
             if b is not None:
@@ -350,13 +354,17 @@ def encode_path(model, x, b, sample=False):
         prev = model.feats(phi_p, m_p)
         hq = model.post(torch.cat([c[:, k], prev], -1))
         mu_q, kap_q = model.phase_params(model.post_phase(hq))
-        rho_q = F.softmax(model.post_meter(hq), -1)
+        if k == 0:
+            rho_q = F.softmax(model.post_meter(hq), -1)
         params.append(dict(mu_phi=mu_q, kappa=kap_q, rho=rho_q))
         if sample:
             phi = vm_sample(mu_q, kap_q, torch.rand(B, device=x.device))
-            m   = torch.multinomial(rho_q, 1).squeeze(-1)
+            if k == 0:
+                m = torch.multinomial(rho_q, 1).squeeze(-1)
         else:                                          # posterior mode
-            phi, m = mu_q, rho_q.argmax(-1)
+            phi = mu_q
+            if k == 0:
+                m = rho_q.argmax(-1)
         m_oh = F.one_hot(m, model.R).float()
         path.append((phi, m)); phi_p, m_p = phi, m_oh
     return path, params
@@ -379,7 +387,8 @@ def predict_labels(model, x, N=64):
                 mu_p = torch.remainder(phi_p + model.omega(hp)*model.Delta + model.pri_delta(hp).squeeze(-1), 2*PI)
                 kap_p = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
             phi = vm_sample(mu_p, kap_p, torch.rand(B, device=x.device))
-            m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
+            if k == 0:
+                m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
             m_oh = F.one_hot(m, model.R).float()
             prob[:, k] += F.softmax(model.emit(model.feats(phi, m_oh)), -1)
             phi_p, m_p = phi, m_oh
