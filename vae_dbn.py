@@ -152,8 +152,8 @@ class VAEDBN(nn.Module):
         self.pri_kappa = nn.Linear(hid, 1)            # phase concentration (T-b)
         self.pri_vel   = nn.Linear(hid, 2)
         self.pri_meter = nn.Linear(hid, n_meter)
-        # emission p(b_k | z_k, x)
-        self.emit = nn.Sequential(nn.Linear(2 + 1 + n_meter + hid, hid), nn.ReLU(),
+        # emission p(b_k | z_k)
+        self.emit = nn.Sequential(nn.Linear(2 + 1 + n_meter, hid), nn.ReLU(),
                                   nn.Linear(hid, 3))
 
     def feats(self, phi, v, m_oh):
@@ -213,7 +213,7 @@ class VAEDBN(nn.Module):
                 v   = muv_p + torch.exp(logsv_p) * torch.randn(B, device=x.device)
                 m   = F.gumbel_softmax(mlog_p, tau=tau, hard=False)
             # ---- emission (frames 1..T-1 carry a label here; frame 0 included for simplicity) ----
-            logit = self.emit(torch.cat([self.feats(phi, v, m), h[:,k]], -1))
+            logit = self.emit(self.feats(phi, v, m))
             if b is not None:
                 emis = emis + F.cross_entropy(logit, b[:,k], reduction="none") * (-1.0)  # +log p
             phi_p, v_p, m_p = phi, v, m                      # advance chain (sampled previous state)
@@ -390,7 +390,7 @@ def predict_labels(model, x, N=64):
             v = vb_p + torch.exp(logs_p) * torch.randn(B, device=x.device)
             m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
             m_oh = F.one_hot(m, model.R).float()
-            prob[:, k] += F.softmax(model.emit(torch.cat([model.feats(phi, v, m_oh), h[:, k]], -1)), -1)
+            prob[:, k] += F.softmax(model.emit(model.feats(phi, v, m_oh)), -1)
             phi_p, v_p, m_p = phi, v, m_oh
     prob /= N
     return prob.argmax(-1), prob                          # b_hat [B,T], p_label [B,T,3]
