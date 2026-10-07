@@ -1,9 +1,0 @@
-# GSNN transition prior and audio-conditioned emission, fixed meter four.
-excerpt_seconds: 30.0
-batch_size: 4
-epochs: 24
-lr: 3.0e-4
-gsnn_alpha: 0.0
-meters: [4]
-
-generator_samples: 4

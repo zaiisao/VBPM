@@ -1,9 +1,0 @@
-[submodule "external/beat_this"]
-	path = external/beat_this
-	url = https://github.com/CPJKU/beat_this.git
-[submodule "external/musicfm"]
-	path = external/musicfm
-	url = https://github.com/minzwon/musicfm.git
-[submodule "external/beat_this_annotations"]
-	path = external/beat_this_annotations
-	url = https://github.com/CPJKU/beat_this_annotations.git
