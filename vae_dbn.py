@@ -2,7 +2,7 @@
 VAE-DBN: a structured (sequential) conditional VAE with a Markov latent chain.
 
 Latent: z = (phi_{1:T}, m)
-    phi_k in S^1  : bar phase         -> von Mises        (implicit reparam), advancing by omega(h_k) + delta(h_k, phi_{k-1})
+    phi_k in S^1  : bar phase         -> von Mises        (implicit reparam), advancing by omega(h_k) >= delta_max plus a correction |delta(h_k, phi_{k-1})| <= delta_max
     m     in {0..R-1} : meter class   -> Categorical      (Gumbel-softmax), drawn once per sequence
 Covariate x (audio features) conditions every factor and is never inferred.
 Observation b_{1:T} (beat labels) is the data; only the encoder sees it.
@@ -131,9 +131,10 @@ def test_vonmises_reparam(kappas=(0.5, 2.0, 5.0, 10.0), n_eps=6, h=1e-5, tol=1e-
 # Model
 # ======================================================================
 class VAEDBN(nn.Module):
-    def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0):
+    def __init__(self, x_dim=4, n_meter=3, hid=64, ctx=64, kmin=1.0, Delta=1.0, delta_max=0.1):
         super().__init__()
         self.R, self.Delta, self.kmin = n_meter, Delta, kmin
+        self.delta_max = delta_max
         prevdim = 2 + n_meter                         # [cos phi, sin phi, onehot(m)]
         # generative backbone over x (bidirectional over the covariate is allowed)
         self.backbone = nn.GRU(x_dim, hid, batch_first=True, bidirectional=True)
@@ -161,8 +162,12 @@ class VAEDBN(nn.Module):
         return torch.cat([torch.cos(phi)[:,None], torch.sin(phi)[:,None], m_oh], -1)
 
     def omega(self, hp):
-        """Phase advance per frame as a deterministic function of the audio."""
-        return F.softplus(self.pri_omega(hp)).squeeze(-1)
+        """Phase advance per frame from the audio, at least delta_max so the corrected advance stays forward."""
+        return self.delta_max / self.Delta + F.softplus(self.pri_omega(hp)).squeeze(-1)
+
+    def delta(self, hp):
+        """Audio correction to the phase mean, bounded to plus or minus delta_max."""
+        return self.delta_max * torch.tanh(self.pri_delta(hp).squeeze(-1))
 
     def backbone_feats(self, x):
         h,_ = self.backbone(x); return torch.tanh(self.hb(h))     # [B,T,hid]
@@ -191,7 +196,7 @@ class VAEDBN(nn.Module):
             if k == 0:
                 mu_pha_p, kap_p = self.phase_params(self.pri_phase0(hp))
             else:
-                mu_pha_p = torch.remainder(phi_p + self.omega(hp)*self.Delta + self.pri_delta(hp).squeeze(-1), 2*PI)
+                mu_pha_p = torch.remainder(phi_p + self.omega(hp)*self.Delta + self.delta(hp), 2*PI)
                 kap_p = F.softplus(self.pri_kappa(hp)).squeeze(-1) + self.kmin
             if k == 0:
                 mlog_p = self.pri_meter(hp)
@@ -393,7 +398,7 @@ def predict_labels(model, x, N=64):
             if k == 0:
                 mu_p, kap_p = model.phase_params(model.pri_phase0(hp))
             else:
-                mu_p = torch.remainder(phi_p + model.omega(hp)*model.Delta + model.pri_delta(hp).squeeze(-1), 2*PI)
+                mu_p = torch.remainder(phi_p + model.omega(hp)*model.Delta + model.delta(hp), 2*PI)
                 kap_p = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
             phi = vm_sample(mu_p, kap_p, torch.rand(B, device=x.device))
             if k == 0:
