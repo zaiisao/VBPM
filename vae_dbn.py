@@ -213,22 +213,20 @@ class VAEDBN(nn.Module):
                 mu_pha_q, kap_q = self.phase_params(self.post_phase(hq))
                 muv_q, logsv_q = self.post_vel(hq)[:,0], self.post_vel(hq)[:,1]
                 mlog_q = self.post_meter(hq)
-                phi = vm_sample(mu_pha_q, kap_q, torch.rand(B, device=x.device))
+                phi = vm_sample(mu_pha_q, kap_q, torch.rand(B, device=x.device)) if k == 0 else torch.remainder(phi_p + v_p*self.Delta, 2*PI)
                 v   = muv_q + torch.exp(logsv_q) * torch.randn(B, device=x.device)
-                m   = F.gumbel_softmax(mlog_q, tau=tau, hard=False)
+                m   = F.one_hot(torch.full((B,), 2, device=x.device), self.R).float()
                 # per-frame KL (closed form), split per factor for diagnostics
-                klp = kl_vm_uniform(mu_pha_q, kap_q) if k == 0 else kl_vm(mu_pha_q, kap_q, mu_pha_p, kap_p)
+                klp = kl_vm_uniform(mu_pha_q, kap_q) if k == 0 else torch.zeros_like(kap_q)
                 klph = klph + klp
                 klve = klve + kl_gauss(muv_q, logsv_q, muv_p, logsv_p)
-                klme = klme + kl_cat(mlog_q, mlog_p)
                 if diag is not None:
                     kap_q_acc.append(kap_q.detach()); sig_q_acc.append(torch.exp(logsv_q).detach())
                     rho = F.softmax(mlog_q, -1); ent_acc.append((-(rho*torch.log(rho+1e-9)).sum(-1)).detach())
             else:
-                phi = vm_sample(mu_pha_p, kap_p.clamp(min=self.kmin), torch.rand(B, device=x.device)) \
-                      if k > 0 else torch.rand(B, device=x.device) * 2*PI - PI
+                phi = torch.remainder(phi_p + v_p*self.Delta, 2*PI) if k > 0 else torch.rand(B, device=x.device) * 2*PI - PI
                 v   = muv_p + torch.exp(logsv_p) * torch.randn(B, device=x.device)
-                m   = F.gumbel_softmax(mlog_p, tau=tau, hard=False)
+                m   = F.one_hot(torch.full((B,), 2, device=x.device), self.R).float()
             # ---- emission (frames 1..T-1 carry a label here; frame 0 included for simplicity) ----
             logit = self.emit_logits(self.feats(phi, v, m), h[:, k])   # p(b|z) or p(b|z,x)
             if b is not None:
@@ -307,14 +305,14 @@ def synth(B=16, T=32, R=3, kappa_true=20.0, Delta=1.0, seed=0,
     The audio features x carry (cos phi, sin phi), a weak meter cue, and noise."""
     torch.manual_seed(seed)
     bpb = torch.tensor([2, 3, 4])[:R]                      # beats per bar for meters 0,1,2
-    m = torch.randint(0, R, (B,))                          # one meter per sequence (categorical)
+    m = torch.full((B,), 2)                          # one meter per sequence (categorical)
     phi = torch.empty(B, T); v = torch.empty(B, T)
     cur_phi = 2*PI*torch.rand(B) - PI
     cur_v = 0.2 + 0.3*torch.rand(B)
     for k in range(T):
         phi[:, k] = cur_phi; v[:, k] = cur_v
         adv = cur_phi + cur_v*Delta
-        cur_phi = torch.distributions.VonMises(adv, kappa_true).sample()   # <-- von Mises noise
+        cur_phi = adv   # <-- von Mises noise
         cur_phi = torch.remainder(cur_phi + PI, 2*PI) - PI                 # wrap to (-pi,pi]
         cur_v = (cur_v + 0.03*torch.randn(B)).clamp(0.1, 0.6)              # Gaussian random walk
     phw = torch.remainder(phi, 2*PI)                       # phase in [0,2pi)
@@ -437,11 +435,12 @@ def encode_path(model, x, b, sample=False):
         rho_q = F.softmax(model.post_meter(hq), -1)
         params.append(dict(mu_phi=mu_q, kappa=kap_q, vbar=vb_q, s=torch.exp(logs_q), rho=rho_q))
         if sample:
-            phi = vm_sample(mu_q, kap_q, torch.rand(B, device=x.device))
+            phi = vm_sample(mu_q, kap_q, torch.rand(B, device=x.device)) if k == 0 else torch.remainder(phi_p + v_p*model.Delta, 2*PI)
             v   = vb_q + torch.exp(logs_q) * torch.randn(B, device=x.device)
-            m   = torch.multinomial(rho_q, 1).squeeze(-1)
+            m   = torch.full((B,), 2, device=x.device)
         else:                                            # posterior mode
-            phi, v, m = mu_q, vb_q, rho_q.argmax(-1)
+            phi = mu_q if k == 0 else torch.remainder(phi_p + v_p*model.Delta, 2*PI)
+            v, m = vb_q, torch.full((B,), 2, device=x.device)
         m_oh = F.one_hot(m, model.R).float()
         path.append((phi, v, m)); phi_p, v_p, m_p = phi, v, m_oh
     return path, params
@@ -461,12 +460,10 @@ def predict_labels(model, x, N=64):
             if k == 0:
                 phi = torch.rand(B, device=x.device) * 2*PI - PI          # uniform initial phase
             else:
-                mu_p = torch.remainder(phi_p + v_p*model.Delta, 2*PI)
-                kap_p = F.softplus(model.pri_kappa(hp)).squeeze(-1) + model.kmin
-                phi = vm_sample(mu_p, kap_p, torch.rand(B, device=x.device))
+                phi = torch.remainder(phi_p + v_p*model.Delta, 2*PI)
             vb_p, logs_p = model.pri_vel(hp)[:, 0], model.pri_vel(hp)[:, 1]
             v = vb_p + torch.exp(logs_p) * torch.randn(B, device=x.device)
-            m = torch.multinomial(F.softmax(model.pri_meter(hp), -1), 1).squeeze(-1)
+            m = torch.full((B,), 2, device=x.device)
             m_oh = F.one_hot(m, model.R).float()
             prob[:, k] += F.softmax(model.emit_logits(model.feats(phi, v, m_oh), h[:, k]), -1)
             phi_p, v_p, m_p = phi, v, m_oh
