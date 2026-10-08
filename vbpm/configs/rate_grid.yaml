@@ -1,5 +1,0 @@
-variant: rate_grid
-emission: triangle
-pos_weight: 1.0
-epochs: 60
-beta_warmup: 0

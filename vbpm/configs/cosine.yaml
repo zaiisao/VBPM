@@ -1,6 +1,0 @@
-# Paper-faithful emission arm: the tutorial's own a + b cos(phi) (§7). gtzan F ~0.43-0.46.
-# Triangle is the champion deviation; this config is the fidelity reference.
-emission: cosine
-pos_weight: 1.0
-epochs: 60
-beta_warmup: 0
